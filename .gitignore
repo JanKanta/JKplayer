@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+Thumbs.db
+
+# Fetched numpy and scipy - 120 MB per Nuke, downloaded on demand, never
+# committed. Keep the note that explains the folder.
+pylibs/*
+!pylibs/README.txt

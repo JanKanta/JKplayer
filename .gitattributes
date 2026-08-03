@@ -1,0 +1,4 @@
+# Written on Windows, run on Linux and macOS too. Normalise to LF in the
+# repository so a Linux checkout does not get CRLF in its Python files and
+# a diff between two platforms is not the whole file.
+* text=auto eol=lf
