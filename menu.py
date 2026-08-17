@@ -49,8 +49,8 @@ def _try_path(path):
 
 def _candidates():
     """The tagged folders to look in, best first."""
-    from exrplayer.installer import package_root, user_pylibs
-    from exrplayer.paths import platform_tag
+    from jkplayer.installer import package_root, user_pylibs
+    from jkplayer.paths import platform_tag
     return [os.path.join(package_root(), "pylibs", platform_tag()),
             user_pylibs(),
             USER_PYLIBS_FLAT]
@@ -59,7 +59,7 @@ def _candidates():
 def platform_tag_or_unknown():
     """The tag this Nuke needs, for the message that says it is missing."""
     try:
-        from exrplayer.paths import platform_tag
+        from jkplayer.paths import platform_tag
         return platform_tag()
     except Exception:
         return "unknown platform"
@@ -97,7 +97,7 @@ def _offer_to_fetch():
 
     Only ever called in GUI mode, with a human in front of the machine.
     """
-    from exrplayer import installer
+    from jkplayer import installer
 
     target = installer.target_dir()
     if installer.nuke_python() is None:
@@ -142,13 +142,13 @@ def _install_menu():
     try:
         m = nuke.menu("Nuke").addMenu("JKplayer")
         m.addCommand("Install dependencies",
-                     "import exrplayer.setup_deps as s; s.run()")
+                     "import jkplayer.setup_deps as s; s.run()")
     except Exception:
         pass
 
 
 def _load():
-    from exrplayer import installer
+    from jkplayer import installer
     where = _find_numpy()
 
     if where is None and nuke.GUI:
@@ -181,8 +181,8 @@ def _load():
         return
 
     _report(where)
-    import exrplayer.register
-    exrplayer.register.register()
+    import jkplayer.register
+    jkplayer.register.register()
 
 
 try:

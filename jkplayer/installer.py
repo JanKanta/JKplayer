@@ -45,12 +45,12 @@ DOWNLOAD_MB = 50          # measured: numpy 12.6 + scipy 36.6; grows slowly
 # purpose, and must never ask an artist to download anything: on two hundred
 # workstations that is two hundred dialogs, most of which then hit the
 # firewall. Either marker turns the offer into a line in the console.
-NO_FETCH_ENV = "EXRPLAYER_NO_FETCH"
+NO_FETCH_ENV = "JKPLAYER_NO_FETCH"
 MANAGED_MARKER = "MANAGED"
 
 
 def package_root():
-    """The EXRPlayer folder - the one that holds both exrplayer/ and pylibs/."""
+    """The JKplayer folder - the one that holds both jkplayer/ and pylibs/."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

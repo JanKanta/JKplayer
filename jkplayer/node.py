@@ -30,10 +30,11 @@ from . import ocio
 from . import sequence
 from .paths import total_ram_mb
 
-NODE_TAG = "cv_is_exrplayer"          # hidden knob, this is how we recognise the node
-# The tag used before the rename to JKplayer. Nodes saved by an older version
-# still carry it, so they are recognised as well and keep all their settings.
-LEGACY_TAGS = ("cv_is_compareviewer",)
+NODE_TAG = "cv_is_jkplayer"          # hidden knob, this is how we recognise the node
+# The tags used before each rename. A node saved by an older version still
+# carries one of them, so it is recognised too and keeps every setting - which
+# is the whole reason a hidden tag exists rather than matching on the node name.
+LEGACY_TAGS = ("cv_is_exrplayer", "cv_is_compareviewer")
 DEFAULT_NAME = "JKplayer"
 
 # Group = today's node (multiple inputs), NoOp = nodes from earlier versions.

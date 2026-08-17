@@ -79,7 +79,7 @@ QWidget#cvTopBar QFrame[frameShape="5"] {   /* vertical separator */
 from .sequence import from_read_node
 from .timeline import Timeline
 
-PANEL_ID = "com.honza.EXRplayerPanel"
+PANEL_ID = "com.honza.JKplayerPanel"
 
 # How often at most the scopes are recomputed while panning/zooming. They read
 # the VISIBLE crop (see ImageView.visible_linear), so they have to follow the

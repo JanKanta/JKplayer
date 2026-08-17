@@ -4,13 +4,13 @@ import nuke
 
 # IMPORTANT: nukescripts.registerWidgetAsPanel does not store the class, it
 # builds the TEXT
-#   "...WidgetKnob(exrplayer.panel.PlayerPanel)"
+#   "...WidgetKnob(jkplayer.panel.PlayerPanel)"
 # and EVALUATES it later in Nuke's global namespace. For that to work,
-# (a) the attribute `exrplayer.panel` has to exist (i.e. the submodule must
-# already be imported) and (b) the name `exrplayer` has to be visible in
+# (a) the attribute `jkplayer.panel` has to exist (i.e. the submodule must
+# already be imported) and (b) the name `jkplayer` has to be visible in
 # __main__. Without it the panel works as a floating window but cannot be
 # docked in Nuke.
-from . import panel as _panel_module          # makes sure exrplayer.panel exists
+from . import panel as _panel_module          # makes sure jkplayer.panel exists
 
 _floating = None                 # the fallback window, when there is no Viewer
 _docked = None                   # the pane beside the Viewer, once opened
@@ -20,19 +20,19 @@ def _expose_in_main():
     """Expose the package in __main__, where the panel expression is evaluated."""
     try:
         import __main__
-        import exrplayer
-        setattr(__main__, "exrplayer", exrplayer)
+        import jkplayer
+        setattr(__main__, "jkplayer", jkplayer)
     except Exception as exc:
         nuke.tprint("JKplayer: cannot expose in __main__: %s" % exc)
 
 
-PANEL_ID = "com.honza.EXRplayerPanel"
+PANEL_ID = "com.honza.JKplayerPanel"
 PANEL_NAME = "JKplayer"
 
 # The widget is named as an EXPRESSION, evaluated later in __main__ - which is
 # what _expose_in_main is for.
 _WIDGET_EXPR = ("__import__('nukescripts').panels.WidgetKnob("
-                "exrplayer.panel.PlayerPanel)")
+                "jkplayer.panel.PlayerPanel)")
 
 
 def _new_pane_panel():
@@ -227,22 +227,22 @@ def register():
         # it. Opening one ourselves goes through _new_pane_panel instead - see
         # there for why.
         nukescripts.registerWidgetAsPanel(
-            "exrplayer.panel.PlayerPanel", PANEL_NAME, PANEL_ID)
+            "jkplayer.panel.PlayerPanel", PANEL_NAME, PANEL_ID)
     except Exception as exc:
         nuke.tprint("JKplayer: panel registration failed: %s" % exc)
 
     try:
         m = nuke.menu("Nuke").addMenu("JKplayer")
         m.addCommand("Create JKplayer Node",
-                     "import exrplayer.register as r; r.create_node()")
+                     "import jkplayer.register as r; r.create_node()")
         m.addCommand("Open JKplayer Panel",
-                     "import exrplayer.register as r; r.open_panel(force=True)")
+                     "import jkplayer.register as r; r.open_panel(force=True)")
     except Exception as exc:
         nuke.tprint("JKplayer: menu failed: %s" % exc)
 
     try:
         nuke.menu("Nodes").addCommand(
             "JKplayer/JKplayer",
-            "import exrplayer.register as r; r.create_node()")
+            "import jkplayer.register as r; r.create_node()")
     except Exception:
         pass
