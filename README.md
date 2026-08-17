@@ -1,4 +1,4 @@
-# EXRplayer
+# JKplayer
 
 An EXR review player for Nuke. It reads the EXR files itself instead of going
 through `nuke.execute`, so playback comes off a RAM cache rather than the comp
@@ -40,10 +40,10 @@ Log3G10 and the rest).
 * **Nuke 14 or newer**, on Windows, Linux or macOS. Both Qt bindings are
   supported — Nuke 14 ships PySide2, Nuke 15+ PySide6.
 * **numpy** (required) and **scipy** (optional) — Nuke ships neither, and this
-  download does not carry them either. **On the first launch EXRplayer offers
+  download does not carry them either. **On the first launch JKplayer offers
   to fetch them**, which takes about 50 MB and twenty seconds. Say yes and
   there is nothing else to do; say no and it is still there later under
-  *EXRplayer > Install dependencies*.
+  *JKplayer > Install dependencies*.
 
 They are not shipped because they are compiled: a wheel is locked to both the
 platform and the CPython version, so one bundled build would only help the
@@ -69,7 +69,7 @@ mismatch takes Nuke down rather than raising something readable.
 
 Fetching **only ever happens in GUI mode, and only after you agree** — a render
 node must not stop to talk to PyPI. In terminal mode a missing numpy just
-prints the pip command, with the paths already filled in, and EXRplayer does
+prints the pip command, with the paths already filled in, and JKplayer does
 not load. Nothing else in Nuke is affected either way.
 
 To do it by hand, or to prepare a folder for someone else, run the Nuke you
@@ -100,19 +100,19 @@ the running Nuke automatically, on every platform.
    ```
 
 3. Restart Nuke. If numpy is not there yet it offers to fetch it — see
-   Requirements. Then there will be an **EXRplayer** menu in the menu bar and
-   an **EXRplayer** entry in the Nodes toolbar.
+   Requirements. Then there will be an **JKplayer** menu in the menu bar and
+   an **JKplayer** entry in the Nodes toolbar.
 
 `pluginAddPath` puts the folder on both the plugin path and `sys.path`, so
 Nuke runs `menu.py` from here and the package imports on its own.
 
 ## Use
 
-1. **EXRplayer > Create EXRplayer Node** and connect a Read with an `.exr`
+1. **JKplayer > Create JKplayer Node** and connect a Read with an `.exr`
    sequence to input **A** (optionally a second one to **B**, and a matte to
    **DiMatte**).
-2. **EXRplayer > Open EXRplayer Panel**, or dock the panel from the pane menu.
-3. The node holds all the settings; the panel follows whichever EXRplayer node
+2. **JKplayer > Open JKplayer Panel**, or dock the panel from the pane menu.
+3. The node holds all the settings; the panel follows whichever JKplayer node
    is selected.
 
 Only Read nodes with `.exr` can be attached — anything else is disconnected and

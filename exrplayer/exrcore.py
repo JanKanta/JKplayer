@@ -42,7 +42,16 @@ _LIB_PATTERNS = {
 _LIB_PATTERNS_DEFAULT = ["libOpenEXRCore*.so*"]        # Linux and the rest
 
 
-# offsets in exr_decode_pipeline_t (found empirically, verified at runtime)
+# Offsets in exr_decode_pipeline_t. They are NOT the same in every OpenEXR:
+# Nuke 17 ships 3.3, where the struct has a field in front of the channel list,
+# and Nuke 16 ships an older one where it does not - with the 3.3 numbers
+# hard-coded, Nuke 16 fell back to the pure Python reader ("unexpected pipeline
+# layout") and read EXRs about 2.3x slower for no reason.
+#
+# So they are searched for instead of assumed, once per session, in
+# _pipeline_layout: the header already says how wide the picture is and which
+# pixel types are legal, and a wrong guess fails that immediately. These stay as
+# the first candidate because they are what the current Nuke uses.
 OFFSET_CHANNELS = 8
 OFFSET_CHANNEL_COUNT = 16
 PIPELINE_SIZE = 8192              # generous headroom, we do not model the struct
@@ -73,6 +82,51 @@ class ChanInfo(C.Structure):
                 ("user_pixel_stride", C.c_int32),
                 ("user_line_stride", C.c_int32),
                 ("decode_to_ptr", C.c_void_p)]
+
+
+_LAYOUT = None                    # (channels offset, count offset) once found
+_LAYOUT_LOCK = threading.Lock()
+
+# Where the channel list can sit. 8/16 is OpenEXR 3.3 (Nuke 17), 0/8 the older
+# layout (Nuke 16); the rest is headroom for whatever a future Nuke ships.
+_LAYOUT_CANDIDATES = ((8, 16), (0, 8), (16, 24), (24, 32))
+
+
+def _pipeline_layout(base, width):
+    """(channels offset, count offset) for this build of OpenEXRCore.
+
+    Worked out from the data rather than assumed: at a correct offset the
+    pointer is not null, the count is a sane number of channels, and the first
+    channel is exactly as wide as the header said with a pixel type we know.
+    Getting all of that right by accident is not realistic, and every wrong
+    guess fails on the first test. Found once and remembered.
+    """
+    global _LAYOUT
+    with _LAYOUT_LOCK:
+        if _LAYOUT is not None:
+            return _LAYOUT
+        for off_ch, off_n in _LAYOUT_CANDIDATES:
+            try:
+                ptr = C.cast(base + off_ch, C.POINTER(C.c_void_p))[0]
+                nchan = C.cast(base + off_n, C.POINTER(C.c_int16))[0]
+                if not ptr or not (0 < nchan <= 64):
+                    continue
+                # Only then is it followed. A wrong guess reads whatever those
+                # eight bytes happen to be, and following that as a pointer
+                # would take Nuke down rather than raise - so it has to look
+                # like a pointer first: malloc never returns an address this
+                # low, nor an unaligned one.
+                if ptr % 8 or ptr < 0x10000:
+                    continue
+                first = C.cast(ptr, C.POINTER(ChanInfo))[0]
+                if first.width != width or first.data_type not in _DTYPE:
+                    continue
+            except Exception:
+                continue
+            _LAYOUT = (off_ch, off_n)
+            return _LAYOUT
+    raise ExrCoreError("unexpected pipeline layout - no candidate offset "
+                       "described a %d px wide channel" % width)
 
 
 class AttrString(C.Structure):
@@ -215,10 +269,9 @@ def read_planes(path):
             raise ExrCoreError("decoding_initialize failed")
         try:
             base = C.addressof(pipe)
-            chans_ptr = C.cast(base + OFFSET_CHANNELS,
-                               C.POINTER(C.c_void_p))[0]
-            nchan = C.cast(base + OFFSET_CHANNEL_COUNT,
-                           C.POINTER(C.c_int16))[0]
+            off_ch, off_n = _pipeline_layout(base, width)
+            chans_ptr = C.cast(base + off_ch, C.POINTER(C.c_void_p))[0]
+            nchan = C.cast(base + off_n, C.POINTER(C.c_int16))[0]
             if not chans_ptr or not (0 < nchan <= 64):
                 raise ExrCoreError("unexpected pipeline layout "
                                    "(channels=%s, count=%s)" % (chans_ptr, nchan))
@@ -492,8 +545,9 @@ def read_rgba_half_direct(path, layer=ROOT_LAYER):
             raise ExrCoreError("decoding_initialize failed")
         try:
             base = C.addressof(pipe)
-            chans_ptr = C.cast(base + OFFSET_CHANNELS, C.POINTER(C.c_void_p))[0]
-            nchan = C.cast(base + OFFSET_CHANNEL_COUNT, C.POINTER(C.c_int16))[0]
+            off_ch, off_n = _pipeline_layout(base, width)
+            chans_ptr = C.cast(base + off_ch, C.POINTER(C.c_void_p))[0]
+            nchan = C.cast(base + off_n, C.POINTER(C.c_int16))[0]
             if not chans_ptr or not (0 < nchan <= 64):
                 raise ExrCoreError("unexpected pipeline layout")
             chans = C.cast(chans_ptr, C.POINTER(ChanInfo))

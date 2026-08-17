@@ -82,15 +82,21 @@ class FrameLoader(object):
         return lambda f: self.key_for(f, seq, layer)
 
     def set_sequence(self, seq):
-        """Switches the source. Drops the queue and the results of old work."""
+        """Switches the source. Returns True when it really changed.
+
+        Drops the queue and the results of old work. The return value matters
+        to callers that also switch the layer - see PlayerPanel._bind_matte -
+        so they can redraw once instead of once per setting.
+        """
         with self._lock:
             if seq == self._seq:
-                return
+                return False
             self._seq = seq
             self._generation += 1
             self._urgent = []
             self._background.clear()
             self._lock.notify_all()
+            return True
 
     def set_layer(self, layer):
         """Switches the layer (AOV). Returns True when it really changed.

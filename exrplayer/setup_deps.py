@@ -30,9 +30,20 @@ def run():
         _register()
         return
 
+    # Same rule as at startup: a managed install does not fetch. Without this
+    # the menu entry would be a way straight round the marker.
+    reason = installer.managed()
+    if reason:
+        nuke.message("This JKplayer install is managed (%s), so it does not\n"
+                     "download anything.\n\n"
+                     "numpy is missing for this Nuke - that is a deployment\n"
+                     "problem. Please pass it on to whoever looks after the\n"
+                     "install." % reason)
+        return
+
     target = installer.target_dir()
     if installer.nuke_python() is None:
-        nuke.message("EXRplayer cannot find Nuke's own python, so it cannot\n"
+        nuke.message("JKplayer cannot find Nuke's own python, so it cannot\n"
                      "install anything. Install numpy by hand into\n%s" % target)
         return
 
@@ -42,7 +53,7 @@ def run():
 
     ok, result = installer.install(target, log=nuke.tprint)
     if not ok:
-        nuke.tprint("EXRplayer: install failed - %s" % result)
+        nuke.tprint("JKplayer: install failed - %s" % result)
         nuke.message("Install failed.\n\n%s\n\nSee the script editor for the "
                      "full log." % result)
         return
@@ -56,7 +67,7 @@ def run():
         return
 
     _register()
-    nuke.message("EXRplayer is ready.\n\nnumpy went into\n%s" % target)
+    nuke.message("JKplayer is ready.\n\nnumpy went into\n%s" % target)
 
 
 def _register():

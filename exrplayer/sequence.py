@@ -18,10 +18,15 @@ _RE_HASH = re.compile(r"#+")
 class ExrSequence(object):
     """Immutable description of a sequence. Equality compares pattern and range."""
 
-    def __init__(self, pattern, first, last):
+    def __init__(self, pattern, first, last, offset=0):
         self.pattern = pattern.replace("\\", "/")
-        self.first = int(first)
-        self.last = int(last)
+        # first/last are the range ON THE TIMELINE, i.e. already shifted; the
+        # offset is kept so path_for can go back to the file. An offset of
+        # +5 means the clip starts five frames later and frame 10 shows the
+        # file of frame 5.
+        self.offset = int(offset)
+        self.first = int(first) + self.offset
+        self.last = int(last) + self.offset
         if self.last < self.first:
             self.last = self.first
         self.is_still = not (_RE_PRINTF.search(self.pattern)
@@ -35,11 +40,12 @@ class ExrSequence(object):
         return max(self.first, min(self.last, int(frame)))
 
     def path_for(self, frame):
-        """Path to the file of that frame (the frame is clamped to the range)."""
-        f = self.clamp(frame)
-        cached = self._paths.get(f)
+        """Path to the file of that TIMELINE frame (clamped to the range)."""
+        key = self.clamp(frame)
+        cached = self._paths.get(key)
         if cached is not None:
             return cached
+        f = key - self.offset          # back to the frame the file is named by
         p = self.pattern
         if _RE_PRINTF.search(p):
             out = _RE_PRINTF.sub(lambda m: ("%0*d" % (int(m.group(1) or 0), f)), p)
@@ -47,7 +53,7 @@ class ExrSequence(object):
             out = _RE_HASH.sub(lambda m: str(f).zfill(len(m.group(0))), p)
         else:
             out = p
-        self._paths[f] = out
+        self._paths[key] = out
         return out
 
     def key_for(self, frame):
@@ -76,45 +82,99 @@ class ExrSequence(object):
         return out
 
     def label(self):
-        return os.path.basename(self.pattern)
+        name = os.path.basename(self.pattern)
+        # The shift is SAID OUT LOUD. Otherwise the per-input timing is
+        # invisible here and the frame numbers simply look wrong.
+        if self.offset:
+            name += "  (offset %+d)" % self.offset
+        return name
 
     def __eq__(self, other):
         return (isinstance(other, ExrSequence)
                 and other.pattern == self.pattern
                 and other.first == self.first
-                and other.last == self.last)
+                and other.last == self.last
+                and other.offset == self.offset)
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
     def __hash__(self):
-        return hash((self.pattern, self.first, self.last))
+        return hash((self.pattern, self.first, self.last, self.offset))
 
     def __repr__(self):
-        return "ExrSequence(%r, %d-%d)" % (self.pattern, self.first, self.last)
+        return "ExrSequence(%r, %d-%d, offset=%d)" % (
+            self.pattern, self.first, self.last, self.offset)
 
 
 def is_exr(path):
     return bool(path) and os.path.splitext(path)[1].lower() == ".exr"
 
 
-def from_read_node(node):
-    """ExrSequence from a Nuke Read node, or None when it is not an EXR Read.
+# Nodes that hand the picture straight on. Walked THROUGH, so wiring with a
+# dot - which everybody does - does not read as an empty input.
+PASSTHROUGH = ("Dot", "NoOp")
 
-    Deliberately strict: we work ONLY with Read nodes and ONLY with EXR
-    (that was the scope given for v2).
+# TimeOffset used to be walked through as well, with its shift read off the
+# node. It is not any more: the player has its own per-input 'Start at' and
+# 'Offset' (see node._add_knobs), which say the same thing in one place, are
+# saved with the settings and are visible next to the range they produce. Two
+# ways to shift the same clip meant they could disagree, and reading a shift
+# out of a node whose knob name we had to guess was never solid.
+MAX_WALK = 32                       # a loop in the graph must not hang us
+
+
+def resolve_source(node):
+    """The Read node behind an input, or None.
+
+    Walks up through dots to the Read that actually holds the files. Anything
+    else stops the walk: this player reads EXRs off disk rather than pulling
+    the image through Nuke, so a node that CHANGES the picture cannot be
+    honoured and pretending otherwise would show the wrong thing.
     """
-    if node is None:
+    for _ in range(MAX_WALK):
+        if node is None:
+            return None
+        try:
+            cls = node.Class()
+        except Exception:
+            return None
+        if cls == "Read":
+            return node
+        if cls not in PASSTHROUGH:
+            return None
+        try:
+            node = node.input(0)
+        except Exception:
+            return None
+    return None
+
+
+def from_read_node(node, start_at=0, nudge=0):
+    """ExrSequence for what is wired into an input, or None.
+
+    Only EXR, and only a Read at the end of the walk (see resolve_source).
+
+    `start_at` and `nudge` are the node's own per-input timing, and they are
+    now the ONLY way a clip is moved in time:
+
+      * `start_at` is ABSOLUTE placement - the timeline frame the first frame
+        lands on. 0 leaves it where the files say it is.
+      * `nudge` is added on top, always. That is the "it is one frame out"
+        control, and it works whichever way the clip was placed.
+    """
+    read = resolve_source(node)
+    if read is None:
         return None
     try:
-        if node.Class() != "Read":
-            return None
-        knobs = node.knobs()
+        knobs = read.knobs()
         if "file" not in knobs:
             return None
-        pattern = node["file"].value()
+        pattern = read["file"].value()
         if not is_exr(pattern):
             return None
-        return ExrSequence(pattern, int(node.firstFrame()), int(node.lastFrame()))
+        first, last = int(read.firstFrame()), int(read.lastFrame())
+        place = (int(start_at) - first) if start_at else 0
+        return ExrSequence(pattern, first, last, place + int(nudge))
     except Exception:
         return None

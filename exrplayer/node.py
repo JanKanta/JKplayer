@@ -1,5 +1,5 @@
 """
-The EXRplayer node - an anchor in the Node Graph plus ALL THE SETTINGS.
+The JKplayer node - an anchor in the Node Graph plus ALL THE SETTINGS.
 
 Deliberately in Python, not C++: the node no longer touches pixels (we read the
 files ourselves), so it is just a settings holder. Python = no compilation, no
@@ -8,8 +8,8 @@ DLL locked while Nuke runs, instant changes.
 Rules (the v2 brief):
   * two inputs A and B, and ONLY Read nodes with .exr (anything else is
     disconnected)
-  * both inputs must have THE SAME frame range (otherwise an error and B is
-    disconnected)
+  * the inputs may cover different frame ranges - it is only reported, and
+    the shorter one holds its end frame
   * a Viewer node cannot be attached
   * no nuke.execute - the node renders nothing
 
@@ -22,23 +22,33 @@ are recognised by their tag, so they keep working - just with a single input.
 
 import nuke
 
+from . import annotate
 from . import effects
 from . import exrcore
 from . import nukelut
 from . import ocio
+from . import sequence
 from .paths import total_ram_mb
 
 NODE_TAG = "cv_is_exrplayer"          # hidden knob, this is how we recognise the node
-# The tag used before the rename to EXRplayer. Nodes saved by an older version
+# The tag used before the rename to JKplayer. Nodes saved by an older version
 # still carry it, so they are recognised as well and keep all their settings.
 LEGACY_TAGS = ("cv_is_compareviewer",)
-DEFAULT_NAME = "EXRplayer"
+DEFAULT_NAME = "JKplayer"
 
 # Group = today's node (multiple inputs), NoOp = nodes from earlier versions.
 # Both are recognised by their tag, so an old script opens and keeps working.
 NODE_CLASSES = ("Group", "NoOp")
 
-INPUT_LABELS = ("A", "B")            # image inputs, the windows pick between them
+# The two image inputs. THREE names for them, on purpose:
+#   KEYS   go into knob names and must NEVER change - a released knob name is
+#          a contract with every saved script (see NODE_TAG for the same rule)
+#   LABELS are what people read: on the node, on the DAG arrows, in messages
+#   TAGS   are the short form for the buttons INSIDE the image, where there is
+#          room for one letter and a full word would swamp the picture
+INPUT_KEYS = ("a", "b")
+INPUT_LABELS = ("Comp", "Plate")
+INPUT_TAGS = ("C", "P")
 
 # The third input carries mattes in its RGBA channels. It is not an image, so a
 # window does not pick it as a source - it is only used in DiMatte mode to draw
@@ -52,12 +62,22 @@ ALL_INPUTS = INPUT_LABELS + (MATTE_LABEL,)
 MATTE_CHANNELS = ("r", "g", "b", "a")
 MATTE_LABELS = ("R", "G", "B", "A")
 
+# Where DiMatte reads its mattes. Order may change, a released NAME may not.
+# Comp layer FIRST, so it is what a new node starts on: a comp that carries its
+# own mattes is the ordinary case, and then there is nothing to wire up - the
+# node does not even grow the third input (see wanted_inputs).
+MATTE_FROM_LAYER, MATTE_FROM_INPUT = range(2)
+MATTE_SOURCES = ["Comp layer", "DiMatte input"]
+
 # Windows in the panel. Each one picks WHICH input it shows - so both can show
 # the same input and differ only by layer (rgba against depth of the same plate).
 SLOT_LABELS = ("1", "2")
 
-VIEW_SINGLE, VIEW_DOUBLE, VIEW_WIPE, VIEW_DIMATTE = range(4)
-VIEW_MODES = ["Single", "Double", "Wipe", "DiMatte"]
+# CAREFUL when adding one: a .nk stores an enumeration by its NAME, so the
+# order here may change, but a name that has been released must not.
+(VIEW_SINGLE, VIEW_DOUBLE, VIEW_OVERLAY, VIEW_WIPE, VIEW_DIMATTE,
+ VIEW_ANNOTATE) = range(6)
+VIEW_MODES = ["Single", "Double", "Difference", "Wipe", "DiMatte", "Annotation"]
 
 SPLIT_SIDE, SPLIT_STACK = range(2)
 SPLIT_MODES = ["Side by side", "Stacked"]
@@ -97,7 +117,7 @@ EFFECT_TIP = (
     "Check display (keys 1-%d in the panel). Switched off by the\n"
     "QC checkbox above, not by an item in the list:\n"
     "  Difference - difference of inputs A and B (overlay or plain)\n"
-    "  Grain      - shows the grain, suppresses edges by normalisation\n"
+    "  Grain      - fine grain on near-black; the display curve tames edges\n"
     "  High-pass  - keeps only detail in the given size band;\n"
     "               better than Grain for paint fixes and texture changes\n"
     "  Saturation - levels the brightness, only colour stays\n"
@@ -180,6 +200,28 @@ def _add_knobs(node):
     add(k)
 
     add(nuke.Text_Knob("cv_matte_head", "DiMatte - mattes over the image"))
+
+    k = nuke.Enumeration_Knob("cv_matte_source", "Mattes from", MATTE_SOURCES)
+    k.setTooltip("Where the mattes are read from.\n"
+                 "  %s  - the third input, a Read of its own\n"
+                 "  %s  - a LAYER of the %s input's own EXR, so a comp\n"
+                 "        that already carries its mattes needs nothing\n"
+                 "        wired up at all\n"
+                 "Only %s is offered: it is the reference being checked,\n"
+                 "and a matte belongs to the comp, not to what it is\n"
+                 "being compared against."
+                 % (MATTE_SOURCES[0], MATTE_SOURCES[1], INPUT_LABELS[0],
+                    INPUT_LABELS[0]))
+    add(k)
+
+    k = nuke.Enumeration_Knob("cv_matte_layer", "Matte layer",
+                              [exrcore.ROOT_LAYER])
+    k.setTooltip("Which layer of the file carries the mattes - whichever\n"
+                 "source is chosen above. The list is filled in from the\n"
+                 "file once one is attached, and the same menu sits in\n"
+                 "the DiMatte panel inside the image.")
+    add(k)
+
     for ch, label in zip(MATTE_CHANNELS, MATTE_LABELS):
         k = nuke.Boolean_Knob("cv_matte_%s" % ch, label)
         k.setValue(False)                 # start on a clean image
@@ -213,6 +255,103 @@ def _add_knobs(node):
     k.setTooltip("Opacity of input B in Wipe mode.\n"
                  "1 = a hard reveal at the line, lower blends B into A.\n"
                  "The same slider is in the image below the B controls.")
+    add(k)
+
+    k = nuke.File_Knob("cv_annot_dir", "Annotation folder")
+    k.setTooltip("Where Export writes the annotated frames.\n"
+                 "Only frames carrying a drawing or a note are written - the\n"
+                 "point is to hand someone the shots that need attention, not\n"
+                 "the whole shot.")
+    add(k)
+
+    k = nuke.String_Knob("cv_annot_name", "File name", "annotation_####.jpg")
+    k.setTooltip("Name of an exported file. #### becomes the frame number.\n"
+                 "Without any #, the number is added before the extension, so\n"
+                 "one file per frame either way.")
+    add(k)
+
+    k = nuke.Enumeration_Knob("cv_annot_color", "Pen colour",
+                              list(annotate.COLOR_NAMES))
+    k.setTooltip("Colour of new strokes and notes. Existing ones keep theirs.")
+    add(k)
+
+    k = nuke.Double_Knob("cv_annot_pen", "Pen width")
+    k.setValue(annotate.LINE_W)
+    k.setRange(0.5, 40.0)
+    k.setTooltip("Stroke width, in IMAGE pixels - so a line keeps its weight\n"
+                 "on the plate whatever you are zoomed to, and comes out of\n"
+                 "the export the thickness it looked.\n"
+                 "Existing strokes keep the width they were drawn with.")
+    add(k)
+
+    k = nuke.Boolean_Knob("cv_annot_scopes", "Export with scopes")
+    k.setValue(False)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Draws the histogram, vectorscope and waveform OF THAT FRAME\n"
+                 "down the right-hand side of the exported picture.\n"
+                 "Inside the format - the JPEG keeps the plate's resolution,\n"
+                 "the scopes sit on top of it.")
+    add(k)
+
+    k = nuke.Boolean_Knob("cv_annot_csv", "Export list (CSV)")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Writes '%s' next to the pictures: frame, which check it was\n"
+                 "seen in, the file it went to and what was written on it.\n"
+                 "A folder of JPEGs cannot be read without opening every one\n"
+                 "of them; this is the same review as a table.\n"
+                 "Semicolons and a BOM, so it opens straight into columns in\n"
+                 "Excel with the diacritics intact." % annotate.REPORT_NAME)
+    add(k)
+
+    k = nuke.Boolean_Knob("cv_annot_stamp", "Export with frame number")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Puts the frame number (and the check, when there is one) in\n"
+                 "the top left of the exported picture - otherwise a folder of\n"
+                 "JPEGs gives no way back to the frame a note is about.")
+    add(k)
+
+    k = nuke.Double_Knob("cv_annot_text", "Text size")
+    k.setValue(annotate.TEXT_H)
+    k.setRange(6.0, 200.0)
+    k.setTooltip("Height of a note, in IMAGE pixels (see Pen width).\n"
+                 "Existing notes keep the size they were written at.")
+    add(k)
+
+    k = nuke.Int_Knob("cv_annot_line", "Line length")
+    k.setValue(annotate.LINE_MAX)
+    k.setRange(annotate.LINE_MIN, 400)
+    k.setTooltip("Longest line of a note, in characters.\n"
+                 "It is a CEILING, not a fixed width: a note out in the middle\n"
+                 "of the frame gets lines this long, and they shorten to %d as\n"
+                 "it is moved towards either side edge so the block stays\n"
+                 "inside the picture.\n"
+                 "Applies to every note at once - the lines are laid out when\n"
+                 "the note is drawn, so changing this re-flows the ones already\n"
+                 "written too." % annotate.LINE_MIN)
+    add(k)
+
+    k = nuke.Enumeration_Knob(
+        "cv_overlay_qc", "Overlay compare",
+        [effects.OVERLAY_LABELS[m] for m in effects.OVERLAY_MODES])
+    k.setTooltip("Compares input A against input B, in Overlay mode.\n"
+                 "Off             - the plain dissolve.\n"
+                 "Difference      - |A-B|; lights up wherever they differ at\n"
+                 "                  all, a grade between them included.\n"
+                 "High-pass diff  - the same band taken out of both and then\n"
+                 "                  subtracted: only TEXTURE differences, with\n"
+                 "                  the overall level taken out first.\n"
+                 "The mix slider is the opacity of the result, so pulling it\n"
+                 "down dissolves the comparison back over A.")
+    add(k)
+
+    k = nuke.Double_Knob("cv_overlay_mix", "Overlay mix")
+    k.setValue(1.0)
+    k.setRange(0.0, 1.0)
+    k.setTooltip("How much of input B is mixed over A in Overlay mode.\n"
+                 "0 = only A, 1 = only B, in between a dissolve.\n"
+                 "The same slider is in the image, under the window controls.")
     add(k)
 
     k = nuke.Enumeration_Knob("cv_split", "Image split", SPLIT_MODES)
@@ -294,6 +433,42 @@ def _add_knobs(node):
     k.setTooltip("Playback stays inside the cached region (like RV).")
     add(k)
 
+    # ---- where each input sits in time ----
+    # One block per input, because the two are almost never delivered on the
+    # same numbering: a plate comes 1001-1100 and the render of it comes 1-100.
+    # They used to have to be lined up with a TimeOffset node outside the
+    # player. This replaces it: one place, saved with the settings, and shown
+    # next to the range it produces.
+    for key, label in zip(INPUT_KEYS, INPUT_LABELS):
+        add(nuke.Text_Knob("cv_in_div_%s" % key, ""))
+
+        k = nuke.Text_Knob("cv_in_info_%s" % key, label, "-")
+        k.setTooltip("What is attached to input %s: its size, and the range it "
+                     "covers ON THE TIMELINE once everything below has been\n"
+                     "applied. Read-only - it is what the player ended up "
+                     "with, so the two fields underneath can never be\n"
+                     "ambiguous." % label)
+        add(k)
+
+        k = nuke.Int_Knob("cv_in_start_%s" % key, "Start at")
+        k.setValue(0)
+        k.setRange(0, 1000000)
+        k.setTooltip("Put the FIRST frame of input %s at this timeline frame.\n"
+                     "0 = leave it where the files say it is.\n"
+                     "This is the absolute placement: to line a 1-100 render "
+                     "up under a 1001-1100 plate, set 1001." % label)
+        add(k)
+
+        k = nuke.Int_Knob("cv_in_offset_%s" % key, "Offset")
+        k.setValue(0)
+        k.setRange(-100000, 100000)
+        k.clearFlag(nuke.STARTLINE)
+        k.setTooltip("A nudge in frames, on top of 'Start at'. Positive moves "
+                     "input %s LATER on the timeline.\n"
+                     "For the usual 'it is one frame out' - the placement stays "
+                     "where it is and this says by how much." % label)
+        add(k)
+
     # ---- Cache ----
     add(nuke.Tab_Knob("cv_cache_tab", "Cache"))
 
@@ -301,7 +476,7 @@ def _add_knobs(node):
     k = nuke.Int_Knob("cv_cache_mb", "Cache memory (MB)")
     k.setValue(default_cache_mb())
     k.setRange(256, 65536)
-    k.setTooltip("How much RAM the EXRplayer panel may use for frames.\n"
+    k.setTooltip("How much RAM the JKplayer panel may use for frames.\n"
                  "Default = a quarter of the machine's RAM%s.\n\n"
                  "Memory per frame (RGBA half):\n"
                  "  1080p ~16 MB   |   4K ~66 MB   |   6K ~148 MB"
@@ -311,8 +486,10 @@ def _add_knobs(node):
     k = nuke.Int_Knob("cv_lookahead", "Look-ahead (frames)")
     k.setValue(24)
     k.setRange(0, 200)
-    k.setTooltip("How many frames ahead of the playhead are pre-fetched in the\n"
-                 "playback direction.")
+    k.setTooltip("MINIMUM number of frames pre-fetched ahead of the playhead in\n"
+                 "the playback direction. The effective depth also follows the\n"
+                 "play rate (about 1.5 s of playback), so it grows with the FPS -\n"
+                 "this is the floor under that, capped by what fits in the cache.")
     add(k)
 
     k = nuke.Int_Knob("cv_behind", "Look-behind (frames)")
@@ -325,11 +502,40 @@ def _add_knobs(node):
     k = nuke.Int_Knob("cv_workers", "Decoding threads")
     k.setValue(4)
     k.setRange(1, 32)
-    k.setTooltip("Number of threads decoding EXR.\n"
-                 "More is NOT more: measured 4 threads = 115 fps, 8 threads =\n"
-                 "100 fps, 12 threads = 92 fps (memory bandwidth is the limit,\n"
-                 "not the core count).\n"
+    k.setTooltip("Number of threads decoding EXR (filling the cache).\n"
+                 "More is NOT automatically better: decoding and drawing fight\n"
+                 "over the same memory bandwidth, so threads spent here are\n"
+                 "taken away from the display. Measured on 4K, with a QC check\n"
+                 "on: 4 decode threads = 9.3 fps drawn, 8 = 6.0, 12 = 4.8 -\n"
+                 "even though the decoding itself got faster.\n"
+                 "Balance it against 'QC threads' below.\n"
                  "The change takes effect after reopening the panel.")
+    add(k)
+
+    k = nuke.Boolean_Knob("cv_qc_full_play", "QC full quality while playing")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("ON:  the check always shows REAL data, at full resolution.\n"
+                 "     This is a QC tool, so that is the default - a check you\n"
+                 "     cannot trust while it plays is worth little.\n"
+                 "     Costs frames: measured on 4K at 100 % zoom, grain runs\n"
+                 "     at about 18 fps rather than 24 (zoomed in it is fine,\n"
+                 "     there are fewer pixels on screen).\n"
+                 "OFF: while playing or moving, the check is computed coarser\n"
+                 "     and sharpens up a moment after you stop. Smoother, but\n"
+                 "     what you see mid-playback is an approximation.")
+    add(k)
+
+    k = nuke.Int_Knob("cv_qc_threads", "QC threads")
+    k.setValue(4)
+    k.setRange(1, 32)
+    k.setTooltip("Threads the QC checks (grain, high-pass) are computed on.\n"
+                 "This is the DISPLAY side: the picture is split into\n"
+                 "horizontal bands, one per thread. Measured on 4K grain:\n"
+                 "1 thread = 70 ms (13 fps), 4 = 41 ms (24 fps),\n"
+                 "6 = 31 ms (32 fps).\n"
+                 "Shares memory bandwidth with the decoding threads above, so\n"
+                 "the two want balancing rather than both set to maximum.")
     add(k)
 
     k = nuke.Boolean_Knob("cv_auto_cache", "Cache the whole range automatically")
@@ -399,7 +605,7 @@ def _add_knobs(node):
     add(nuke.Text_Knob("cv_info_div", ""))
     info = nuke.Text_Knob("cv_info", "",
                           "Display is handled by the panel:  "
-                          "EXRplayer > Open EXRplayer Panel")
+                          "JKplayer > Open JKplayer Panel")
     add(info)
     apply_color_visibility(node)
     apply_view_visibility(node)
@@ -433,7 +639,7 @@ def apply_view_visibility(node):
         mode = int(node["cv_view_mode"].getValue())
     except Exception:
         return
-    both = mode in (VIEW_DOUBLE, VIEW_WIPE)   # both windows have something to do
+    both = mode in (VIEW_DOUBLE, VIEW_WIPE, VIEW_OVERLAY)   # two live windows
     # DiMatte is like Single: one window, only with mattes over it
 
     def show(name, want):
@@ -442,8 +648,18 @@ def apply_view_visibility(node):
 
     show("cv_split", mode == VIEW_DOUBLE)     # a wipe is not split, it overlaps
     show("cv_wipe_opacity", mode == VIEW_WIPE)
+    show("cv_overlay_mix", mode == VIEW_OVERLAY)
+    show("cv_overlay_qc", mode == VIEW_OVERLAY)
+    for name in ("cv_annot_dir", "cv_annot_name", "cv_annot_color",
+                 "cv_annot_pen", "cv_annot_text", "cv_annot_line",
+                 "cv_annot_scopes", "cv_annot_stamp", "cv_annot_csv"):
+        show(name, mode == VIEW_ANNOTATE)
     show("cv_scope_opacity", not both)        # belongs to the scopes, Single only
     show("cv_matte_head", mode == VIEW_DIMATTE)
+    show("cv_matte_source", mode == VIEW_DIMATTE)
+    # The layer applies to EITHER source - a DiMatte input is an EXR too and
+    # may carry its mattes in a layer of its own - so it is offered for both.
+    show("cv_matte_layer", mode == VIEW_DIMATTE)
     for name in ("cv_matte_light", "cv_matte_gain", "cv_matte_gamma"):
         show(name, mode == VIEW_DIMATTE)
     for ch in MATTE_CHANNELS:
@@ -477,7 +693,7 @@ def apply_color_visibility(node):
 
 # ---------------------------------------------------------------------------
 def create():
-    """Creates an EXRplayer node and returns it.
+    """Creates an JKplayer node and returns it.
 
     `nuke.createNode` (unlike `nuke.nodes.Group()`) behaves like an ordinary
     Nuke node: it attaches to the selected node and is placed right below it.
@@ -515,20 +731,35 @@ def _inner_inputs(node):
     return out
 
 
-def _build_inputs(node):
-    """Adds the missing Input nodes inside the group. Returns their names.
+def wanted_inputs(node):
+    """The inputs this node should HAVE, given its settings.
 
-    This is done on an existing node too (see ensure_inputs): a Group with no
-    Input nodes has zero inputs and there is nowhere to attach a Read to it in
-    the Node Graph.
+    The DiMatte input only exists when the mattes are actually read from it.
+    An arrow that leads nowhere is worse than no arrow: people wire a Read into
+    it, nothing happens, and there is no way to tell that the setting above
+    decided the mattes come from the Comp layer instead.
+    """
+    try:
+        from_input = int(node["cv_matte_source"].getValue()) == MATTE_FROM_INPUT
+    except Exception:
+        from_input = False        # a node from before the setting existed
+    return list(ALL_INPUTS) if from_input else list(INPUT_LABELS)
+
+
+def _build_inputs(node):
+    """Makes the inside of the group match wanted_inputs. Returns what changed.
+
+    Done on an existing node too (see ensure_inputs): a Group with no Input
+    nodes has zero inputs and there is nowhere to attach a Read to it.
     """
     if node.Class() != "Group":
         return []
-    added = []
+    want = wanted_inputs(node)
+    changed = []
     node.begin()
     try:
         have = _inner_inputs(node)
-        for i, label in enumerate(ALL_INPUTS):
+        for i, label in enumerate(want):
             if i in have:
                 continue
             k = nuke.createNode("Input", inpanel=False)
@@ -538,14 +769,30 @@ def _build_inputs(node):
             except Exception:
                 pass                          # name taken, the number is enough
             have[i] = k
-            added.append(label)
+            changed.append("+" + label)
+        # ... and take away the ones that are not wanted any more - but NEVER
+        # one that has something wired into it. Removing the Input takes the
+        # connection with it, and silently dropping a Read somebody attached is
+        # not ours to do. The arrow simply stays until it is unplugged, and
+        # then it goes on its own.
+        for i in sorted(have, reverse=True):
+            if i < len(want):
+                continue
+            try:
+                if node.input(i) is not None:
+                    continue                  # in use - leave it alone
+                name = have[i].name()
+                nuke.delete(have[i])
+                changed.append("-" + name)
+            except Exception:
+                pass
         # Output only so the group is not empty - nothing renders through it
         if not [k for k in node.nodes() if k.Class() == "Output"]:
             out = nuke.createNode("Output", inpanel=False)
             out.setInput(0, have.get(0))
     finally:
         node.end()
-    return added
+    return changed
 
 
 def ensure_inputs(node):
@@ -553,13 +800,13 @@ def ensure_inputs(node):
     if not is_player_node(node) or node.Class() != "Group":
         return []
     try:
-        added = _build_inputs(node)
-        if added:
-            nuke.tprint("EXRplayer: added inputs on %s: %s"
-                        % (node.name(), ", ".join(added)))
-        return added
+        changed = _build_inputs(node)
+        if changed:
+            nuke.tprint("JKplayer: inputs on %s: %s"
+                        % (node.name(), ", ".join(changed)))
+        return changed
     except Exception as exc:
-        nuke.tprint("EXRplayer: cannot add the inputs (%s)" % exc)
+        nuke.tprint("JKplayer: cannot add the inputs (%s)" % exc)
         return []
 
 
@@ -599,7 +846,7 @@ def prune_knobs(node):
         except Exception:
             continue                          # will not go? at least do not crash
     if removed:
-        nuke.tprint("EXRplayer: removed obsolete knobs on %s: %s"
+        nuke.tprint("JKplayer: removed obsolete knobs on %s: %s"
                     % (node.name(), ", ".join(removed)))
     return removed
 
@@ -638,10 +885,10 @@ def ensure_order(node):
                 pass
         apply_color_visibility(node)
         apply_view_visibility(node)
-        nuke.tprint("EXRplayer: knob order fixed on %s" % node.name())
+        nuke.tprint("JKplayer: knob order fixed on %s" % node.name())
         return True
     except Exception as exc:
-        nuke.tprint("EXRplayer: cannot fix the knob order (%s)" % exc)
+        nuke.tprint("JKplayer: cannot fix the knob order (%s)" % exc)
         return False
 
 
@@ -658,11 +905,17 @@ def ensure_knobs(node):
         _add_knobs(node)
         added = set(node.knobs()) - before
         if added:
-            nuke.tprint("EXRplayer: added knobs on %s: %s"
+            nuke.tprint("JKplayer: added knobs on %s: %s"
                         % (node.name(), ", ".join(sorted(added))))
+            # AND PUT THEM WHERE THEY BELONG. Nuke appends a new knob at the
+            # very end, which means after the last Tab_Knob - so a knob added
+            # to the Playback or the DiMatte block landed in the last tab
+            # instead, where nobody would ever look for it. ensure_order was
+            # written for exactly this and was never being called.
+            ensure_order(node)
         return added
     except Exception as exc:
-        nuke.tprint("EXRplayer: cannot add the knobs (%s)" % exc)
+        nuke.tprint("JKplayer: cannot add the knobs (%s)" % exc)
         return set()
 
 
@@ -719,9 +972,16 @@ def settings(node):
         "lookahead": int(val("cv_lookahead", 24)),
         "behind": int(val("cv_behind", 4)),
         "workers": int(val("cv_workers", 8)),
+        "qc_threads": int(val("cv_qc_threads", 4)),
+        "qc_full_play": bool(val("cv_qc_full_play", True)),
         "auto_cache": bool(val("cv_auto_cache", True)),
         "fps": fps,
         "loop": enum("cv_loop", 0),              # 0 loop, 1 ping-pong, 2 stop
+        # (start_at, offset) per input; 0 for start_at means "leave alone"
+        "in_timing": tuple(
+            (int(val("cv_in_start_%s" % key, 0)),
+             int(val("cv_in_offset_%s" % key, 0)))
+            for key in INPUT_KEYS),
         "realtime": bool(val("cv_realtime", True)),
         "cached_only": bool(val("cv_play_cached_only", False)),
         # the layer and source of each window (see SLOT_LABELS)
@@ -741,6 +1001,19 @@ def settings(node):
         "nuke_input": str(val("cv_nuke_input", nukelut.DEFAULT_INPUT)),
         "scope_opacity": float(val("cv_scope_opacity", DEFAULT_SCOPE_OPACITY)),
         "wipe_opacity": float(val("cv_wipe_opacity", 1.0)),
+        "overlay_mix": float(val("cv_overlay_mix", 1.0)),
+        "overlay_qc": enum("cv_overlay_qc", 0),
+        "annot_dir": str(val("cv_annot_dir", "")),
+        "annot_name": str(val("cv_annot_name", "annotation_####.jpg")),
+        "annot_color": enum("cv_annot_color", 0),
+        "annot_pen": float(val("cv_annot_pen", annotate.LINE_W)),
+        "annot_text": float(val("cv_annot_text", annotate.TEXT_H)),
+        "annot_line": int(val("cv_annot_line", annotate.LINE_MAX)),
+        "annot_scopes": bool(val("cv_annot_scopes", False)),
+        "annot_csv": bool(val("cv_annot_csv", True)),
+        "annot_stamp": bool(val("cv_annot_stamp", True)),
+        "matte_source": enum("cv_matte_source", MATTE_FROM_INPUT),
+        "matte_layer": str(val("cv_matte_layer", exrcore.ROOT_LAYER)),
         "matte": tuple(bool(val("cv_matte_%s" % ch, False))
                        for ch in MATTE_CHANNELS),
         "matte_light": float(val("cv_matte_light", 1.0)),
@@ -759,10 +1032,10 @@ def settings(node):
 # Input policing: only a Read with .exr, no Viewer
 # ---------------------------------------------------------------------------
 def enforce_no_viewer():
-    """Disconnects every Viewer that has an EXRplayer node on its input.
+    """Disconnects every Viewer that has an JKplayer node on its input.
 
     MIND THE DIRECTION: when a user "attaches a Viewer to the node", it is the
-    VIEWER that has our node on its input (Viewer.input(0) = EXRplayer). Our
+    VIEWER that has our node on its input (Viewer.input(0) = JKplayer). Our
     node knows nothing about it in its own inputs - which is why it has to be
     searched for this way, downstream. Returns the names of the disconnected
     Viewers.
@@ -784,8 +1057,17 @@ def enforce_no_viewer():
 
 
 def _frame_range(src):
+    """The range an input covers, as the FILES have it.
+
+    Not where it ends up on the timeline: the per-input 'Start at' and 'Offset'
+    move it afterwards, and this is only used to report a length mismatch -
+    which shifting does not change.
+    """
+    read = sequence.resolve_source(src)
+    if read is None:
+        return None
     try:
-        return int(src.firstFrame()), int(src.lastFrame())
+        return (int(read.firstFrame()), int(read.lastFrame()))
     except Exception:
         return None
 
@@ -804,13 +1086,35 @@ def _enforce_one(node, index):
     if cls == "Viewer":
         node.setInput(index, None)
         return "A Viewer node cannot be attached."
-    if cls != "Read":
+    # Not "is this a Read" but "does this LEAD to one" - a dot in between is
+    # followed through (see sequence.resolve_source). Anything
+    # that changes the picture still stops it: the player reads the EXRs off
+    # disk itself, so it would show the untouched plate and pass it off as the
+    # result.
+    read = sequence.resolve_source(src)
+    if read is None:
         node.setInput(index, None)
-        return ("Input %s: only a Read node can be attached (this is %s). "
-                "EXRplayer reads EXR files directly and does not work with "
-                "other nodes." % (label, cls))
+        # Names the actual node and says what IS allowed. The old wording gave
+        # the class and left people guessing why the connection sprang back -
+        # and a Reformat is the first thing anybody reaches for, so it gets
+        # told where the same job is done instead.
+        extra = ""
+        if cls == "TimeOffset":
+            extra = ("\n  Shifting is done on the node now: Playback tab, "
+                     "'Start at' and 'Offset' for this input.")
+        elif cls == "Reformat":
+            extra = ("\n  For A/B of different sizes there is nothing to do: "
+                     "the player fits B onto A itself when it compares them.")
+        return ("Input %s: '%s' (%s) cannot be honoured, so it was "
+                "disconnected.\n  Allowed on the way to the Read: %s. "
+                "Everything else changes the picture, and the player reads "
+                "the EXR files off disk itself - it would show the untouched "
+                "plate and pass it off as the result.%s"
+                % (label, src.name(), cls,
+                   ", ".join(sequence.PASSTHROUGH),
+                   extra))
     try:
-        path = src["file"].value()
+        path = read["file"].value()
     except Exception:
         path = ""
     if not path.lower().endswith(".exr"):
@@ -822,9 +1126,11 @@ def _enforce_one(node, index):
 def enforce_input(node):
     """Disconnects a disallowed input. Returns the problem text, or None if fine.
 
-    Besides the input type it also checks that both have THE SAME frame range.
-    Without that the playhead would point at different frames on the two sides
-    and the comparison would lie - so B is disconnected and an error reported.
+    The TYPE of an input is enforced - a node whose picture we cannot reproduce
+    is disconnected, because showing the untouched plate as if it were the
+    result would be a lie. A frame range that does not match is not: it is
+    reported and left alone. Wanting to see a plate against a shorter test
+    render is ordinary, and refusing to wire it up helped nobody.
     """
     if not is_player_node(node):
         return None
@@ -842,8 +1148,21 @@ def enforce_input(node):
     if a is None or b is None:
         return None
     ra, rb = _frame_range(a), _frame_range(b)
-    if ra is None or rb is None or ra == rb:
+    if ra is None or rb is None:
         return None
-    node.setInput(1, None)
-    return ("Input B disconnected: both inputs must have the same frame range "
-            "(A %d-%d, B %d-%d)." % (ra[0], ra[1], rb[0], rb[1]))
+    # Different lengths are ALLOWED and only reported. They used to disconnect
+    # B, which meant a plate against a shorter test render - a perfectly
+    # ordinary thing to want to look at - could not be wired up at all. The
+    # sequence clamps outside its own range (see ExrSequence.path_for), so the
+    # shorter side simply holds its first or last frame instead of failing.
+    #
+    # Still said out loud: past the end of the shorter input the two sides no
+    # longer show the same moment, and a difference there is comparing a frame
+    # against a held still.
+    if (ra[1] - ra[0]) == (rb[1] - rb[0]):
+        return None
+    return ("Inputs cover a different number of frames (A %d-%d is %d, "
+            "B %d-%d is %d). The shorter one holds its end frame outside its "
+            "own range, so a comparison there is against a held still."
+            % (ra[0], ra[1], ra[1] - ra[0] + 1,
+               rb[0], rb[1], rb[1] - rb[0] + 1))

@@ -15,8 +15,10 @@ from .qtcompat import QtCore, QtGui, QtWidgets, event_pos
 # heights of the individual bands (from the bottom) - kept low so the timeline
 # does not eat space
 TIMELINE_H = 30      # total height of the strip
-CACHE_H = 4          # yellow cache strip
+CACHE_H = 4          # cache strip, one input
+CACHE_H2 = 7         # ...and with two, so each line is still 3 px
 MARK_H = 6           # band with the IN/OUT triangles
+ALT_H = 11           # second number row: input B in ITS OWN numbering
 LABEL_H = 12         # bubble with the frame number
 HANDLE_GRAB = 7      # how close to a marker the mouse grabs it
 
@@ -50,7 +52,13 @@ class Timeline(QtWidgets.QWidget):
         self._in = 1
         self._out = 100
         self._frame = 1
-        self._cache_runs = []          # [(from, to), ...]
+        self._cache_runs = []          # [(from, to), ...] - input A
+        self._cache_runs_b = []        # the same for input B, its own line
+        self._annot_runs = []          # frames carrying a drawn note
+        # Input B's own numbering, for the second row under the cache lanes.
+        # (shift, first, last) on the TIMELINE; shift is what has to come off a
+        # timeline frame to get back to B's own. None = one input, no row.
+        self._alt = None
         self._drag = None              # None | "frame" | "in" | "out" | "pan"
         self._pan_x = 0.0
         self._pan_view = None
@@ -61,9 +69,22 @@ class Timeline(QtWidgets.QWidget):
         self.c_bg_out = QtGui.QColor(26, 26, 26)      # outside IN/OUT
         self.c_tick = QtGui.QColor(90, 90, 90)
         self.c_text = QtGui.QColor(170, 170, 170)
-        self.c_cache = QtGui.QColor(240, 200, 40)     # yellow = in RAM (solid bar)
+        # Cache lines. Saturated on purpose - they are thin, and a washed-out
+        # 2 px line at the bottom of a dark strip is not a readout. Input A
+        # keeps the yellow it always had; B gets orange, far enough apart to
+        # tell at a glance which one is behind.
+        self.c_cache = QtGui.QColor(255, 205, 20)     # A = in RAM
+        self.c_cache_b = QtGui.QColor(255, 120, 20)   # B = in RAM
         self.c_cache_bg = QtGui.QColor(240, 200, 40, 46)   # soft tint
+        # blue = there is a drawn note on this frame. Semi-transparent so the
+        # cache underneath still shows through - the two say different things
+        # and neither should hide the other.
+        self.c_annot = QtGui.QColor(70, 150, 255, 150)
         self.c_play = QtGui.QColor(235, 235, 235)
+        # the second row is tinted like B's cache line, so there is no doubt
+        # which input those numbers belong to
+        self.c_alt_text = QtGui.QColor(255, 150, 70)
+        self.c_alt_bg = QtGui.QColor(22, 22, 22)
         self.c_mark = QtGui.QColor(120, 170, 255)
 
     # ------------------------------------------------------------------ API
@@ -122,8 +143,48 @@ class Timeline(QtWidgets.QWidget):
             self.ensure_visible(frame)     # when zoomed in, follow the playhead
             self.update()
 
-    def set_cache_runs(self, runs):
-        self._cache_runs = runs or []
+    def set_cache_runs(self, runs, second=None):
+        """Cached frames. `second` is the OTHER input, drawn as its own line.
+
+        Two lines rather than one: with a single bar showing where both inputs
+        agree, an input still filling up looked identical to one that was not
+        loading at all, and there was no way to tell which of the two was
+        holding playback back.
+        """
+        runs = runs or []
+        second = second or []
+        if runs == self._cache_runs and second == self._cache_runs_b:
+            return
+        self._cache_runs = runs
+        self._cache_runs_b = second
+        self.update()
+
+    def set_alt_numbering(self, shift=None, first=None, last=None):
+        """A second row of frame numbers: input B in ITS OWN numbering.
+
+        The timeline counts in one set of numbers, but the two inputs are
+        almost never delivered on the same one - a plate at 1001 against a
+        render at 1. Reading the shift off the node and doing the arithmetic in
+        your head is exactly the sort of thing that goes wrong at 8pm, so B's
+        own numbers are written under the cache lanes and can simply be read.
+
+        `shift` is what to take off a timeline frame to get B's own number.
+        None (or no B at all) hides the row and the strip goes back to its
+        original height.
+        """
+        alt = None if shift is None else (int(shift), int(first), int(last))
+        if alt == self._alt:
+            return
+        self._alt = alt
+        self.setFixedHeight(TIMELINE_H + (ALT_H if alt else 0))
+        self.update()
+
+    def set_annotated(self, runs):
+        """Which frames carry a drawn note - see annotate.Annotations.runs()."""
+        runs = runs or []
+        if runs == self._annot_runs:
+            return
+        self._annot_runs = runs
         self.update()
 
     def set_in_out(self, mark_in, mark_out):
@@ -178,7 +239,8 @@ class Timeline(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
         w, h = self.width(), self.height()
         cw = self._cell_w()
-        track_h = h - MARK_H                    # above the marker band
+        alt_h = ALT_H if self._alt else 0
+        track_h = h - MARK_H - alt_h            # above B's numbers and the markers
 
         # background: the whole strip dark, the IN..OUT area lighter
         p.fillRect(0, 0, w, track_h, self.c_bg_out)
@@ -188,17 +250,45 @@ class Timeline(QtWidgets.QWidget):
 
         # CACHE - two layers, so it reads well even in a narrow strip:
         #   1) a soft tint over the whole cached area
-        #   2) a solid strip along the bottom edge
+        #   2) a solid strip along the bottom edge - one LINE PER INPUT, so an
+        #      input that is still filling cannot be mistaken for one that is
+        #      not loading at all. With a single input there is one line, the
+        #      full height it always was.
         p.setPen(QtCore.Qt.NoPen)
-        cy = track_h - CACHE_H
-        for a, b in self._cache_runs:
+        two = bool(self._cache_runs_b)
+        if two:
+            # Taller when it has to carry two: splitting the single-input
+            # height would leave 1.5 px a line, which is not a readout.
+            line_h = (CACHE_H2 - 1) / 2.0
+            lanes = [(self._cache_runs, track_h - CACHE_H2, line_h,
+                      self.c_cache),
+                     (self._cache_runs_b, track_h - line_h, line_h,
+                      self.c_cache_b)]
+        else:
+            lanes = [(self._cache_runs, track_h - CACHE_H, CACHE_H,
+                      self.c_cache)]
+        for runs, y, line_h, color in lanes:
+            for a, b in runs:
+                if b < self._vfirst or a > self._vlast:
+                    continue                          # outside the zoomed part
+                xa = self._x(max(a, self._vfirst))
+                xb = self._x(min(b, self._vlast)) + cw
+                width_px = max(1.0, xb - xa)
+                p.fillRect(QtCore.QRectF(xa, 0, width_px, track_h),
+                           self.c_cache_bg)
+                p.fillRect(QtCore.QRectF(xa, y, width_px, line_h), color)
+
+        # ANNOTATED frames, over the cache and under the ticks: a solid block
+        # down the whole track, because "there is a note here" is what you scan
+        # the timeline for, and a thin line at the edge would be lost among the
+        # cache stripes.
+        for a, b in self._annot_runs:
             if b < self._vfirst or a > self._vlast:
-                continue                              # outside the zoomed part
+                continue
             xa = self._x(max(a, self._vfirst))
             xb = self._x(min(b, self._vlast)) + cw
-            width_px = max(1.0, xb - xa)
-            p.fillRect(QtCore.QRectF(xa, 0, width_px, track_h), self.c_cache_bg)
-            p.fillRect(QtCore.QRectF(xa, cy, width_px, CACHE_H), self.c_cache)
+            p.fillRect(QtCore.QRectF(xa, 0, max(1.0, xb - xa), track_h),
+                       self.c_annot)
 
         # ticks and frame numbers (spacing follows the width)
         font = p.font()
@@ -216,10 +306,28 @@ class Timeline(QtWidgets.QWidget):
                            QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, str(f))
             f += step
 
+        # INPUT B'S OWN NUMBERS, directly under the cache lanes.
+        # Deliberately at the SAME tick positions as the row above, because the
+        # whole point is reading one against the other: 1001 over 0001 says the
+        # shift at a glance, where two rows on different steps would say nothing.
+        if self._alt:
+            shift, afirst, alast = self._alt
+            p.fillRect(0, track_h, w, alt_h, self.c_alt_bg)
+            p.setPen(self.c_alt_text)
+            f = self._vfirst - (self._vfirst % step) if step else self._vfirst
+            while f <= self._vlast:
+                # only where B actually has frames - past its end it is holding
+                # a still, and printing numbers there would invent footage
+                if f >= self._vfirst and afirst <= f <= alast:
+                    p.drawText(QtCore.QRectF(self._x(f) + 2, track_h, 60, alt_h),
+                               QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                               str(f - shift))
+                f += step
+
         # the IN/OUT marker band
-        p.fillRect(0, track_h, w, MARK_H, QtGui.QColor(20, 20, 20))
-        self._draw_marker(p, self._x(self._in), track_h, True)
-        self._draw_marker(p, self._x(self._out) + cw, track_h, False)
+        p.fillRect(0, track_h + alt_h, w, MARK_H, QtGui.QColor(20, 20, 20))
+        self._draw_marker(p, self._x(self._in), track_h + alt_h, True)
+        self._draw_marker(p, self._x(self._out) + cw, track_h + alt_h, False)
 
         # playhead
         px = self._x(self._frame)

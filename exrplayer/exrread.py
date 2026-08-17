@@ -95,6 +95,10 @@ class ExrFile(object):
         self.compression = None
         self.x0 = self.y0 = 0
         self.width = self.height = 0
+        # 1.0 unless the file says otherwise. Anamorphic and 2K/HD-squeezed
+        # plates carry it, and without it a 2:1 squeeze reads as "the two
+        # inputs are different shapes" when they are the same picture.
+        self.pixel_aspect = 1.0
 
         i = 8
         while True:
@@ -114,6 +118,10 @@ class ExrFile(object):
                 self.width, self.height = x1 - x0 + 1, y1 - y0 + 1
             elif name == "channels":
                 self.channels = _parse_channels(body)
+            elif name == "pixelAspectRatio" and size >= 4:
+                par = struct.unpack_from("<f", body, 0)[0]
+                if par > 0.0:
+                    self.pixel_aspect = float(par)
 
         for _cname, ptype in self.channels:
             if ptype not in _NPTYPE:
@@ -341,6 +349,7 @@ def probe(path):
     try:
         e = ExrFile(path)
         return {"width": e.width, "height": e.height,
+                "pixel_aspect": e.pixel_aspect,
                 "compression": COMPRESSION_NAMES.get(e.compression, e.compression),
                 "channels": [c[0] for c in e.channels],
                 "supported": True}

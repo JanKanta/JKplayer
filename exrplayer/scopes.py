@@ -41,6 +41,8 @@ All of them respect the channel selection - with R/G/B only that channel is
 drawn, with A the alpha and with Y the luminance.
 """
 
+import math
+
 import numpy as np
 
 # ---------------------------------------------------------------- histogram
@@ -301,9 +303,33 @@ def _pack(binned, over):
     return curves, colors, max(over) if over else 0.0
 
 
+# Where to put a mark on the scene-linear axis, and which of them get a
+# number written by them. Powers of two above 1.0 because the axis is
+# logarithmic there, so they come out evenly spaced; 0.18 below it because mid
+# grey is the one reference everybody exposes against.
+#
+# Not every mark is labelled - six numbers across a 230 px strip would collide
+# and the strip would read as a row of digits rather than as a scale. The
+# unlabelled ones are still drawn, so a value between two labels can be counted
+# off instead of guessed.
+LINEAR_MARKS = ((0.0, "0"), (0.18, "0.18"), (0.5, ""), (1.0, "1"),
+                (2.0, ""), (4.0, "4"), (8.0, ""), (16.0, "16"),
+                (32.0, ""), (HIST_MAX, "55"))
+
+
+def _axis_marks(marks):
+    """[(position 0..1, text)] - the values put through value_to_pos.
+
+    Built from the same function the data goes through, so a mark sits exactly
+    where that value lands and cannot drift away from the curve above it.
+    """
+    return [(float(value_to_pos(np.float32(v))), text) for v, text in marks]
+
+
 # histogram axis: (position of the clipping line 0..1, labels [(position, text)])
-AXIS_LINEAR = (HIST_SPLIT, [(0.0, "0"), (HIST_SPLIT, "1"), (1.0, "55")])
-AXIS_DISPLAY = (1.0, [(0.0, "0"), (0.5, "128"), (1.0, "255")])
+AXIS_LINEAR = (HIST_SPLIT, _axis_marks(LINEAR_MARKS))
+AXIS_DISPLAY = (1.0, [(0.0, "0"), (0.25, ""), (0.5, "128"),
+                      (0.75, ""), (1.0, "255")])
 
 
 def histogram_display(rgb8, channel="rgb"):
@@ -522,6 +548,26 @@ With a single channel the trace is a STRAIGHT LINE out of the centre, and
     return _vectorscope_grid(rgb, size)
 
 
+def vectorscope_point(rgb):
+    """(x, y) in -1..1 for ONE display-space pixel, or None.
+
+    The same arithmetic _vectorscope_grid does, deliberately sharing the
+    constants: the probe dot has to land exactly on the trace that pixel made,
+    and a second copy of the maths would drift away from it the first time
+    either was touched.
+    """
+    if rgb is None or len(rgb) < 3:
+        return None
+    r, g, b = float(rgb[0]), float(rgb[1]), float(rgb[2])
+    y = _KR * r + _KG * g + _KB * b
+    dx = ((b - y) / _CB_D) * (VS_GAIN / 128.0)
+    dy = ((r - y) / _CR_D) * (VS_GAIN / 128.0)
+    rad = math.hypot(dx, dy)
+    if rad > 1.0:                  # radial clip, the same rule as the grid
+        dx, dy = dx / rad, dy / rad
+    return dx, dy
+
+
 def target_colors():
     """{target name: (r,g,b)} - each in its own colour, so it reads instantly."""
     base = {"R": (255, 60, 60), "Yl": (235, 235, 70), "G": (70, 235, 90),
@@ -569,8 +615,7 @@ WF_H = 128             # steps on the vertical axis (0 at the bottom, the top
 
 # Waveform axis: (position of the 1.0 line or None, labels [(position, text)]).
 # Positions are measured FROM THE BOTTOM, 0 = value 0, 1 = top of the axis.
-WF_AXIS_LINEAR = (HIST_SPLIT, [(0.0, "0"), (HIST_SPLIT * 0.5, ""),
-                               (HIST_SPLIT, "1"), (1.0, "55")])
+WF_AXIS_LINEAR = (HIST_SPLIT, _axis_marks(LINEAR_MARKS))
 WF_AXIS_DISPLAY = (None, [(0.0, "0"), (0.25, ""), (0.5, "128"),
                           (0.75, ""), (1.0, "255")])
 

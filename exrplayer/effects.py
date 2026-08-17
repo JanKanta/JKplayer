@@ -13,7 +13,12 @@ Why some effects work in the display domain and others in linear:
     above 1).
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
+
+from . import nukelut
 
 try:
     from scipy import ndimage as _ndi
@@ -21,7 +26,9 @@ except Exception:
     _ndi = None
 
 NONE = "none"
+LOG = "log"
 DIFF = "diff"
+HPDIFF = "hpdiff"
 GRAIN = "grain"
 BANDPASS = "bandpass"
 SAT = "sat"
@@ -29,24 +36,45 @@ CANVAS = "canvas"
 VALUEMAP = "valuemap"
 TEMPORAL = "temporal"
 
-# Ordered by group: first the difference between inputs, then detail and its
-# changes (grain, high-pass, temporal), then colour and exposure (saturation,
-# value map). Canvas is last on purpose - it is not a computation over the
-# image like the others, just a shifted crop, and it is the only one displayed
-# through the ordinary display transform.
+# The QC menu of ONE window: detail and its changes (grain, high-pass,
+# temporal), then colour and exposure (saturation, value map). Canvas is last
+# on purpose - it is not a computation over the image like the others, just a
+# shifted crop, and it is the only one displayed through the ordinary display
+# transform.
 #
-# NONE is NOT in the list: QC is switched off by its toggle, not by an entry in
-# the menu. It stays as a value though - the panel sends it to a window when QC
-# is off.
-ORDER = [DIFF, GRAIN, BANDPASS, TEMPORAL, SAT, VALUEMAP, CANVAS]
-LABELS = {NONE: "No effect", DIFF: "Difference", GRAIN: "Grain check",
+# The two-input comparisons are NOT here. They compare A against B, which is
+# what Overlay mode is for, so they live in its own selector (OVERLAY_MODES) -
+# offering them per window meant picking "difference" on a window and then
+# wondering which two things were being differenced.
+#
+# NONE is NOT in the list either: QC is switched off by its toggle, not by an
+# entry in the menu. It stays as a value though - the panel sends it to a
+# window when QC is off.
+ORDER = [LOG, GRAIN, BANDPASS, TEMPORAL, SAT, VALUEMAP, CANVAS]
+
+# The log curves offered by the log view. Taken from the same table the input
+# transforms come from, so the shot is shown in exactly the curve it would be
+# read back with - and only the LOG ones: putting sRGB in this list would make
+# a "log view" that is not a log view.
+LOG_CURVES = ["Cineon", "AlexaV3LogC", "SLog3", "Log3G10"]
+
+# What the Overlay strip offers. NONE first - that is the plain dissolve.
+OVERLAY_MODES = [NONE, DIFF, HPDIFF]
+
+LABELS = {NONE: "No effect", LOG: "Log view", DIFF: "Difference",
+          GRAIN: "Grain check",
           BANDPASS: "High-pass", SAT: "Saturation check",
           CANVAS: "Canvas check", VALUEMAP: "Value map",
-          TEMPORAL: "Temporal check"}
+          TEMPORAL: "Temporal check",
+          HPDIFF: "High-pass difference"}
 
-# The only mode that needs BOTH inputs at once. Because of it the panel decodes
+# Labels for the Overlay selector - shorter, the strip is narrow, and "off"
+# reads better than "no effect" next to a dissolve.
+OVERLAY_LABELS = {NONE: "Off", DIFF: "Difference", HPDIFF: "High-pass diff"}
+
+# The modes that need BOTH inputs at once. Because of them the panel decodes
 # even the window that is not currently visible (see PlayerPanel._live_slots).
-NEEDS_BOTH = (DIFF,)
+NEEDS_BOTH = (DIFF, HPDIFF)
 
 # Difference: the colours the overlay fills changed places with. All of them
 # dark and low in saturation - unmistakable in the image, but they do not pull
@@ -70,6 +98,8 @@ DIFF_PLAIN_GAIN = 8.0        # so that an intensity of 1.00 on the plain
 # sliders but as ONE slider with several handles (see overlay._BandSlider).
 BANDS = "bands"
 
+LUMA_R, LUMA_G, LUMA_B = 0.2126, 0.7152, 0.0722       # Rec.709
+
 # Effects that blur - they are several times more expensive than the rest and
 # therefore have their own, stricter pixel ceiling (see ImageView._effect_step).
 BLUR_HEAVY = (GRAIN, BANDPASS)
@@ -84,15 +114,19 @@ TEMPORAL_GAIN = 8.0
 # unambiguous proof of a duplicate; the numeric difference is printed as
 # information and you judge it yourself.
 
-# Grain checker (all values chosen by measuring on a real plate, see _grain)
-GRAIN_SIGMA = 1.0             # high-pass sigma: smaller = only the finest detail
-GRAIN_ENERGY_SIGMA = 2.0      # the neighbourhood defining "local activity";
-                              # narrower = better edge rejection
-                              # (edge/flat ratio 4.3 -> 2.8)
-GRAIN_FLOOR = 0.5             # so completely smooth areas do not divide by zero
-GRAIN_SOFT_K = 1.3            # steepness of the soft clip (tanh); larger = more grain
-GRAIN_SCALE = 60.0            # final grain contrast
-GRAIN_MID = 72.0              # background brightness (128 was too light a grey)
+# Grain checker. The way grain is pulled in a comp: a high-pass in SCENE-LINEAR
+# (subtract a blurred copy - the "background"), take its magnitude like a
+# |A-B| difference merge, then let the DISPLAY CURVE show it. The curve is what
+# makes it read: it lifts the dark grain (steep near black) and compresses the
+# bright edges (flat near white), so the grain is even and fine and the edges
+# do not blow out. Doing the high-pass after the display transform (the old
+# way) and then a linear gain gets this backwards and the edges clip - see
+# _grain. Defaults chosen against a real reference plate.
+GRAIN_CONTRAST = 20.0         # exposure applied BEFORE the display curve
+GRAIN_SIZE = 1.0              # background blur sigma, in scene-linear pixels;
+                              # small = only the finest grain, larger = coarser
+GRAIN_FINE = 0.0              # single-pixel emphasis via the [[2,2,2],[2,-15,2],
+                              # [2,2,2]] matrix; 0 = plain high-pass
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +134,12 @@ GRAIN_MID = 72.0              # background brightness (128 was too light a grey)
 # (key, label, min, max, default, number of decimals)
 # ---------------------------------------------------------------------------
 PARAMS = {
+    LOG: [
+        # a seventh element = a menu instead of a slider (see overlay.EffectPanel)
+        ("curve", "Log curve", 0, len(LOG_CURVES) - 1, 0, 0, LOG_CURVES),
+        ("exposure", "Exposure (stops)", -6.0, 6.0, 0.0, 2),
+        ("black", "Black level", 0.0, 0.5, 0.0, 3),
+    ],
     DIFF: [
         # a seventh element = a menu instead of a slider (see overlay.EffectPanel)
         ("mode", "Display", 0, len(DIFF_MODES) - 1, DIFF_OVERLAY, 0,
@@ -110,9 +150,9 @@ PARAMS = {
         ("intensity", "Intensity", 0.0, 8.0, 1.0, 2),
     ],
     GRAIN: [
-        ("boost", "Grain contrast", 0.25, 4.0, 1.0, 2),
-        ("sigma", "Grain size", 0.5, 3.0, GRAIN_SIGMA, 1),
-        ("edge", "Edge rejection", 1.0, 8.0, GRAIN_ENERGY_SIGMA, 1),
+        ("contrast", "Grain contrast", 1.0, 40.0, GRAIN_CONTRAST, 1),
+        ("size", "Grain / background size", 0.3, 6.0, GRAIN_SIZE, 1),
+        ("fine", "Fineness", 0.0, 1.0, GRAIN_FINE, 2),
     ],
     BANDPASS: [
         # the "to" end stops at 24 px on purpose: the cost of blurring grows
@@ -124,6 +164,19 @@ PARAMS = {
         ("coarse", "To detail (px)", 1.0, 24.0, 8.0, 1),
         ("gain", "Gain", 1.0, 40.0, 8.0, 0),
         ("mid", "Background level", 0.0, 200.0, 128.0, 0),
+        # Colour in a high-pass is mostly chroma noise fighting the texture you
+        # are trying to read. Pulled all the way up this is the check in
+        # luminance; part way it just calms the colour speckle down without
+        # losing which channel a difference sits in.
+        ("desat", "Desaturate", 0.0, 1.0, 0.0, 2),
+    ],
+    HPDIFF: [
+        # The same band as the high-pass, applied to BOTH inputs, so the two
+        # are directly comparable - that is the whole point of the mode.
+        ("fine", "From detail (px)", 0.0, 8.0, 0.0, 1),
+        ("coarse", "To detail (px)", 1.0, 24.0, 8.0, 1),
+        ("gain", "Gain", 1.0, 60.0, 16.0, 0),
+        ("desat", "Desaturate", 0.0, 1.0, 0.0, 2),
     ],
     SAT: [
         # Default 2.0, not 1.0: levelling the brightness COMPRESSES the colour
@@ -152,6 +205,16 @@ PARAMS = {
 }
 
 DESCRIPTION = {
+    LOG: ("The shot read back through a LOG curve, whatever the monitor is\n"
+          "set to. The toe and the shoulder are stretched out, so what a\n"
+          "display transform has already rolled away is visible again.\n"
+          "Curve    = which log encoding to read it in.\n"
+          "Exposure = stops, for pushing a dark or bright plate into the\n"
+          "           part of the curve you want to look at.\n"
+          "Black    = lifts the floor away, so the toe is not mistaken for\n"
+          "           detail.\n"
+          "Look for: crushed blacks, clipped highlights, banding in a\n"
+          "gradient, a grade already baked into a plate that should be raw."),
     DIFF: ("Difference between input A and B (not between frames - that is\n"
            "Temporal).\n"
            "Overlay     = the image stays, changed places are covered with a\n"
@@ -163,9 +226,24 @@ DESCRIPTION = {
            "codec noise.\n"
            "Intensity: the strength of the colour in overlay mode, the gain on\n"
            "the difference in the plain mode."),
-    GRAIN: ("Shows the grain and suppresses the content of the shot.\n"
+    GRAIN: ("Pulls the grain the way a comp does: a scene-linear high-pass (a\n"
+            "blurred copy subtracted), its magnitude like a |A-B| merge, shown\n"
+            "through the display curve - which lifts the fine grain and\n"
+            "compresses the edges, so the grain reads even and fine on near-\n"
+            "black and the edges stay thin.\n"
+            "Contrast = grain brightness; Size = radius of the background\n"
+            "subtracted (small = only the finest grain, larger = coarser too);\n"
+            "Fineness = single-pixel grain over 2-3px softness (the matrix).\n"
             "Look for: missing or doubled grain, areas with no grain\n"
             "(repainted / blurred), a jump in graininess between shots."),
+    HPDIFF: ("The high-pass of A against the high-pass of B - both put through\n"
+             "the same band, then subtracted.\n"
+             "BLACK = the same detail in both. Anything lit up is texture that\n"
+             "differs, with the overall level taken out first, so a grade\n"
+             "between the two does not drown the answer the way a plain\n"
+             "difference does.\n"
+             "Look for: paint fixes, re-grained patches, softened areas,\n"
+             "a swapped plate, detail that went missing in a comp."),
     BANDPASS: ("Keeps only detail in the given size range and subtracts the rest.\n"
                "A narrow band = you see just that one layer of detail.\n"
                "Look for: soft spots after a paint fix, clone stamp prints,\n"
@@ -292,7 +370,7 @@ def difference_mask(cur, other, lut, params=None):
     return d.max(axis=2) > int(round(thr * 255.0))
 
 
-def difference(cur, other, lut, params=None):
+def difference(cur, other, lut, params=None, threads=1):
     """The difference of two inputs. `cur` and `other` are (h,w,4) half scene-linear.
 
     Computed in the display domain (through `lut`), not in scene-linear: the
@@ -301,27 +379,36 @@ def difference(cur, other, lut, params=None):
     in uint8 - the difference of two bytes is a whole number 0-255, so a table
     is enough for the gain.
     """
-    a = lut[cur[:, :, :3].view(np.uint16)]
-    if diff_is_overlay(params):
-        # Overlay: the image stays, changed places are covered with a solid colour.
-        out = np.ascontiguousarray(a)
-        out[difference_mask(cur, other, lut, params)] = difference_color(params)
-        return out
-
-    # The plain difference. Intensity means the gain on the difference here;
-    # the DIFF_PLAIN_GAIN multiplier is there so that an intensity of 1.00
-    # looks the same as it used to - small differences would otherwise not be
-    # visible at all.
-    b = lut[other[:, :, :3].view(np.uint16)]
-    d = np.maximum(a, b)
-    d -= np.minimum(a, b)                       # |a - b| without a sign, without floats
+    overlay = diff_is_overlay(params)
+    color = difference_color(params) if overlay else None
     intensity = max(0.0, param(params, "intensity", 1.0))
     table = np.clip(np.arange(256, dtype=np.float32)
                     * (intensity * DIFF_PLAIN_GAIN), 0, 255).astype(np.uint8)
-    return table[d]
+
+    def band(c, o):
+        a = lut[c[:, :, :3].view(np.uint16)]
+        if overlay:
+            # Overlay: the image stays, changed places get a solid colour.
+            out = np.ascontiguousarray(a)
+            out[difference_mask(c, o, lut, params)] = color
+            return out
+        # The plain difference. Intensity means the gain on the difference
+        # here; the DIFF_PLAIN_GAIN multiplier is there so that an intensity of
+        # 1.00 looks the same as it used to - small differences would otherwise
+        # not be visible at all.
+        b = lut[o[:, :, :3].view(np.uint16)]
+        d = np.maximum(a, b)
+        d -= np.minimum(a, b)                   # |a - b| unsigned, no floats
+        return table[d]
+
+    bands = _band_count(cur.shape[0], int(threads), 0)
+    if bands > 1:
+        return _banded(lambda r0, r1: band(cur[r0:r1], other[r0:r1]),
+                       cur.shape[0], bands, 0)
+    return band(cur, other)
 
 
-def temporal(cur, prev, lut, params=None):
+def temporal(cur, prev, lut, params=None, threads=1):
     """|current - previous| amplified. Black = no change, glowing = motion.
 
     Everything is computed in uint8: the difference of two bytes is a whole
@@ -330,12 +417,19 @@ def temporal(cur, prev, lut, params=None):
     cost 2.3x more (24.8 -> 10.8 ms on 1080p).
     """
     gain = param(params or {}, "gain", TEMPORAL_GAIN)
-    a = _to_display(cur, lut)
-    b = _to_display(prev, lut)
-    diff = np.maximum(a, b) - np.minimum(a, b)      # |a-b| without underflow
     table = np.clip(np.arange(256, dtype=np.float32) * gain,
                     0, 255).astype(np.uint8)
-    return table[diff]
+
+    def band(c, p):
+        a = _to_display(c, lut)
+        b = _to_display(p, lut)
+        return table[np.maximum(a, b) - np.minimum(a, b)]   # |a-b|, no underflow
+
+    bands = _band_count(cur.shape[0], int(threads), 0)
+    if bands > 1:
+        return _banded(lambda r0, r1: band(cur[r0:r1], prev[r0:r1]),
+                       cur.shape[0], bands, 0)
+    return band(cur, prev)
 
 
 def frame_difference(cur, prev, step=8):
@@ -382,52 +476,263 @@ def canvas_source_index(x0, y0, x1, y1, step, full_h, full_w, params=None):
     return ys, xs
 
 
+def _wrap_runs(idx, step):
+    """Splits a wrapped index list into (src_from, src_to, dst_from, dst_to) runs.
+
+    The shift wraps at most once along each axis, so this gives one or two runs
+    per axis - each of them a plain slice of the source.
+    """
+    out = []
+    n = len(idx)
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and idx[end] == idx[end - 1] + step:
+            end += 1
+        out.append((int(idx[start]), int(idx[end - 1]) + 1, start, end))
+        start = end
+    return out
+
+
+def canvas_crop(arr, x0, y0, x1, y1, step, params=None):
+    """The shifted (canvas) crop of `arr`, assembled from CONTIGUOUS blocks.
+
+    The obvious way to do this is arr[np.ix_(ys, xs)], but that is a per-element
+    gather and cannot read memory in order: measured on 4K it costs 30 ms a
+    frame, against 0 ms for the plain slice ordinary display gets - which is why
+    the canvas check stuttered while nothing else did.
+
+    The shift wraps at most once per axis, so the result is really just two to
+    four RECTANGLES copied out of the source. Copying them as slices is a
+    straight memory copy and is 3x faster (30 -> 10 ms), for a bit-identical
+    result.
+    """
+    full_h, full_w = arr.shape[0], arr.shape[1]
+    ys, xs = canvas_source_index(x0, y0, x1, y1, step, full_h, full_w, params)
+    if len(ys) == 0 or len(xs) == 0:
+        return arr[np.ix_(ys, xs)]              # nothing to copy - let numpy do it
+    out = np.empty((len(ys), len(xs)) + arr.shape[2:], dtype=arr.dtype)
+    for sy, ey, dy0, dy1 in _wrap_runs(ys, step):
+        for sx, ex, dx0, dx1 in _wrap_runs(xs, step):
+            out[dy0:dy1, dx0:dx1] = arr[sy:ey:step, sx:ex:step]
+    return out
+
+
 def _to_display(lin, lut):
     """Scene-linear half -> uint8 RGB through the LUT (as in normal display)."""
     return lut[lin[:, :, :3].view(np.uint16)]
 
 
-def _grain(lin, lut, params=None):
-    """Shows the GRAIN and suppresses the content. The grain swings around dark grey.
+def _box(radius):
+    """Odd box width for uniform_filter, from a radius in pixels."""
+    return 2 * max(1, int(round(radius))) + 1
 
-    Measured on a real plate: a plain high-pass has 18x the variance on edges
-    than on flat areas, so at a gain where the edges do not clip, the grain is
-    invisible (hence the original "grey" result). The fix has two parts:
-      1) LOCAL NORMALISATION - divide by the local activity in a narrow
-         neighbourhood, so edges cancel out and grain in quiet areas is boosted.
-      2) A SOFT CLIP (tanh) - the remnants of edges saturate smoothly instead
-         of shooting off to white/black.
-    Result: edge/flat ratio 13.3x -> 1.9x, grain 6.1 -> 24, no clipping.
+
+def _band(disp, fine, coarse):
+    """The SIGNED band a high-pass leaves: one blur subtracted from another.
+
+    Shared by the high-pass check and the high-pass comparison, so the two
+    inputs of that comparison are put through exactly the same thing - a band
+    computed two slightly different ways would show a difference that is not in
+    the pictures.
+
+    BOX blurs (running sums), not gaussians. A gaussian costs more the wider it
+    gets - measured on 2.2 Mpx it goes 39 ms at radius 2 to 426 ms at radius
+    24, so the "to detail" slider made the check unusable at its own top end. A
+    box is O(1) in the radius: 31 ms to 40 ms across that whole range. Since
+    this is the DIFFERENCE of two blurs, what the band keeps is decided by the
+    two radii, and the kernel shape only changes how sharply the band falls off
+    at its edges - a box rings very slightly around hard edges where a gaussian
+    would not, which on a texture check is no loss.
     """
-    params = params or {}
-    boost = param(params, "boost", 1.0)
-    sigma = param(params, "sigma", GRAIN_SIGMA)
-    edge_sigma = param(params, "edge", GRAIN_ENERGY_SIGMA)
-
-    disp = _to_display(lin, lut).astype(np.float32)
+    coarse = max(coarse, fine + 0.3)        # the wider one really has to be wider
     if _ndi is None:                        # fallback without scipy: a 3x3 box
         b = disp + np.roll(disp, 1, 0) + np.roll(disp, -1, 0)
         b = b + np.roll(b, 1, 1) + np.roll(b, -1, 1)
-        blur = (8.0 * b + 52.0 * disp) * (1.0 / 124.0)
-        return np.clip((disp - blur) * 16.0 * boost + GRAIN_MID,
-                       0, 255).astype(np.uint8)
+        return disp - b * (1.0 / 9.0)
+    high = _ndi.uniform_filter(disp, size=(_box(coarse), _box(coarse), 1),
+                               mode="nearest")
+    if fine > 0.05:
+        low = _ndi.uniform_filter(disp, size=(_box(fine), _box(fine), 1),
+                                  mode="nearest")
+    else:
+        low = disp
+    return low - high
 
-    hp = disp - _ndi.gaussian_filter(disp, sigma=(sigma, sigma, 0), truncate=3.0)
-    # Local activity in a narrow neighbourhood - the narrower, the better the
-    # edges cancel. Summing three abs values is the same as abs().mean(axis=2),
-    # but without a temporary array across all channels (16.9 -> 7.3 ms).
-    # CAREFUL with /3.0 instead of *(1/3): one third is not exact in binary, so
-    # multiplying by the reciprocal moves the last bit and the result differs
-    # from np.mean by a level.
-    energy = _ndi.gaussian_filter(
-        (np.abs(hp[:, :, 0]) + np.abs(hp[:, :, 1]) + np.abs(hp[:, :, 2])) / 3.0,
-        sigma=edge_sigma, truncate=2.0)
-    norm = hp / (energy[:, :, None] + GRAIN_FLOOR)
-    # A SOFT clip: grain (small values) stays linear, edges saturate smoothly
-    # instead of shooting off -> the shot underneath practically disappears and
-    # nothing clips (measured: edge/flat ratio 4.5 -> 1.9, clipping 4.9 -> 0 %)
-    out = np.tanh(norm * (GRAIN_SOFT_K * boost)) * GRAIN_SCALE + GRAIN_MID
-    return np.clip(out, 0, 255).astype(np.uint8)
+
+def _desaturate(out, desat):
+    """Mixes a signed image towards its own luminance, in place where it can."""
+    if desat <= 0.001 or out.ndim != 3 or out.shape[2] != 3:
+        return out
+    y = (out[:, :, 0] * LUMA_R + out[:, :, 1] * LUMA_G + out[:, :, 2] * LUMA_B)
+    out *= (1.0 - desat)
+    out += y[:, :, None] * desat
+    return out
+
+
+# Every half float there is, as float32 - for building tables indexed by half
+# BITS (the display LUTs are indexed that way, see imageview.build_lut).
+_HALF_VALUES = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
+
+_GRAIN_TABLE = None
+_GRAIN_TABLE_KEY = None
+_GRAIN_TABLE_LOCK = threading.Lock()
+
+
+def _grain_table(lut, contrast):
+    """A table that does |x| * contrast AND the display curve in one lookup.
+
+    The grain ends with abs, a multiply, a clip and then the display LUT - four
+    passes over a 26 MB array. All but the lookup can be baked into the table
+    instead, because the table is indexed by the half BITS of the residual and
+    there are only 65536 of those: entry i is simply what |half(i)| * contrast
+    comes out as on screen. Measured 26.5 -> 19.7 ms on 2.2 Mpx, for a table
+    that costs 0.2 ms and is then reused until the contrast changes.
+
+    Quantising the residual to half BEFORE the multiply rather than after moves
+    the last bit: measured one display level on 0.7 % of pixels.
+    """
+    global _GRAIN_TABLE, _GRAIN_TABLE_KEY
+    key = (id(lut), float(contrast))
+    with _GRAIN_TABLE_LOCK:                 # the bands all ask at once
+        if key != _GRAIN_TABLE_KEY:
+            v = np.nan_to_num(np.abs(_HALF_VALUES) * float(contrast),
+                              nan=0.0, posinf=60000.0, neginf=0.0)
+            np.clip(v, 0.0, 60000.0, out=v)
+            _GRAIN_TABLE = lut[v.astype(np.float16).view(np.uint16)]
+            _GRAIN_TABLE_KEY = key
+        return _GRAIN_TABLE
+
+
+_LOG_TABLE = None
+_LOG_TABLE_KEY = None
+_LOG_TABLE_LOCK = threading.Lock()
+
+
+def _log_table(curve, exposure, black):
+    """half BITS -> uint8, the whole log view in one lookup.
+
+    The curve itself is a log10 per pixel, which on a 4K frame is the most
+    expensive thing in the check by a wide margin. It does not have to be:
+    the input is a half, so there are only 65536 answers, and the table is
+    built once and reused until a slider moves.
+    """
+    global _LOG_TABLE, _LOG_TABLE_KEY
+    name = LOG_CURVES[max(0, min(len(LOG_CURVES) - 1, int(round(curve))))]
+    key = (name, float(exposure), float(black))
+    with _LOG_TABLE_LOCK:
+        if key != _LOG_TABLE_KEY:
+            # The table covers EVERY half there is, so the top of it overflows
+            # as soon as exposure is pushed up, and log10 is handed a zero at
+            # the bottom. Both are expected and both are dealt with by the
+            # clip below - they must not print a warning per slider move.
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                v = np.clip(_HALF_VALUES, 0.0, None) * (2.0 ** float(exposure))
+                v = np.asarray(nukelut.encode(name, v), dtype=np.float32)
+            # Black level lifts the floor away, so the bottom of the curve is
+            # not read as detail when it is only the toe of the encoding.
+            lo = float(black)
+            if lo > 0.0:
+                v = (v - lo) / max(1e-6, 1.0 - lo)
+            _LOG_TABLE = (np.clip(np.nan_to_num(v, nan=0.0, posinf=1.0,
+                                                neginf=0.0), 0.0, 1.0)
+                          * 255.0 + 0.5).astype(np.uint8)
+            _LOG_TABLE_KEY = key
+        return _LOG_TABLE
+
+
+def _log(lin, _lut, params=None):
+    """The shot as it looks IN LOG, whatever the monitor is set to.
+
+    Not a display transform and not a check over the picture - it is the same
+    data read back through a log curve, which is how a shot is judged before it
+    is graded: the toe and the shoulder are stretched out, so crushed blacks,
+    clipped highlights and banding are all visible where a display transform
+    has already rolled them away.
+
+    The window's own display setting is deliberately ignored (`_lut` is unused)
+    - a log view that still went through sRGB would be neither one thing nor
+    the other.
+    """
+    params = params or {}
+    table = _log_table(param(params, "curve", 0),
+                       param(params, "exposure", 0.0),
+                       param(params, "black", 0.0))
+    return table[lin[:, :, :3].view(np.uint16)]
+
+
+def _grain(lin, lut, params=None):
+    """Shows the GRAIN the way a compositor pulls it: a high-pass in SCENE-LINEAR
+    (subtract a blurred copy of the plate - the "background"), its MAGNITUDE
+    like a |A-B| difference merge, then shown through the ordinary display
+    curve. The curve is the whole trick. Grain lives in the shadows, where the
+    curve is steep, so it is lifted and reads evenly across the frame; edges are
+    large, where the curve is flat, so they compress instead of blowing out.
+    Result: fine, even grain on near-black, thin controlled edges.
+
+    Measured on a real reference: in scene-linear the edges are 58x the flat
+    grain, yet through the curve they sit only a little above it - exactly what
+    makes the reference look fine. The previous version high-passed AFTER the
+    display transform and applied a linear gain, which scales grain and edges
+    together, so the edges clipped to white and dominated. This does it in the
+    right order.
+
+    The controls each separate grain from content a different way:
+      contrast  exposure BEFORE the curve - grain brightness
+      size      radius of the background subtracted; small = only the finest
+                grain, larger = coarser texture comes through too
+      fine      single-pixel grain over 2-3px softness, via the
+                [[2,2,2],[2,-15,2],[2,2,2]] matrix (weights sum to 1, so a flat
+                area is unchanged and a lone pixel comes out 15x). This is the
+                reference's own matrix. 0 = plain high-pass.
+    """
+    params = params or {}
+    contrast = param(params, "contrast", GRAIN_CONTRAST)
+    size = max(0.3, param(params, "size", GRAIN_SIZE))
+    fine = max(0.0, min(1.0, param(params, "fine", GRAIN_FINE)))
+
+    src = lin[:, :, :3].astype(np.float32)          # scene-linear
+
+    if _ndi is None:                        # fallback without scipy: a 3x3 box
+        b = src + np.roll(src, 1, 0) + np.roll(src, -1, 0)
+        b = b + np.roll(b, 1, 1) + np.roll(b, -1, 1)
+        resid = src - b * (1.0 / 9.0)
+    else:
+        # A BOX blur (running sum), not a gaussian: uniform_filter is O(1) in
+        # the radius and several times cheaper than gaussian_filter, which is
+        # the bulk of the frame time. For a high-pass BACKGROUND the exact shape
+        # barely matters - the grain is the residual either way. `size` is the
+        # radius; k is the box width.
+        resid = src - _ndi.uniform_filter(src, size=(_box(size), _box(size), 1),
+                                          mode="nearest")
+
+    if fine > 0.0:
+        # The matrix on the residual: 2*(8 neighbours) - 15*centre, scaled by
+        # -1/15 so a single-pixel spike comes back the right way up at ~1x while
+        # coarser detail comes out smaller - that is what emphasises the finest
+        # grain.
+        #
+        # Written as a 3x3 BOX rather than as eight shifted copies. The eight
+        # neighbours are the 3x3 sum minus the centre, so the whole matrix is
+        # just (17*centre - 2*sum9)/15 - one running-sum pass instead of eight
+        # full-size temporaries. Measured 114 -> 38 ms on 2.2 Mpx, and the
+        # result matches to 4e-09 (plain float rounding).
+        if _ndi is None:                    # no running sums without scipy
+            s9 = resid + np.roll(resid, 1, 0) + np.roll(resid, -1, 0)
+            s9 = s9 + np.roll(s9, 1, 1) + np.roll(s9, -1, 1)
+            s9 *= (1.0 / 9.0)               # the mean, as uniform_filter gives
+        else:
+            s9 = _ndi.uniform_filter(resid, size=(3, 3, 1), mode="nearest")
+        sharp = resid * (17.0 / 15.0)
+        sharp -= s9 * (18.0 / 15.0)         # s9 is the MEAN, so sum9 = s9 * 9
+        resid = resid * (1.0 - fine) + sharp * fine
+
+    # Magnitude (like |A-B|), exposed, then THROUGH THE DISPLAY CURVE, so the
+    # viewer's own transform lifts the grain and compresses the edges. All of
+    # that is one lookup: the abs, the contrast and the curve live in the table
+    # (see _grain_table), so only the residual has to be walked over.
+    return _grain_table(lut, contrast)[
+        resid.astype(np.float16).view(np.uint16)]
 
 
 def _bandpass(lin, lut, params=None):
@@ -448,22 +753,56 @@ def _bandpass(lin, lut, params=None):
     coarse = param(params, "coarse", 8.0)
     gain = param(params, "gain", 8.0)
     mid = param(params, "mid", 128.0)
+    desat = max(0.0, min(1.0, param(params, "desat", 0.0)))
     coarse = max(coarse, fine + 0.3)        # the wider one really has to be wider
 
-    disp = _to_display(lin, lut).astype(np.float32)
-    if _ndi is None:                        # fallback without scipy: a 3x3 box
-        b = disp + np.roll(disp, 1, 0) + np.roll(disp, -1, 0)
-        b = b + np.roll(b, 1, 1) + np.roll(b, -1, 1)
-        return np.clip((disp - b * (1.0 / 9.0)) * gain + mid,
-                       0, 255).astype(np.uint8)
+    out = _band(_to_display(lin, lut).astype(np.float32), fine, coarse)
+    out *= gain
+    # Towards luminance, BEFORE the pedestal and the clip: what is being mixed
+    # is then the signed band, so grey stays grey and nothing has been clipped
+    # to white first. At 1.0 the three channels are identical and the check is
+    # in luminance. Skipped entirely at 0, which is the default, and on a
+    # single-channel crop there is nothing to mix.
+    _desaturate(out, desat)
+    out += mid
+    np.clip(out, 0, 255, out=out)
+    return out.astype(np.uint8)
 
-    # truncate 2.0 instead of 3.0: on a wide blur it shortens the kernel by a
-    # third and it is not noticeable on a visual check (it is the difference of
-    # two blurs anyway)
-    low = disp if fine <= 0.05 else _ndi.gaussian_filter(
-        disp, sigma=(fine, fine, 0), truncate=2.0)
-    high = _ndi.gaussian_filter(disp, sigma=(coarse, coarse, 0), truncate=2.0)
-    return np.clip((low - high) * gain + mid, 0, 255).astype(np.uint8)
+
+def hp_difference(cur, other, lut, params=None, threads=1):
+    """The high-pass of A against the high-pass of B.
+
+    Both inputs go through the SAME band (see _band) and the two results are
+    subtracted. What is left is where the two differ in TEXTURE - a paint fix,
+    a re-grain, a softened patch, a plate swap - with the overall level taken
+    out of the picture by the high-pass first. A plain difference lights up
+    wherever the two are graded even slightly apart; this one does not care
+    about that and only answers "is the same detail there".
+
+    Black means the same detail in both. It sits on black rather than on a grey
+    pedestal on purpose: on a comparison, "nothing" should look like nothing.
+    """
+    params = params or {}
+    fine = param(params, "fine", 0.0)
+    coarse = param(params, "coarse", 8.0)
+    gain = param(params, "gain", 16.0)
+    desat = max(0.0, min(1.0, param(params, "desat", 0.0)))
+
+    def band(a, b):
+        out = _band(_to_display(a, lut).astype(np.float32), fine, coarse)
+        out -= _band(_to_display(b, lut).astype(np.float32), fine, coarse)
+        _desaturate(out, desat)
+        np.abs(out, out=out)                # direction does not matter, presence does
+        out *= gain
+        np.clip(out, 0, 255, out=out)
+        return out.astype(np.uint8)
+
+    halo = _halo_rows(BANDPASS, params)
+    bands = _band_count(cur.shape[0], int(threads), halo)
+    if bands > 1:
+        return _banded(lambda r0, r1: band(cur[r0:r1], other[r0:r1]),
+                       cur.shape[0], bands, halo)
+    return band(cur, other)
 
 
 def _saturation(lin, lut, params=None):
@@ -482,14 +821,29 @@ def _saturation(lin, lut, params=None):
     # the same, but costs 12x more (31.7 -> 2.6 ms on 1080p) - reducing along
     # an axis is expensive here.
     mx8 = np.maximum(np.maximum(d8[:, :, 0], d8[:, :, 1]), d8[:, :, 2])
-    disp = d8.astype(np.float32)
-    mx = mx8.astype(np.float32)[:, :, None]
-    out = disp * (level / np.maximum(mx, 1e-6))
+
+    # The per-pixel divide level/mx is a TABLE lookup: mx is a byte, so there
+    # are only 256 answers. Measured 15.4 ms of dividing gone.
+    scale = np.arange(256, dtype=np.float32)
+    scale[0] = 1e-6                         # black is overwritten below anyway
+    np.divide(level, scale, out=scale)
+
+    out = d8.astype(np.float32)
     if abs(boost - 1.0) > 1e-3:             # amplify the deviation from neutral grey
-        gray = out.mean(axis=2, keepdims=True)
-        out = gray + (out - gray) * boost
+        # gray + (x - gray) * boost  ==  x * boost + gray * (1 - boost), which
+        # is one pass fewer over a 26 MB array. gray is summed by hand rather
+        # than with mean(axis=2) for the same reason the maximum above is -
+        # measured 14.8 -> 5.3 ms. Folding it in before the scale (instead of
+        # after, as it used to be) can move the last bit: measured one display
+        # level on 0.06 % of pixels, which no eye finds on a saturation check.
+        gray = out[:, :, 0] + out[:, :, 1] + out[:, :, 2]
+        gray *= ((1.0 - boost) / 3.0)
+        out *= boost
+        out += gray[:, :, None]
+    out *= scale[mx8][:, :, None]
     out[mx8 == 0] = level                   # black -> grey
-    return np.clip(out, 0, 255).astype(np.uint8)
+    np.clip(out, 0, 255, out=out)
+    return out.astype(np.uint8)
 
 
 def _canvas(lin, lut, params=None):
@@ -530,7 +884,14 @@ def _valuemap(lin, _lut, params=None):
     params = params or {}
     b1, b2, b3 = valuemap_bands(params)
     rgb = lin[:, :, :3].astype(np.float32)
-    lum = rgb[:, :, 0] * 0.2126 + rgb[:, :, 1] * 0.7152 + rgb[:, :, 2] * 0.0722
+    if rgb.shape[2] == 1:
+        # a single isolated channel (see imageview._isolate_channel): ITS value
+        # is what the bands are read from - weighting one channel by the three
+        # luminance coefficients would only scale it by their sum, which is 1
+        lum = rgb[:, :, 0]
+    else:
+        lum = (rgb[:, :, 0] * LUMA_R + rgb[:, :, 1] * LUMA_G
+               + rgb[:, :, 2] * LUMA_B)
     h, w = lum.shape
     out = np.empty((h, w, 3), dtype=np.uint8)
     grays = np.array(VM_GRAYS, dtype=np.uint8)
@@ -546,16 +907,144 @@ def _valuemap(lin, _lut, params=None):
     return out
 
 
-_FUNCS = {GRAIN: _grain, BANDPASS: _bandpass, SAT: _saturation,
+_FUNCS = {LOG: _log, GRAIN: _grain, BANDPASS: _bandpass, SAT: _saturation,
           CANVAS: _canvas, VALUEMAP: _valuemap}
 
 
-def apply(effect, lin, lut, params=None):
-    """uint8 RGB (h,w,3), or None when the effect is unknown / there is nothing to do."""
+# ---------------------------------------------------------------------------
+# Computing a check on SEVERAL THREADS.
+#
+# The blur-heavy checks are the one expensive thing left on the GUI thread
+# (measured: one grain frame at 2.2 Mpx is 70 ms single-threaded, i.e. a 13 fps
+# ceiling on DISPLAY no matter how fast the decoding is). numpy releases the GIL
+# for large arrays, so splitting the picture into horizontal bands and doing one
+# band per thread genuinely parallelises: measured 70 ms -> 31 ms on 6 threads.
+#
+# Each band is computed with a HALO of extra rows above and below, which are
+# then thrown away. Without it every band edge would be a seam - the blur inside
+# a band cannot see the rows that belong to its neighbour. With the halo the
+# result is bit-identical to the single-threaded one (verified; only the two
+# rows at the very top and bottom of the image differ, and those are the
+# wrap-around of the blur itself, which the single-threaded version has too).
+# ---------------------------------------------------------------------------
+_POOL = None
+_POOL_SIZE = 0
+_POOL_LOCK = threading.Lock()
+
+
+def _pool(threads):
+    """One shared pool, rebuilt only when the thread count really changes."""
+    global _POOL, _POOL_SIZE
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_SIZE != threads:
+            if _POOL is not None:
+                _POOL.shutdown(wait=False)
+            _POOL = ThreadPoolExecutor(max_workers=threads,
+                                       thread_name_prefix="exr-qc")
+            _POOL_SIZE = threads
+        return _POOL
+
+
+def _halo_rows(effect, params):
+    """How many rows a band has to overlap its neighbour by.
+
+    It has to cover the reach of the widest filter in the effect, otherwise the
+    band edge is computed from data that is not there.
+    """
+    if effect == GRAIN:
+        # box radius (uniform_filter) + 1 row for the 3x3 matrix + slack
+        return int(round(max(0.3, param(params, "size", GRAIN_SIZE)))) + 2
+    if effect == BANDPASS:
+        # a box of that radius reaches exactly it (see _box)
+        return int(max(param(params, "coarse", 8.0), 1.0)) + 2
+    return 0
+
+
+def _band_count(height, threads, halo):
+    """How many bands are worth using.
+
+    A band has to be a good deal taller than its halo - otherwise the overlap
+    is most of the work and the threads cost more than they save. Pointwise
+    checks have no halo at all; there the floor is just "big enough that a
+    thread earns its keep".
+    """
+    if threads <= 1:
+        return 1
+    min_rows = max(64, 4 * halo + 16)
+    return max(1, min(int(threads), int(height // min_rows)))
+
+
+def _banded(make, height, bands, halo):
+    """Runs `make(r0, r1)` over horizontal bands in parallel and stitches them.
+
+    `make` gets the row range to COMPUTE (halo included) and returns the result
+    for exactly those rows; the halo rows are trimmed off here. Written against
+    row ranges rather than arrays so the two-input checks (difference,
+    temporal) can slice both of their inputs the same way.
+
+    Only for checks whose output row depends on nearby rows at most - i.e.
+    everything except the canvas check, which shifts the whole picture.
+    """
+    step = -(-height // bands)                  # ceil, so the bands cover it all
+
+    def one(i):
+        y0 = i * step
+        y1 = min(height, y0 + step)
+        r0 = max(0, y0 - halo)                  # compute a bit more...
+        r1 = min(height, y1 + halo)
+        out = make(r0, r1)
+        return out[y0 - r0:y0 - r0 + (y1 - y0)]  # ...and keep only our rows
+
+    return np.concatenate(list(_pool(bands).map(one, range(bands))), axis=0)
+
+
+# Checks whose rows can be computed independently (with a halo where they
+# blur). CANVAS is deliberately absent: it rolls the picture by half its height,
+# so a band has no idea what belongs in it.
+BANDABLE = (GRAIN, BANDPASS, SAT, VALUEMAP, DIFF, TEMPORAL)
+
+
+def _es_comp(es):
+    """Keeps the grain BRIGHTNESS the same whatever the sampling.
+
+    When the source is point-subsampled by es (the fast/coarse render, or a
+    zoomed-out one), the high-pass sees neighbours es pixels apart, so the grain
+    magnitude grows. Measured on a real plate it grows as 1 + ln(es) almost
+    exactly (es 1..4 -> x1.00, 1.69, 2.07, 2.36). Dividing the contrast by that
+    cancels it: the fast render and the full render then match - no jump in
+    lightness when the refinement lands, or when you change zoom.
+    """
+    es = max(1, int(es))
+    return 1.0 / (1.0 + float(np.log(es)))
+
+
+def apply(effect, lin, lut, params=None, es=1, threads=1, lut_f=None):
+    """uint8 RGB (h,w,3), or None when the effect is unknown / there is nothing to do.
+
+    `es` is the source subsampling step the crop was taken at (1 = full). Only
+    the grain uses it, to keep its brightness constant across samplings.
+    `threads` splits the blur-heavy checks over that many bands (see _pool).
+    `lut_f` is the same display curve UNCLIPPED (imageview.build_lut_f). The
+    band pass is handed that one instead: it subtracts one blur from another,
+    and over a highlight already flattened to white there is nothing left to
+    subtract - the check would report smooth where the plate has texture.
+    """
     fn = _FUNCS.get(effect)
     if fn is None or lin is None or lin.size == 0:
         return None
-    return fn(lin, lut, params or {})
+    params = params or {}
+    if effect == BANDPASS and lut_f is not None:
+        lut = lut_f
+    if effect == GRAIN and es > 1:
+        params = dict(params)
+        params["contrast"] = param(params, "contrast", GRAIN_CONTRAST) * _es_comp(es)
+    if effect in BANDABLE and int(threads) > 1:
+        halo = _halo_rows(effect, params)
+        bands = _band_count(lin.shape[0], int(threads), halo)
+        if bands > 1:
+            return _banded(lambda r0, r1: fn(lin[r0:r1], lut, params),
+                           lin.shape[0], bands, halo)
+    return fn(lin, lut, params)
 
 
 def legend(effect):
@@ -564,7 +1053,11 @@ def legend(effect):
         return ("red < 0  |  4 grey steps below the first boundary  |  blue  "
                 "|  green  |  orange above the last (boundaries are in the slider)")
     if effect == GRAIN:
-        return "grain swings around dark grey; edges suppressed by normalisation"
+        return "fine grain on near-black; edges compressed by the display curve"
+    if effect == LOG:
+        return "the shot in log, not through the display - toe and shoulder open"
+    if effect == HPDIFF:
+        return "black = the same detail in A and B; lit = texture that differs"
     if effect == BANDPASS:
         return "only detail between 'from' and 'to'; smooth spots = paint or blur"
     if effect == SAT:

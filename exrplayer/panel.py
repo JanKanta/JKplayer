@@ -1,5 +1,5 @@
 """
-The EXRplayer panel - the UI layer (viewer + timeline + cache bar).
+The JKplayer panel - the UI layer (viewer + timeline + cache bar).
 
 INPUTS AND WINDOWS ARE TWO DIFFERENT THINGS:
   * a node input (A, B) = a sequence of files
@@ -32,11 +32,14 @@ Playback logic:
 The look-ahead is rebuilt in the playback direction on every move.
 """
 
+import math
+import os
 import time
 
 import nuke
 from .qtcompat import QtCore, QtGui, QtWidgets, QShortcut, event_pos
 
+from . import annotate
 from . import effects as fx
 from . import exrcore
 from . import node as exrnode
@@ -84,6 +87,14 @@ PANEL_ID = "com.honza.EXRplayerPanel"
 # about 10 ms together, which would make panning crawl. 100 ms gives a steady
 # ~10 updates a second and the drag stays smooth.
 SCOPE_REFRESH_MS = 100
+
+# Zoom values offered in the top bar. The doubling ladder is the one every
+# viewer has; 85 and 70 are in there because they are the useful ones on a 4K
+# plate in a big window - they are the last zooms that still read EVERY source
+# pixel (below about 67 % the sampling step ticks over to 2 and the picture is
+# computed at a quarter of the data). "Fit" first, so it is one click away.
+ZOOM_PRESETS = ["Fit", "12%", "25%", "50%", "70%", "85%", "100%",
+                "150%", "200%", "400%", "800%"]
 
 
 def _nbsp(text):
@@ -238,9 +249,10 @@ class _Slot(object):
     def __init__(self, index, cache, workers, on_ready):
         self.index = index
         self.label = exrnode.SLOT_LABELS[index]
-        self.source = min(index, len(exrnode.INPUT_LABELS) - 1)  # 0=A, 1=B
+        self.source = min(index, len(exrnode.INPUT_LABELS) - 1)  # 0=Comp, 1=Plate
         self.sequence = None
         self.source_info = "-"
+        self.source_size = ""      # "3780x2520 1.50" (see _size_text)
         self.layers = []                 # layers in the selected input's file
         self.view = ImageView()
         self.loader = FrameLoader(cache, workers=workers, on_ready=on_ready)
@@ -255,7 +267,12 @@ class _Slot(object):
         return self.loader.layer
 
     def source_label(self):
+        """The readable name - for messages and the status line."""
         return exrnode.INPUT_LABELS[self.source]
+
+    def source_tag(self):
+        """The one-letter form, for the readout inside the image."""
+        return exrnode.INPUT_TAGS[self.source]
 
 
 class _Stage(QtWidgets.QWidget):
@@ -311,8 +328,9 @@ class _Stage(QtWidgets.QWidget):
                 half = max(1, (w - gap) // 2)
                 boxes = [(0, 0, half, h), (half + gap, 0, w - half - gap, h)]
         else:
-            # Single and Wipe: both windows over the whole area. In Single the
-            # second one is hidden, in Wipe it is clipped by a mask.
+            # Single, Wipe and Overlay: both windows over the whole area. In
+            # Single the second one is hidden, in Wipe it is clipped by a mask,
+            # in Overlay it is simply drawn over the first at its own opacity.
             boxes = [(0, 0, w, h), (0, 0, w, h)]
         for view, box in zip(self.views, boxes):
             view.setGeometry(*box)
@@ -439,6 +457,72 @@ class _Stage(QtWidgets.QWidget):
         self.wipeChanged.emit()
 
 
+def _keypad_minus():
+    """The minus ON THE NUMBER PAD as a key sequence, or the plain one.
+
+    Qt tells the two minus keys apart, so binding only "-" leaves the pad key
+    doing nothing - and the pad is where the finger goes, because that is the
+    one sitting over plus.
+    """
+    try:
+        return QtGui.QKeySequence(QtCore.Qt.KeypadModifier
+                                  | QtCore.Qt.Key_Minus)
+    except Exception:
+        return QtGui.QKeySequence("-")     # older bindings: no harm, no gain
+
+
+def _fmt_value(v):
+    """A scene-linear value as an ORDINARY decimal - never an exponent.
+
+    "2.2e-05" is not a number anybody wants to read off a viewer, so the
+    decimals go as far as they have to instead. The count follows the
+    magnitude: 55.3 has no use for four places, and a stray 0.000022 has to
+    stay visible as something other than zero, which is the whole reason for
+    looking at the low end at all.
+
+    Trailing zeros come off, so 1.0 reads as "1" and does not pretend to a
+    precision it is not claiming.
+    """
+    a = abs(float(v))
+    if a >= 100:
+        text = "%.0f" % v
+    elif a >= 10:
+        text = "%.1f" % v
+    elif a >= 1:
+        text = "%.3f" % v
+    elif a >= 0.01 or a == 0.0:
+        text = "%.4f" % v
+    else:
+        # enough places for two significant digits, and no more than that -
+        # eight covers everything a half float can hold above its subnormals
+        places = min(8, 1 - int(math.floor(math.log10(a))))
+        text = "%.*f" % (places, v)
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _size_text(info):
+    """"3780x2520 1.50" - size and the aspect it will be SEEN at.
+
+    The displayed aspect, not width/height: a plate can be squeezed (an
+    anamorphic one is stored 2:1 narrow), and then the raw ratio of the numbers
+    is not the shape on screen. Written out because comparing two inputs starts
+    with knowing whether they are even the same shape.
+
+    The pixel aspect is only mentioned when it is NOT square - saying "PAR 1"
+    on every ordinary plate would be noise.
+    """
+    w, h = int(info.get("width", 0)), int(info.get("height", 0))
+    if w <= 0 or h <= 0:
+        return ""
+    par = float(info.get("pixel_aspect", 1.0) or 1.0)
+    text = "%dx%d  %.2f" % (w, h, (w * par) / float(h))
+    if abs(par - 1.0) > 0.001:
+        text += " (PAR %g)" % par
+    return text
+
+
 class PlayerPanel(QtWidgets.QWidget):
 
     _frame_ready = QtCore.Signal(int)          # from a worker -> the GUI thread
@@ -449,11 +533,10 @@ class PlayerPanel(QtWidgets.QWidget):
 
         self._node_name = None
         self.frame = 1
-        self.cache_runs = []
         self.mark_in = 1
         self.mark_out = 1
         self._cache_anchor = 1        # where the rolling cache window is planned from
-        self._hint = "looking for an EXRplayer node..."
+        self._hint = "looking for an JKplayer node..."
         self._last_error = None
         self._input_note = ""            # a problem with the inputs (type, frame range)
         self._knob_note = ""             # writing to the node failed
@@ -549,8 +632,10 @@ class PlayerPanel(QtWidgets.QWidget):
         return [s.view for s in self._slots]
 
     def _both_slots(self):
-        """Are both windows visible? (Double side by side and Wipe over each other)"""
-        return self._view_mode in (exrnode.VIEW_DOUBLE, exrnode.VIEW_WIPE)
+        """Are both windows visible? (Double side by side, Wipe and Overlay
+        over each other)"""
+        return self._view_mode in (exrnode.VIEW_DOUBLE, exrnode.VIEW_WIPE,
+                                   exrnode.VIEW_OVERLAY)
 
     # it used to be called _double(); the name stays as a shorthand for the same
     _double = _both_slots
@@ -569,12 +654,27 @@ class PlayerPanel(QtWidgets.QWidget):
             shown = list(self._slots)
         return [s for s in shown if s.sequence is not None]
 
-    def _timeline_sequence(self):
-        """The sequence the timeline range follows (the first connected one)."""
-        for seq in self._sequences:
-            if seq is not None:
-                return seq
-        return None
+    def _timeline_range(self):
+        """(first, last) - ALWAYS the Comp input's range, or None.
+
+        Comp is the thing being reviewed; Plate is what it is checked against.
+        So the timeline is the comp's, whatever the plate happens to cover -
+        a plate delivered with handles must not add frames of comp that do not
+        exist, and a short plate must not cut the comp off.
+
+        Outside its own range a sequence holds its end frame
+        (ExrSequence.path_for clamps), so the plate simply stops moving there.
+
+        The plate is only used when there is no comp at all, so a node with
+        just a plate wired up still plays.
+        """
+        comp = self._sequences[0] if self._sequences else None
+        if comp is not None:
+            return (comp.first, comp.last)
+        found = [s for s in self._sequences if s is not None]
+        if not found:
+            return None
+        return (min(s.first for s in found), max(s.last for s in found))
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -593,13 +693,6 @@ class PlayerPanel(QtWidgets.QWidget):
         bar = QtWidgets.QHBoxLayout(bar_host)
         bar.setContentsMargins(5, 3, 5, 3)
         bar.setSpacing(3)
-
-        def button(text, slot, tip=""):
-            b = QtWidgets.QPushButton(text)
-            b.clicked.connect(slot)
-            b.setToolTip(tip)
-            bar.addWidget(b)
-            return b
 
         # How many windows. Which input and layer is picked inside each window
         # (see SlotBar), so in Double it is clear which controls are which.
@@ -645,8 +738,28 @@ class PlayerPanel(QtWidgets.QWidget):
 
         # the QC mode selector and CC (gain/gamma/saturation) are in the
         # panels right in the image
-        button("Fit", self._fit_all,
-               "Fit into the window - key F (or double click in the image)")
+
+        # Zoom, as in the Nuke Viewer: pick a value or type your own. Editable
+        # on purpose - the interesting zooms are not round numbers. "Fit" is the
+        # first entry, which is why there is no separate Fit button any more.
+        # Which zoom is cheap is not obvious either (the visible area grows as
+        # you zoom out and the sampling step only comes in whole numbers), so
+        # the render rate in the status line is worth a glance when picking one.
+        self._zoom_combo = QtWidgets.QComboBox()
+        self._zoom_combo.setEditable(True)
+        self._zoom_combo.addItems(ZOOM_PRESETS)
+        self._zoom_combo.setFixedWidth(74)
+        self._zoom_combo.setToolTip(
+            "Zoom. Pick a value or type one in.\n"
+            "'Fit' fits the image into the window - key F, or a double click\n"
+            "in the image, does the same.\n"
+            "70 % and 85 % are the last zooms that still read EVERY source\n"
+            "pixel; below about 67 % the picture is computed from a quarter of\n"
+            "the data (watch 'render fps' in the status line).")
+        self._zoom_combo.activated.connect(self._on_zoom_pick)
+        self._zoom_combo.lineEdit().returnPressed.connect(
+            lambda: self._on_zoom_text(self._zoom_combo.currentText()))
+        bar.addWidget(self._zoom_combo)
 
         bar.addStretch(1)
         root.addWidget(bar_host)
@@ -672,7 +785,7 @@ class PlayerPanel(QtWidgets.QWidget):
 
             # the window controls: the input toggle and the layer next to it,
             # top left
-            sb = SlotBar(exrnode.INPUT_LABELS, self._stage)
+            sb = SlotBar(exrnode.INPUT_TAGS, self._stage)
             sb.sourceChanged.connect(
                 lambda src, s=slot: self._on_source_ui(s, src))
             sb.layerChanged.connect(
@@ -699,6 +812,7 @@ class PlayerPanel(QtWidgets.QWidget):
                                                        s.controls.fx.combo.currentIndex()))
             ctrl.matte.toggled.connect(self._on_matte_ui)
             ctrl.matte.changed.connect(self._on_matte_values)
+            ctrl.matte.layerChanged.connect(self._on_matte_layer_ui)
             slot.controls = ctrl
 
             sc = ScopeStack(self._stage)
@@ -710,6 +824,40 @@ class PlayerPanel(QtWidgets.QWidget):
             # when A changes height (collapse, on/off), B has to move
             ctrl.refitted.connect(self._place_overlays)
             sb.moved.connect(self._place_overlays)
+
+        # The Overlay dissolve: one strip under BOTH windows' controls, so it
+        # is not the property of either of them. Hidden in every other mode.
+        self._mix_bar = overlay_mod.OverlayPanel(exrnode.INPUT_TAGS,
+                                                 self._stage)
+        self._mix_bar.mixChanged.connect(self._on_overlay_mix)
+        self._mix_bar.modeChanged.connect(self._on_overlay_qc)
+        self._mix_bar.paramsChanged.connect(self._on_overlay_params)
+        self._mix_bar.sourceLayerChanged.connect(self._on_overlay_layer)
+        self._mix_bar.resized.connect(self._raise_overlays)
+        self._mix_bar.hide()
+        self._overlay_qc = fx.NONE       # the comparison shown in Overlay
+        self._overlay_params = {}        # its settings, per comparison mode
+
+        # Annotation mode: ONE set of notes for the shot, shared by the views -
+        # a note belongs to the frame, not to whichever window drew it.
+        self._annot = annotate.Annotations()
+        self._export_scopes = None   # built on the first export that wants them
+        self._annot_bar = overlay_mod.AnnotBar(self._stage)
+        self._annot_bar.toolChanged.connect(self._on_annot_tool)
+        self._annot_bar.exportWanted.connect(self._export_annotations)
+        self._annot_bar.undoWanted.connect(self._annot_undo)
+        self._annot_bar.clearWanted.connect(self._annot_clear)
+        self._annot_bar.hide()
+        # a panel of its own, so picking a tool up does not resize the strip
+        self._annot_opts = overlay_mod.AnnotOptions(self._stage)
+        self._annot_opts.colorChanged.connect(self._on_annot_color)
+        self._annot_opts.sizeChanged.connect(self._on_annot_size)
+        self._annot_opts.hide()
+        for slot in self._slots:
+            slot.view.annotations = self._annot
+            slot.view.annotated.connect(self._on_annotated)
+            slot.view.textWanted.connect(
+                lambda x, y, s=slot: self._ask_note(s, x, y))
 
         self._stage.set_views([s.view for s in self._slots])
         # after every rearrangement raise the panels above the wipe line again
@@ -812,13 +960,35 @@ class PlayerPanel(QtWidgets.QWidget):
         self._probe_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self._probe_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self._probe_lbl.setToolTip(
-            "Scene-linear RGBA of the pixel under the mouse.\n"
+            "Scene-linear RGBA of the pixel under the mouse, and after the\n"
+            "divider its luminance (Rec.709) - what an exposure is judged on.\n"
+            "Bold = below 0 or above 1.\n"
             "The P key freezes the readout so you can move the mouse away.")
         tl.addWidget(self._probe_lbl)
         tl.addWidget(self._vline())
 
         # the frame number is right in the timeline (a bubble at the playhead),
         # a separate spin box is no longer needed
+        # The extremes of the whole frame. Next to the FPS because it is
+        # read the same way - a glance while something else is going on - and
+        # a stray negative or a value up at 60 is the first thing a check is
+        # looking for.
+        self._range_lbl = QtWidgets.QLabel("")
+        self._range_lbl.setFixedWidth(190)
+        self._range_lbl.setAlignment(QtCore.Qt.AlignRight
+                                     | QtCore.Qt.AlignVCenter)
+        self._range_lbl.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse)
+        self._range_lbl.setToolTip(
+            "Lowest and highest scene-linear value in the WHOLE frame\n"
+            "(RGB, alpha not counted).\n"
+            "Measured over every pixel, not a sample - one stray negative is\n"
+            "the thing worth catching.\n"
+            "Held frames only: during playback it would cost more than it is\n"
+            "worth and could not be read anyway.")
+        tl.addWidget(self._range_lbl)
+        tl.addWidget(self._vline())
+
         self._fps_lbl = QtWidgets.QLabel("-- fps")
         self._fps_lbl.setFixedWidth(66)
         self._fps_lbl.setAlignment(QtCore.Qt.AlignCenter)
@@ -836,7 +1006,7 @@ class PlayerPanel(QtWidgets.QWidget):
             "       C CC, Q QC, H histogram, V vectorscope, W waveform\n"
             "       F fit into the window\n"
             "       1-7 QC modes, I/O mark in/out, P freeze the readout\n"
-            "       X switch window (in Double)")
+            "       X switch window (in Double), - swap Comp/Plate")
         self._status.setContentsMargins(4, 0, 4, 2)
         root.addWidget(self._status)
 
@@ -852,6 +1022,13 @@ class PlayerPanel(QtWidgets.QWidget):
             ("B", lambda: self._toggle_channel(3)),
             ("A", lambda: self._toggle_channel(4)),
             ("Y", lambda: self._toggle_channel(5)),      # luminance
+            # MINUS - the one over plus on the number pad. Qt treats the
+            # keypad key as a different sequence from the one in the number
+            # row ("Num+-" against "-"), so both are bound: it is the same
+            # character and nobody looks at which half of the keyboard it
+            # came from.
+            ("-", self._swap_source),                    # Comp <-> Plate
+            (_keypad_minus(), self._swap_source),
             ("I", self._set_mark_in),                    # mark IN here
             ("O", self._set_mark_out),                   # mark OUT here
             ("P", self._toggle_probe_freeze),            # freeze the pixel readout
@@ -862,7 +1039,7 @@ class PlayerPanel(QtWidgets.QWidget):
         for key, _label, _tip in overlay_mod.PANEL_BUTTONS:
             shortcuts.append((self.PANEL_KEYS[key],
                               lambda k=key: self._toggle_panel(k)))
-        for i in range(len(fx.ORDER)):                   # 1=difference, 2=grain...
+        for i in range(len(fx.ORDER)):                   # 1=grain, 2=high-pass...
             shortcuts.append((str(i + 1),
                               lambda idx=i: self._set_effect(idx)))
         for key, fn in shortcuts:
@@ -917,6 +1094,38 @@ class PlayerPanel(QtWidgets.QWidget):
     def _fit_all(self):
         for view in self._each_view():
             view.fit()
+        self._sync_zoom_combo()
+
+    def _on_zoom_pick(self, _index):
+        self._on_zoom_text(self._zoom_combo.currentText())
+
+    def _on_zoom_text(self, text):
+        """A value picked or typed. Anything unreadable is simply ignored - the
+        box goes back to showing the zoom that is actually set."""
+        text = (text or "").strip().lower().rstrip("%").strip()
+        if text in ("fit", ""):
+            self._fit_all()
+            return
+        try:
+            value = float(text.replace(",", "."))
+        except ValueError:
+            self._sync_zoom_combo()
+            return
+        for view in self._each_view():
+            view.set_zoom_percent(value)
+        self._sync_zoom_combo()
+        self.setFocus()                 # keys go back to the player, not the box
+
+    def _sync_zoom_combo(self):
+        """Shows the zoom that is really set (the wheel and F change it too)."""
+        combo = getattr(self, "_zoom_combo", None)
+        if combo is None:
+            return
+        text = "%.0f%%" % self.view.zoom_percent()
+        if combo.currentText() != text:
+            combo.blockSignals(True)
+            combo.setEditText(text)
+            combo.blockSignals(False)
 
     def _viewport_moved(self):
         """Pan or zoom - the scopes describe a different crop now.
@@ -928,6 +1137,7 @@ class PlayerPanel(QtWidgets.QWidget):
         """
         if not self._scope_timer.isActive():
             self._scope_timer.start()
+        self._sync_zoom_combo()     # the wheel and F move the zoom too
 
     def _sync_viewport(self, source):
         """Zoom/pan from one window into the other - so the pixels line up.
@@ -950,6 +1160,32 @@ class PlayerPanel(QtWidgets.QWidget):
             self._split = max(0, min(len(exrnode.SPLIT_MODES) - 1, int(split)))
         self._stage.set_mode(self._view_mode, self._split)
         self._apply_slot_visibility()
+        # The per-window bars and stacks are hidden by _apply_slot_visibility
+        # (called just above) and kept hidden by _apply_panel_flags - deciding
+        # it here as well would be a third opinion on the same thing.
+        # Annotation looks like Single - one window with its usual controls -
+        # and adds the tool strip under them.
+        annot_on = self._view_mode == exrnode.VIEW_ANNOTATE
+        self._annot_bar.setVisible(annot_on)
+        if not annot_on:
+            self._annot_bar.set_tool("")
+            self._on_annot_tool("")       # hides the settings panel with it
+        overlay_on = self._view_mode == exrnode.VIEW_OVERLAY
+        self._mix_bar.setVisible(overlay_on)
+        if overlay_on:
+            self._mix_bar.set_mix(self._settings.get("overlay_mix", 1.0))
+            index = int(self._settings.get("overlay_qc", 0))
+            self._overlay_qc = fx.OVERLAY_MODES[
+                max(0, min(len(fx.OVERLAY_MODES) - 1, index))]
+            self._mix_bar.set_mode(
+                self._overlay_qc, self._overlay_params.get(self._overlay_qc))
+            # window A shows input A and window B input B - that IS the mode
+            for i, slot in enumerate(self._slots):
+                if slot.source != i:
+                    self._set_source(slot, i)
+                self._mix_bar.set_layers(i, slot.layers or ["rgba"],
+                                         slot.layer())
+        self._apply_overlay_qc()
         self._stage.wipe_opacity = self._settings.get("wipe_opacity", 1.0)
         self._apply_wipe_opacity(self._stage.wipe_opacity)
         self._apply_matte(self._settings)
@@ -972,12 +1208,17 @@ class PlayerPanel(QtWidgets.QWidget):
         if not both:
             self._active = 0              # in Single window 1 is always active
         visible = self._live_slots_all()
+        # In Difference the one panel replaces the per-window bars and stacks.
+        # The WINDOWS still show - it is only their furniture that goes. This
+        # was the second place bringing the old panels back over the new one:
+        # both windows are live here, so "visible" was true for both of them.
+        furniture = self._view_mode != exrnode.VIEW_OVERLAY
         for slot, sb in zip(self._slots, self._slot_bars):
             shown = slot in visible
             slot.view.setVisible(shown)
-            sb.setVisible(shown)
-            slot.controls.setVisible(shown)
-            slot.scopes.setVisible(shown)
+            sb.setVisible(shown and furniture)
+            slot.controls.setVisible(shown and furniture)
+            slot.scopes.setVisible(shown and furniture)
             sb.set_active(both and slot.index == self._active)
         self._place_overlays()
         if both:
@@ -1001,10 +1242,12 @@ class PlayerPanel(QtWidgets.QWidget):
 
     def _place_overlays_inner(self):
         stage_w = self._stage.width()
-        wipe = self._view_mode == exrnode.VIEW_WIPE
+        # Overlay stacks the controls the same way Wipe does - the windows are
+        # on top of each other, so side by side would put them in one corner.
+        stacked = self._view_mode in (exrnode.VIEW_WIPE, exrnode.VIEW_OVERLAY)
         for slot, sb in zip(self._slots, self._slot_bars):
             top = None
-            if wipe:
+            if stacked:
                 # the blocks below each other, as far apart as the first one is
                 # from the top edge
                 top = (overlay_mod.EDGE if slot.index == 0
@@ -1014,10 +1257,27 @@ class PlayerPanel(QtWidgets.QWidget):
                 (box.x(), box.y(), box.right()), stage_w, top)
             sb.set_anchor(*bar_at)
             slot.scopes.set_anchor(*scope_at)
+        # the one Overlay panel replaces the per-window bars, so it takes their
+        # place at the top left instead of hanging below them
+        if self._view_mode == exrnode.VIEW_OVERLAY:
+            self._mix_bar.set_anchor(overlay_mod.EDGE, overlay_mod.EDGE)
+        # the tools go UNDER the window's own controls, as asked, and the
+        # settings of the armed tool under those again
+        if self._view_mode == exrnode.VIEW_ANNOTATE:
+            self._annot_bar.set_anchor(
+                overlay_mod.EDGE,
+                self._slots[0].controls.bottom() + overlay_mod.EDGE)
+            self._annot_opts.set_anchor(
+                overlay_mod.EDGE,
+                self._annot_bar.bottom() + overlay_mod.EDGE)
         self._raise_overlays()
 
     def _raise_overlays(self):
         """The controls belong above the wipe line - otherwise it draws over them."""
+        if self._mix_bar.isVisible():
+            self._mix_bar.raise_()
+        if self._annot_opts.isVisible():
+            self._annot_opts.raise_()
         for slot, sb in zip(self._slots, self._slot_bars):
             sb.raise_()
             slot.controls.raise_()
@@ -1135,6 +1395,16 @@ class PlayerPanel(QtWidgets.QWidget):
         """Applies the panel state of one window (wherever the settings came from)."""
         if slot.controls is None:
             return
+        # In Difference mode the one panel replaces all of this - the bar, CC
+        # and the per-window QC. Enforced HERE and not only when the mode is
+        # switched: this runs on every panel toggle and knob change too, and
+        # each of those used to bring the old panels back over the new one.
+        if self._view_mode == exrnode.VIEW_OVERLAY:
+            slot.controls.setVisible(False)
+            slot.bar.setVisible(False)
+            slot.scopes.set_visibility(False, False, False)
+            slot.scopes.set_scope_active(False, False, False)
+            return
         scopes_ok = self._scopes_allowed()
         slot.controls.set_visibility(
             self._flag(s, "cc", slot),
@@ -1171,7 +1441,10 @@ class PlayerPanel(QtWidgets.QWidget):
         changes - so the image jumped left and travelled while dragging the line.
         """
         value = max(0.0, min(1.0, float(value)))
-        if self._view_mode != exrnode.VIEW_WIPE:
+        if self._view_mode == exrnode.VIEW_OVERLAY:
+            value = max(0.0, min(1.0, float(
+                self._settings.get("overlay_mix", 1.0))))
+        elif self._view_mode != exrnode.VIEW_WIPE:
             value = 1.0
         self._slots[1].view.set_opacity(value)
 
@@ -1180,6 +1453,267 @@ class PlayerPanel(QtWidgets.QWidget):
         self._apply_wipe_opacity(value)
         self._write_knob("cv_wipe_opacity", float(value))
         self._settings["wipe_opacity"] = float(value)
+
+    # ---------------------------------------------------------- Annotation
+    def _on_annot_tool(self, tool):
+        """Arms the pencil or the text tool on every window."""
+        for view in self._each_view():
+            view.annot_tool = tool or None
+            view.setCursor(QtCore.Qt.CrossCursor if tool
+                           else QtCore.Qt.ArrowCursor)
+        # the settings belong to the armed tool, so they come and go with it
+        self._annot_opts.set_tool(tool)
+        self._annot_opts.setVisible(
+            bool(tool) and self._view_mode == exrnode.VIEW_ANNOTATE)
+        self._place_overlays()
+
+    def _on_annot_color(self, index):
+        """The swatch in the image -> the windows + the node (the node is truth)."""
+        index = int(index)
+        for view in self._each_view():
+            view.annot_color = index
+        self._write_knob("cv_annot_color", index)
+        self._settings["annot_color"] = index
+
+    def _on_annot_size(self, tool, value):
+        """Pen width or text size, from the bar. Both live in IMAGE pixels."""
+        value = float(value)
+        knob = "cv_annot_pen" if tool == "draw" else "cv_annot_text"
+        key = "annot_pen" if tool == "draw" else "annot_text"
+        for view in self._each_view():
+            setattr(view, key, value)
+        self._write_knob(knob, value)
+        self._settings[key] = value
+
+    def _on_annotated(self):
+        """A note was added, taken back or cleared."""
+        self.timeline.set_annotated(self._annot.runs())
+        for view in self._each_view():
+            view.update()
+
+    def _ask_note(self, slot, x, y):
+        """The text tool was clicked - ask for the words, then place them.
+
+        Clicking an EXISTING note opens that one instead of stacking a second
+        one on top of it: a review note gets corrected far more often than it
+        gets doubled, and two notes in the same place cannot be told apart.
+        """
+        view = slot.view
+        width, height = view.image_size
+        look = view.current_look()
+        index = self._annot.text_at(self.frame, x, y, look, width, height)
+        if index is None:
+            old, size, at = "", view.annot_text, x
+            color = view.annot_color
+        else:
+            old = self._annot.text_of(self.frame, index)
+            size = self._annot.text_size(self.frame, index)
+            at = self._annot.text_pos(self.frame, index)[0]
+            color = self._annot.text_color(self.frame, index)
+        # the column the note will be broken into THERE - the lines shorten
+        # towards a side edge, so the box has to be told which it is
+        per_line = annotate.fits_per_line(size, at, width,
+                                          self._annot.line_max)
+        text, color, ok = overlay_mod.NoteDialog.ask(
+            self.frame, self, old, per_line, index is not None, color)
+        if not ok:
+            return
+        if index is None:
+            changed = self._annot.add_text(self.frame, x, y, text, color,
+                                           view.annot_text, look)
+        else:
+            changed = self._annot.replace_text(self.frame, index, text, color)
+        if changed:
+            self._on_annotated()
+
+    def _annot_undo(self):
+        """Only what is on screen - undo must not reach into another check."""
+        look = self.active.view.current_look()
+        if self._annot.undo(self.frame, look):
+            self._on_annotated()
+        elif self._annot.has(self.frame):
+            self._note_once("nothing to undo here - the notes on frame %d "
+                             "were made in another check" % self.frame)
+
+    def _annot_clear(self):
+        look = self.active.view.current_look()
+        if self._annot.clear(self.frame, look):
+            self._on_annotated()
+        elif self._annot.has(self.frame):
+            self._note_once("nothing to clear here - the notes on frame %d "
+                             "were made in another check" % self.frame)
+
+    def _annot_frame_image(self, slot, frame, look):
+        """One frame as it LOOKS, at full resolution, with its notes on it.
+
+        Rendered from the cached scene-linear data through the window's own
+        colour path, so the JPEG matches what was reviewed rather than some
+        other interpretation of the same file.
+        """
+        arr = self.cache.peek(slot.loader.key_for(frame))
+        if arr is None:
+            return None
+        # the view the notes were MADE in, not whatever is on screen now
+        rgb = slot.view.render_full(arr, look)
+        if rgb is None:
+            return None
+        h, w = rgb.shape[0], rgb.shape[1]
+        image = QtGui.QImage(rgb.data, w, h, w * 3,
+                             QtGui.QImage.Format_RGB888).copy()
+        painter = QtGui.QPainter(image)
+        try:
+            # The scopes go UNDER the notes: a note is the point of the file
+            # and must not end up behind a graph.
+            if self._settings.get("annot_scopes"):
+                if self._export_scopes is None:
+                    self._export_scopes = overlay_mod.ExportScopes()
+                self._export_scopes.draw(
+                    painter, slot.view.scope_source_for(arr, rgb, look), w, h)
+            # only the notes belonging to THIS view, at image pixels 1:1
+            self._annot.draw(painter, frame, look=look, width=w, height=h)
+            if self._settings.get("annot_stamp", True):
+                effect = (look or {}).get("effect", fx.NONE)
+                label = fx.LABELS.get(effect, "") if effect != fx.NONE else ""
+                annotate.draw_frame_number(painter, frame, w, h, label)
+        finally:
+            painter.end()
+        return image
+
+    def _export_annotations(self):
+        """Every annotated frame as a JPEG, into the folder set on the node."""
+        frames = self._annot.frames()
+        if not frames:
+            self._toggle_note = "nothing to export - no frame has a note"
+            self._toggle_note_t = time.monotonic()
+            return
+        folder = (self._settings.get("annot_dir") or "").strip()
+        if not folder:
+            nuke.message("Set the annotation folder on the JKplayer node "
+                         "first (Annotation folder).")
+            return
+        slot = self.active
+        if slot.sequence is None:
+            return
+        pattern = self._settings.get("annot_name") or "annotation_####.jpg"
+        try:
+            if not os.path.isdir(folder):
+                os.makedirs(folder)
+        except Exception as exc:
+            nuke.message("Cannot create %s\n\n%s" % (folder, exc))
+            return
+
+        written, missing, rows = 0, [], []
+        for frame in frames:
+            # ONE PICTURE PER CHECK. A frame reviewed in the grain check and
+            # again without it is two different findings, and flattening them
+            # into one JPEG would put a note about grain over a plate that does
+            # not show any.
+            for look in self._annot.looks(frame):
+                image = self._annot_frame_image(slot, frame, look)
+                if image is None:
+                    missing.append(frame)     # not in the cache - cannot draw it
+                    continue
+                # The check goes IN THE NAME, so whoever opens the folder can
+                # tell the two apart without opening them. A plain frame gets
+                # no label - there is nothing to say.
+                effect = (look or {}).get("effect", fx.NONE)
+                label = fx.LABELS.get(effect, "") if effect != fx.NONE else ""
+                name = annotate.export_name(pattern, frame, label)
+                if image.save(os.path.join(folder, name), "JPG", 92):
+                    written += 1
+                    # One row per FILE, so the table and the folder line up.
+                    # Several notes on one frame become one cell, separated by
+                    # blank lines - they are all about that one picture.
+                    rows.append((
+                        frame, label, name,
+                        self._annot.strokes_count(frame, look),
+                        "\n\n".join(self._annot.notes(frame, look))))
+                else:
+                    missing.append(frame)
+        note = "exported %d frame%s to %s" % (written,
+                                              "" if written == 1 else "s",
+                                              folder)
+        if rows and self._settings.get("annot_csv", True):
+            try:
+                annotate.write_report(
+                    os.path.join(folder, annotate.REPORT_NAME), rows)
+                note += "  +  " + annotate.REPORT_NAME
+            except Exception as exc:
+                # The pictures are already written and they are the point -
+                # a failed list must not read as a failed export.
+                note += "  |  list NOT written: %s" % exc
+        if missing:
+            # Named, not hidden: a silently short export is the worst outcome
+            # here - you would hand over a review that is missing pages.
+            note += "  |  NOT written (not cached): %s" % ", ".join(
+                str(f) for f in missing[:12])
+        self._toggle_note = note
+        self._toggle_note_t = time.monotonic()
+        nuke.tprint("JKplayer: " + note)
+
+    # ------------------------------------------------------------- Overlay
+    def _apply_overlay_qc(self):
+        """Puts the comparison on the TOP window, or takes it off again.
+
+        The top one, because the mix slider is its opacity: at 1.00 you see the
+        comparison alone, and pulling it down dissolves it back over A, which is
+        how you find WHERE in the picture a difference sits. The bottom window
+        keeps showing A untouched.
+        """
+        if self._view_mode != exrnode.VIEW_OVERLAY:
+            return
+        # The bottom window always shows input A plain - a check left over from
+        # another mode would be compared against, not looked through.
+        self._slots[0].view.set_effect(fx.NONE)
+        top = self._slots[1]
+        if self._overlay_qc == fx.NONE:
+            top.view.set_effect(fx.NONE)
+        else:
+            params = self._overlay_params.setdefault(
+                self._overlay_qc, fx.defaults(self._overlay_qc))
+            top.view.set_effect(self._overlay_qc, params)
+            top.legend = fx.legend(self._overlay_qc)
+        # the comparison reads the OTHER window's frame, so both have to be
+        # decoded and in the cache before it can draw anything
+        self._request_around()
+        self._schedule_cache()
+        self._show_current()
+
+    def _on_overlay_qc(self, mode):
+        self._overlay_qc = mode if mode in fx.OVERLAY_MODES else fx.NONE
+        self._write_knob("cv_overlay_qc",
+                         fx.OVERLAY_MODES.index(self._overlay_qc))
+        self._settings["overlay_qc"] = fx.OVERLAY_MODES.index(self._overlay_qc)
+        self._apply_overlay_qc()
+        # a comparison needs BOTH inputs decoded, even the hidden one
+        self._request_around()
+        self._schedule_cache()
+
+    def _on_overlay_params(self, values):
+        """A slider of the comparison moved."""
+        if self._overlay_qc == fx.NONE:
+            return
+        self._overlay_params[self._overlay_qc] = dict(values)
+        self._slots[1].view.set_effect_params(dict(values))
+
+    def _on_overlay_layer(self, index, layer):
+        """A layer picked in the Overlay panel - the same path a slot bar takes."""
+        if 0 <= index < len(self._slots):
+            self._on_layer_ui(self._slots[index], layer)
+
+    def _show_layers(self, slot, layers, current=None):
+        """The layer menu of one window, in BOTH places it appears - its own bar
+        and the Overlay panel, which replaces the bars in that mode."""
+        self._slot_bars[slot.index].set_layers(layers, current)
+        self._mix_bar.set_layers(slot.index, layers, current)
+
+    def _on_overlay_mix(self, value):
+        """The dissolve slider in the image -> the image + the node."""
+        value = max(0.0, min(1.0, float(value)))
+        self._settings["overlay_mix"] = value
+        self._write_knob("cv_overlay_mix", value)
+        if self._view_mode == exrnode.VIEW_OVERLAY:
+            self._slots[1].view.set_opacity(value)
 
     # ------------------------------------------------------------- DiMatte
     def _apply_matte(self, s):
@@ -1245,6 +1779,33 @@ class PlayerPanel(QtWidgets.QWidget):
         s["sources"] = tuple(sources)
         self._settings = s
 
+    def _swap_source(self):
+        """';' - show the other input in the active window.
+
+        The quickest A/B there is: one key, the same frame, the same zoom and
+        pan, so the two land on the eye in the same place. Wired to the ACTIVE
+        window, so it does the obvious thing in Double as well.
+        """
+        slot = self.active
+        if slot is None or len(self._sequences) < 2:
+            return
+        other = 1 - slot.source if slot.source in (0, 1) else 0
+        if self._sequences[other] is None:
+            self._note_once("input %s is not connected"
+                            % exrnode.INPUT_LABELS[other])
+            return
+        self._on_source_ui(slot, other)
+
+    def _note_once(self, text):
+        """One line in the status area, which fades on its own.
+
+        For things that are worth saying once and are not errors: a key that
+        could not do anything, an undo with nothing to undo. Shared, because
+        two copies of three lines is two places to change.
+        """
+        self._toggle_note = text
+        self._toggle_note_t = time.monotonic()
+
     def _set_source(self, slot, source):
         """Switches a window to a different node input (with its sequence and layers)."""
         source = max(0, min(len(self._sequences) - 1, int(source)))
@@ -1265,7 +1826,7 @@ class PlayerPanel(QtWidgets.QWidget):
         """
         node = self._get_node()
         if node is None:
-            self._knob_note = "no EXRplayer node to store %s in" % name
+            self._knob_note = "no JKplayer node to store %s in" % name
             return False
         try:
             node[name].setValue(value)
@@ -1281,7 +1842,7 @@ class PlayerPanel(QtWidgets.QWidget):
         except Exception as exc:
             self._knob_note = ("knob %s cannot be stored on node %s (%s)"
                                % (name, node.name(), exc))
-            nuke.tprint("EXRplayer: " + self._knob_note)
+            nuke.tprint("JKplayer: " + self._knob_note)
             return False
 
     def _vline(self):
@@ -1308,12 +1869,12 @@ class PlayerPanel(QtWidgets.QWidget):
             msg = "%s: %s" % (type(exc).__name__, exc)
             if msg != self._last_error:          # report only NEW errors
                 self._last_error = msg
-                nuke.tprint("EXRplayer: error in follow: %s" % msg)
+                nuke.tprint("JKplayer: error in follow: %s" % msg)
             self._follow_note = "NODE WATCHER ERROR: %s" % msg
             self._hint = "error: %s" % msg
 
     def _follow_tick_inner(self):
-        """Follows the selected EXRplayer node and polices its input."""
+        """Follows the selected JKplayer node and polices its input."""
         try:
             sel = [n for n in nuke.selectedNodes() if exrnode.is_player_node(n)]
         except Exception as exc:
@@ -1323,8 +1884,8 @@ class PlayerPanel(QtWidgets.QWidget):
             self._node_name = sel[0].fullName()
         node = self._get_node()
         if node is None:
-            self._hint = ("there is no EXRplayer node "
-                          "(EXRplayer > Create EXRplayer Node)")
+            self._hint = ("there is no JKplayer node "
+                          "(JKplayer > Create JKplayer Node)")
             for i, seq in enumerate(self._sequences):
                 if seq is not None:
                     self._set_input_sequence(i, None)
@@ -1333,21 +1894,47 @@ class PlayerPanel(QtWidgets.QWidget):
         if problem != self._input_note:
             self._input_note = problem or ""
             if problem:
-                nuke.tprint("EXRplayer: " + problem)
+                nuke.tprint("JKplayer: " + problem)
         # a safeguard: a Viewer attaches DOWNSTREAM (Viewer.input = our node),
         # so it is found differently than the inputs - the global guard watches
         # it too
         for name in exrnode.enforce_no_viewer():
-            nuke.tprint("EXRplayer: Viewer '%s' disconnected (display is "
-                        "handled by the EXRplayer panel)." % name)
+            nuke.tprint("JKplayer: Viewer '%s' disconnected (display is "
+                        "handled by the JKplayer panel)." % name)
         self._apply_settings(node)
         count = exrnode.input_count(node)     # an old NoOp node has only one
+        timing = self._settings.get("in_timing", ())
         for i in range(len(self._sequences)):
             src = node.input(i) if i < count else None
-            seq = from_read_node(src)
+            start_at, nudge = timing[i] if i < len(timing) else (0, 0)
+            seq = from_read_node(src, start_at, nudge)
             if seq != self._sequences[i]:
                 self._set_input_sequence(i, seq)
+        self._describe_inputs(node)
         self._hint = self._input_hint(node, count)
+
+    def _describe_inputs(self, node):
+        """Fills in the read-only 'Input A / B' line on the node.
+
+        Says the size and the range the input ENDED UP covering on the
+        timeline. 'Start at' and 'Offset' are two controls over one number, so
+        without a readout of the result there is no telling what they did
+        between them.
+        """
+        for key in exrnode.INPUT_KEYS:
+            i = exrnode.INPUT_KEYS.index(key)
+            seq = self._sequences[i] if i < len(self._sequences) else None
+            if seq is None:
+                text = "-"
+            else:
+                size = next((s.source_size for s in self._slots
+                             if s.source == i and s.source_size), "")
+                text = "%d-%d" % (seq.first, seq.last)
+                if seq.offset:
+                    text += "  (shifted %+d)" % seq.offset
+                if size:
+                    text = "%s   %s" % (size, text)
+            self._write_knob("cv_in_info_%s" % key, text)
 
     def _input_hint(self, node, count):
         """What the user is missing.
@@ -1362,9 +1949,10 @@ class PlayerPanel(QtWidgets.QWidget):
             return None
         if count < 2 and "B" in empty:
             return ("node '%s' has only one input (it is from an earlier "
-                    "version) - create a new one for A/B: EXRplayer > Create "
-                    "EXRplayer Node" % node.name())
-        return ("input %s is empty - attach a Read with .exr to it"
+                    "version) - create a new one for A/B: JKplayer > Create "
+                    "JKplayer Node" % node.name())
+        return ("input %s is empty - attach a Read with .exr to it "
+                "(a Dot in between is fine)"
                 % " and ".join(sorted(set(empty))))
 
     def _live_slots_all(self):
@@ -1418,7 +2006,50 @@ class PlayerPanel(QtWidgets.QWidget):
         # gain/gamma/saturation are handled by the in-image CC panel, the node
         # no longer holds them
         for view in self._each_view():
+            view.annot_color = int(s.get("annot_color", 0))
+            view.annot_pen = max(0.5, float(s.get("annot_pen",
+                                                  annotate.LINE_W)))
+            view.annot_text = max(6.0, float(s.get("annot_text",
+                                                   annotate.TEXT_H)))
+        # One setting for every note, so it lives on the store rather than on
+        # each window. Changing it re-flows the notes already written, which is
+        # why the views are redrawn.
+        line_max = max(annotate.LINE_MIN,
+                       int(s.get("annot_line", annotate.LINE_MAX)))
+        if line_max != self._annot.line_max:
+            self._annot.line_max = line_max
+            for view in self._each_view():
+                view.update()
+        # the panel shows the same numbers - the knobs stay usable and
+        # whichever of the two was touched, the other follows
+        self._annot_opts.set_color(int(s.get("annot_color", 0)))
+        self._annot_opts.set_size("draw", s.get("annot_pen", annotate.LINE_W))
+        self._annot_opts.set_size("text", s.get("annot_text", annotate.TEXT_H))
+        qc_threads = max(1, int(s.get("qc_threads", 4)))
+        qc_full = bool(s.get("qc_full_play", True))
+        # a redraw only when one of them really changed - otherwise every
+        # unrelated knob would throw the rendered image away
+        # The matte source and its layer are read by the matte loader, not by
+        # the views, so a change there has to be pushed - nothing else would
+        # notice it.
+        if s.get("matte_source") != old.get("matte_source"):
+            # the third input comes and goes with this setting - see
+            # node.wanted_inputs
+            node = self._get_node()
+            if node is not None:
+                exrnode.ensure_inputs(node)
+        if (s.get("matte_source") != old.get("matte_source")
+                or s.get("matte_layer") != old.get("matte_layer")):
+            self._fill_matte_layers()
+            self._bind_matte()
+        qc_changed = (qc_threads != old.get("qc_threads")
+                      or qc_full != old.get("qc_full_play"))
+        for view in self._each_view():
             view.set_color(channels=s["channels"])
+            view.qc_threads = qc_threads
+            view.qc_full_play = qc_full
+            if qc_changed:
+                view.invalidate()
         # the window sources before the mode: switching to Double reveals the
         # second window and it should already know which input it shows
         for i, slot in enumerate(self._slots):
@@ -1465,6 +2096,18 @@ class PlayerPanel(QtWidgets.QWidget):
             self._stage.wipe_opacity = value
             self._stage.line.update()
             self._apply_wipe_opacity(value)
+        if s.get("overlay_mix") != old.get("overlay_mix"):
+            value = max(0.0, min(1.0, float(s.get("overlay_mix", 1.0))))
+            self._mix_bar.set_mix(value)         # the knob is the truth
+            if self._view_mode == exrnode.VIEW_OVERLAY:
+                self._slots[1].view.set_opacity(value)
+        if s.get("overlay_qc") != old.get("overlay_qc"):
+            index = int(s.get("overlay_qc", 0))
+            self._overlay_qc = fx.OVERLAY_MODES[
+                max(0, min(len(fx.OVERLAY_MODES) - 1, index))]
+            self._mix_bar.set_mode(
+                self._overlay_qc, self._overlay_params.get(self._overlay_qc))
+            self._apply_overlay_qc()
         if any(s.get(k) != old.get(k) for k in
                ("matte", "matte_light", "matte_gain", "matte_gamma")):
             self._apply_matte(s)
@@ -1477,14 +2120,23 @@ class PlayerPanel(QtWidgets.QWidget):
                 want = want[i] if i < len(want) else None
                 if want in (slot.layers or []) and want != slot.layer():
                     self._apply_layer(slot, want)
-                    self._slot_bars[i].set_layers(slot.layers, want)
+                    self._show_layers(slot, slot.layers, want)
         # the exposure no longer has a widget in the panel - it comes off the node
         if self._playing:
             self._play_timer.setInterval(max(1, int(1000.0 / s["fps"])))
 
+    def _matte_from_layer(self):
+        return (self._settings.get("matte_source", exrnode.MATTE_FROM_INPUT)
+                == exrnode.MATTE_FROM_LAYER)
+
     def _matte_sequence(self):
-        """The sequence of the DiMatte input, or None."""
-        idx = exrnode.MATTE_INPUT
+        """Where the mattes come from - the third input, or Comp itself.
+
+        A comp that already carries its own mattes as an EXR layer needs
+        nothing wired up, which is the usual case; the separate input stays for
+        mattes that arrive as their own files.
+        """
+        idx = 0 if self._matte_from_layer() else exrnode.MATTE_INPUT
         return self._sequences[idx] if idx < len(self._sequences) else None
 
     def _matte_live(self):
@@ -1493,47 +2145,63 @@ class PlayerPanel(QtWidgets.QWidget):
                 and self._matte_sequence() is not None
                 and any(self._settings.get("matte", ())))
 
+    def _bind_matte(self):
+        """Points the matte loader at whichever source is chosen.
+
+        Its own loader and its own layer, so switching the matte layer never
+        disturbs what the windows are showing - and the cache keys carry the
+        layer (FrameLoader.key_for), so the two cannot mix.
+        """
+        seq = self._matte_sequence()
+        # The layer applies to EITHER source. A DiMatte input is an EXR too and
+        # may well carry its mattes in a layer of its own, so tying the menu to
+        # one of the two sources would have been an arbitrary limit.
+        layer = self._settings.get("matte_layer", exrcore.ROOT_LAYER)
+        changed = self._matte_loader.set_sequence(seq)
+        changed = self._matte_loader.set_layer(layer) or changed
+        if changed and self._matte_live():
+            self._request_around()
+            self._schedule_cache()
+            self._show_current()
+
     def _set_input_sequence(self, index, seq):
         """The source of one node INPUT changed - rebind the windows showing it."""
         self._sequences[index] = seq
         self._sync_timeline_range()
         if index == exrnode.MATTE_INPUT:
-            self._matte_loader.set_sequence(seq)
-            self._request_around()
-            self._schedule_cache()
-            self._show_current()
+            self._bind_matte()
             return
+        if index == 0:
+            # Comp may be the matte source as well, and then its layers are
+            # what the matte menu offers
+            self._fill_matte_layers()
+            self._bind_matte()
         for slot in self._slots:
             if slot.source == index:
                 self._bind_slot(slot)
 
     def _sync_timeline_range(self):
-        """The timeline range follows the first attached input.
-
-        Both inputs have to have the same range (exrnode.enforce_input polices
-        that), so it does not matter that the first one is taken - and when
-        only one is attached, that is the one that applies.
-        """
-        seq = self._timeline_sequence()
-        if seq is None:
+        """Puts the timeline over the range the attached inputs cover."""
+        rng = self._timeline_range()
+        if rng is None:
             self._tl_range = None          # after disconnecting, let it be set again
             return
         # CAREFUL: we remember the range HERE, we do not read it from Timeline.
         # That one holds it in _first/_last and reading a non-existent .first
         # raised an exception that _follow_tick swallowed - from the outside it
         # looked as if an attached input never loaded at all.
-        rng = (seq.first, seq.last)
         if rng == self._tl_range:
             return
         self._tl_range = rng
+        first, last = rng
         for w in (self._in_spin, self._out_spin):
             w.blockSignals(True)
-            w.setRange(seq.first, seq.last)
+            w.setRange(first, last)
             w.blockSignals(False)
-        self.timeline.set_range(seq.first, seq.last)
-        self.timeline.set_in_out(seq.first, seq.last)
-        self.mark_in, self.mark_out = seq.first, seq.last
-        self.frame = seq.clamp(self.frame)
+        self.timeline.set_range(first, last)
+        self.timeline.set_in_out(first, last)
+        self.mark_in, self.mark_out = first, last
+        self.frame = max(first, min(last, self.frame))
         self._sync_frame_widgets()
 
     def _bind_slot(self, slot):
@@ -1545,8 +2213,9 @@ class PlayerPanel(QtWidgets.QWidget):
         if seq is None:
             slot.view.set_frame(None)
             slot.source_info = "-"
+            slot.source_size = ""
             slot.fitted = False           # after a new connection, fit again
-            self._slot_bars[slot.index].set_layers([exrcore.ROOT_LAYER])
+            self._show_layers(slot, [exrcore.ROOT_LAYER])
             return
 
         # The image is fitted into the window ONLY THE FIRST TIME. When
@@ -1565,11 +2234,12 @@ class PlayerPanel(QtWidgets.QWidget):
         if not info.get("supported"):
             self._input_note = "input %s: we cannot read this EXR: %s (%s)" % (
                 slot.source_label(), info.get("reason", "?"), seq.label())
-            nuke.tprint("EXRplayer: " + self._input_note)
+            nuke.tprint("JKplayer: " + self._input_note)
         else:
-            slot.source_info = "%dx%d  %s" % (info["width"], info["height"],
-                                              info.get("compression", "?"))
-            nuke.tprint("EXRplayer: %s = %s  %s  channels %s  [reader: %s]"
+            slot.source_size = _size_text(info)
+            slot.source_info = "%s  %s" % (slot.source_size,
+                                           info.get("compression", "?"))
+            nuke.tprint("JKplayer: %s = %s  %s  channels %s  [reader: %s]"
                         % (slot.source_label(), seq.label(), slot.source_info,
                            ",".join(info.get("channels", [])),
                            info.get("backend", "?")))
@@ -1579,6 +2249,24 @@ class PlayerPanel(QtWidgets.QWidget):
             self._schedule_cache()
 
     # ------------------------------------------------------------- playback
+    # Look-ahead is sized to the PLAY RATE: a fixed frame count buffers less
+    # time the faster you play. The priority window covers at least this many
+    # seconds of playback; the cv_lookahead knob is a floor on top of it.
+    LOOKAHEAD_SECONDS = 1.5
+
+    def _effective_lookahead(self):
+        """Prefetch depth in frames: the larger of the cv_lookahead knob and
+        ~LOOKAHEAD_SECONDS of playback, capped by what actually fits in the
+        cache (so it never prefetches frames that would evict straight away)."""
+        s = self._settings
+        floor = int(s.get("lookahead", 24))
+        fps = float(s.get("fps", 24.0)) or 24.0
+        ahead = max(floor, int(round(fps * self.LOOKAHEAD_SECONDS)))
+        cap = self._cache_capacity()
+        if cap:
+            ahead = min(ahead, max(1, cap - 1))    # leave room for the current frame
+        return max(1, min(ahead, 200))
+
     def _request_around(self):
         """Look-ahead around the playhead, but only within mark IN..OUT.
 
@@ -1589,9 +2277,10 @@ class PlayerPanel(QtWidgets.QWidget):
         loaders = [slot.loader for slot in self._live_slots()]
         if self._matte_live():
             loaders.append(self._matte_loader)
+        ahead = self._effective_lookahead()
         for loader in loaders:
             loader.set_playhead(self.frame, self._direction,
-                                ahead=s.get("lookahead", 24),
+                                ahead=ahead,
                                 behind=s.get("behind", 4),
                                 lo=self.mark_in, hi=self.mark_out)
 
@@ -1637,6 +2326,10 @@ class PlayerPanel(QtWidgets.QWidget):
         Only the active window counts towards the FPS, so the number always
         means the same thing.
         """
+        # which frame the notes belong to - without this a drawing made after
+        # scrubbing would land on whatever frame the window was opened at
+        for view in self._each_view():
+            view.annot_frame = self.frame
         shown = False
         for slot in self._live_slots():
             if self._show_slot(slot) and slot.index == self._active:
@@ -1759,20 +2452,45 @@ class PlayerPanel(QtWidgets.QWidget):
     def _toggle_play(self):
         self._play_btn.setChecked(not self._play_btn.isChecked())
 
+    def _suspend_background(self):
+        """Drops the background (whole-range) queue on every loader.
+
+        The URGENT look-ahead window is untouched - that is the prefetch that
+        actually feeds playback, and it is paced by the playhead all by itself.
+        """
+        for slot in self._slots:
+            slot.loader.cancel_background()
+        self._matte_loader.cancel_background()
+
     def _on_play_toggled(self, on):
         self._playing = on
         self._play_btn.setText("Stop" if on else "Play")
+        # no margin while playing - it only pays off when the frame is NOT
+        # changing, and it costs 1.8x the pixels (see _visible_box)
+        for view in self._each_view():
+            view.playing = on
+            view.invalidate()
         if on:
             fps = self._settings.get("fps", 24.0)
             self._play_t0 = time.monotonic()
             self._play_f0 = self.frame
             self._fps_t0 = time.monotonic()
             self._shown = 0
-            self._schedule_cache()      # the cache window follows the playback direction
+            # The background fill is SUSPENDED while playing. Decoding is
+            # memory-bandwidth bound and so is the display (the QC checks are
+            # big numpy passes), so a background queue running flat out starves
+            # the GUI thread: measured on 4K, one grain frame goes 107 ms with 4
+            # workers busy but 166 ms with 8 - which is why more decoding
+            # threads FEEL slower and people turn them back down. The look-ahead
+            # window alone keeps up with playback and leaves the bandwidth for
+            # drawing. The range fills again the moment playback stops.
+            self._suspend_background()
             self._play_timer.start(max(1, int(1000.0 / fps)))
         else:
             self._play_timer.stop()
             self._fps_lbl.setText("-- fps")
+            if self._settings.get("auto_cache", True):
+                self._schedule_cache()      # free again - fill the range
 
     def _tick(self):
         seq = self.sequence
@@ -1886,9 +2604,16 @@ class PlayerPanel(QtWidgets.QWidget):
         effect = fx.ORDER[index]
         params = slot.fx_params.setdefault(effect, fx.defaults(effect))
         active = self._flag(self._settings, "qc", slot)
-        slot.view.set_effect(effect if active else fx.NONE, params)
+        # In Overlay the top window belongs to the comparison in the strip; its
+        # own QC menu still fills its panel, but it must not take the image back
+        # off the comparison that is running there.
+        owned = (self._view_mode == exrnode.VIEW_OVERLAY
+                 and slot.index == 1 and self._overlay_qc != fx.NONE)
+        if not owned:
+            slot.view.set_effect(effect if active else fx.NONE, params)
         slot.controls.fx.set_effect(effect, params)
-        slot.legend = fx.legend(effect) if active else ""
+        slot.legend = (fx.legend(self._overlay_qc) if owned
+                       else (fx.legend(effect) if active else ""))
         if fx.needs_other(effect):
             # from now on the second input has to be decoded, even when hidden
             self._request_around()
@@ -2096,6 +2821,12 @@ class PlayerPanel(QtWidgets.QWidget):
         The values come from the window the mouse is over - so in Double the
         input of that window is written in front of them.
         """
+        # The marker on the scopes follows the cursor. It goes to the window
+        # the mouse is over and is cleared on every other one, so two windows
+        # cannot both claim to be showing "the" pixel. Freezing the readout (P)
+        # parks the marker with it - which is the point of freezing.
+        for s in self._slots:
+            s.scopes.set_probe(info if s is slot else None)
         if info is None:
             self._probe_lbl.setText("")
             return
@@ -2113,8 +2844,20 @@ class PlayerPanel(QtWidgets.QWidget):
                 cell = "<b>%s</b>" % cell
             parts.append('<span style="color:%s">%s</span>' % (color, cell))
 
+        # Luminance after the channels, behind a divider: it is not a channel
+        # but a reading OF them (Rec.709), and it is what an exposure is
+        # actually judged on. Already computed for the probe - see
+        # ImageView._probe_at.
+        lum = info.get("lum")
+        if lum is not None:
+            cell = _nbsp("%7.4f" % lum)
+            if lum < 0.0 or lum > 1.0:
+                cell = "<b>%s</b>" % cell
+            parts.append('<span style="color:#808080">|</span>&nbsp;'
+                         '<span style="color:#e0e0e0">%s</span>' % cell)
+
         snow = "&#10052;" if self.view.probe_frozen else ""
-        tag = ("<b>%s</b>&nbsp;" % slot.source_label()
+        tag = ("<b>%s</b>&nbsp;" % slot.source_tag()
                if slot is not None and self._double() else "")
         self._probe_lbl.setText(snow + tag + "&nbsp;".join(parts))
 
@@ -2133,8 +2876,52 @@ class PlayerPanel(QtWidgets.QWidget):
             self._apply_layer(slot, want)
         elif slot.layer() not in slot.layers:
             self._apply_layer(slot, slot.layers[0])
-        self._slot_bars[slot.index].set_layers(
-            slot.layers or [exrcore.ROOT_LAYER], slot.layer())
+        self._show_layers(slot, slot.layers or [exrcore.ROOT_LAYER],
+                          slot.layer())
+
+    def _fill_matte_layers(self):
+        """Offers the layers of the Comp file in the matte layer menu.
+
+        The list can only be built once a file is attached, so it is refilled
+        whenever the source changes. A stored choice that the file does not
+        have falls back to the first layer rather than reading nothing.
+        """
+        seq = self._matte_sequence()
+        layers = ([exrcore.ROOT_LAYER] if seq is None
+                  else reader.layers_of(seq.path_for(seq.first)))
+        want = self._settings.get("matte_layer", exrcore.ROOT_LAYER)
+        if want not in layers and layers:
+            want = layers[0]
+            self._settings = dict(self._settings, matte_layer=want)
+            self._write_knob("cv_matte_layer", want)
+        self._set_knob_values("cv_matte_layer", layers)
+        for slot in self._slots:              # the menu inside the image
+            slot.controls.matte.set_layers(layers, want)
+
+    def _on_matte_layer_ui(self, layer):
+        """The layer menu in the image -> the node (the node is truth)."""
+        layer = str(layer)
+        if not layer or layer == self._settings.get("matte_layer"):
+            return
+        self._settings = dict(self._settings, matte_layer=layer)
+        self._write_knob("cv_matte_layer", layer)
+        self._bind_matte()
+
+    def _set_knob_values(self, name, values):
+        """Replaces the items of an Enumeration knob, keeping the choice."""
+        node = self._get_node()
+        if node is None:
+            return
+        try:
+            knob = node[name]
+            if list(knob.values()) == list(values):
+                return
+            current = knob.value()
+            knob.setValues(list(values))
+            if current in values:
+                knob.setValue(current)
+        except Exception as exc:
+            nuke.tprint("JKplayer: cannot fill %s (%s)" % (name, exc))
 
     def _on_layer_ui(self, slot, layer):
         """A layer choice -> new data for this window."""
@@ -2261,6 +3048,8 @@ class PlayerPanel(QtWidgets.QWidget):
         """When the playhead has run away from the anchor, move the cache window forward."""
         if self.sequence is None or not self._settings.get("auto_cache", True):
             return
+        if self._playing:
+            return          # suspended while playing - see _on_play_toggled
         cap = self._cache_capacity()
         if not cap:
             return
@@ -2270,23 +3059,36 @@ class PlayerPanel(QtWidgets.QWidget):
 
     def _clear_cache(self):
         self.cache.clear()
-        self.cache_runs = []
         self.timeline.set_cache_runs([])
         self._request_around()
 
-    def _cache_runs(self):
-        """Continuous runs for the cache bar.
+    def _cache_lanes(self):
+        """One list of runs PER LIVE INPUT, for the timeline's cache lines.
 
-        In Double the INTERSECTION is shown - a frame is green only when both
-        windows have it. Playback would not go further anyway (see
-        _frame_cached), so one-sided green would lie.
+        Not the intersection any more. It was honest about where playback can
+        go, but it hid which of the two inputs is behind - and that is the one
+        thing you want to know while a second input is still filling.
         """
-        live = self._live_slots()
-        if not live:
-            return []
-        sets = [set(self.cache.cached_frames(s.sequence, s.loader.key_fn()))
-                for s in live]
-        frames = sorted(set.intersection(*sets))
+        return [self._runs_of(s) for s in self._live_slots()]
+
+    def _sync_alt_numbering(self):
+        """Puts input B's own numbers under the cache lanes, when they help.
+
+        Only with two inputs actually being read AND only when B is shifted or
+        covers a different range from A - otherwise the second row would repeat
+        the first one and cost 11 px for nothing.
+        """
+        a, b = (self._sequences + [None, None])[:2]
+        if a is None or b is None or len(self._live_slots()) < 2 \
+                or (b.offset == a.offset and b.first == a.first
+                    and b.last == a.last):
+            self.timeline.set_alt_numbering(None)
+            return
+        self.timeline.set_alt_numbering(b.offset, b.first, b.last)
+
+    def _runs_of(self, slot):
+        frames = sorted(self.cache.cached_frames(slot.sequence,
+                                                 slot.loader.key_fn()))
         runs = []
         for f in frames:
             if runs and f == runs[-1][1] + 1:
@@ -2296,14 +3098,23 @@ class PlayerPanel(QtWidgets.QWidget):
         return runs
 
     def _source_label(self):
-        """A description of the source: in Double both windows."""
+        """A description of the source: every window that is being read.
+
+        In a comparison _live_slots returns BOTH inputs even though only one
+        window is on screen, so two sizes are listed - and then they have to
+        say WHICH is which. They used to be tagged only in Double, which left
+        a difference reading "3780x2520 || 4096x2160" with no way to tell
+        which one was being fitted onto the other.
+        """
+        slots = self._live_slots()
+        tagged = len(slots) > 1
         parts = []
-        for slot in self._live_slots():
+        for slot in slots:
             name = slot.sequence.label()
             if slot.layer() != exrcore.ROOT_LAYER:
                 name += " [%s]" % slot.layer()
             parts.append("%s %s  [%s]" % (slot.source_label(), name,
-                                          slot.source_info) if self._double()
+                                          slot.source_info) if tagged
                          else "%s  [%s]" % (name, slot.source_info))
         return "   ||   ".join(parts)
 
@@ -2317,8 +3128,12 @@ class PlayerPanel(QtWidgets.QWidget):
         # CAREFUL: the timeline keeps ITS OWN copy of the runs, they have to be
         # handed to it (forget that and the cache does not show in the timeline
         # at all)
-        self.cache_runs = self._cache_runs()
-        self.timeline.set_cache_runs(self.cache_runs)
+        # One line per input. Where playback may actually go is a different
+        # question and is asked of the cache directly (see _frame_cached).
+        lanes = self._cache_lanes()
+        self.timeline.set_cache_runs(lanes[0] if lanes else [],
+                                     lanes[1] if len(lanes) > 1 else None)
+        self._sync_alt_numbering()
         for slot in self._slots:
             if slot.view.last_error:
                 self._status.setText("DISPLAY ERROR (window %s): %s"
@@ -2345,11 +3160,63 @@ class PlayerPanel(QtWidgets.QWidget):
             need = self.mark_out - self.mark_in + 1
             capacity = " | fits %d f%s" % (
                 cap, "" if cap >= need else " of %d NEEDS MORE RAM" % need)
-        txt = ("%s | RAM %.0f/%.0f MB (%d f)%s | fill %.0f fps "
+        # Decode cost per frame, the number that says WHY the fill rate is what
+        # it is: a frame cannot arrive faster than one decode, and the ceiling
+        # is roughly (threads * 1000 / decode_ms). Averaged over the session by
+        # the loader, so it is stable enough to read while playing.
+        decode = max((s.loader.avg_decode_ms for s in self._slots), default=0.0)
+        decode_txt = " | decode %.0f ms" % decode if decode else ""
+        txt = ("%s | RAM %.0f/%.0f MB (%d f)%s | fill %.0f fps%s "
                "| queue %d | zoom %.0f%%"
                % (self._source_label(),
                   cs["mb_used"], cs["mb_budget"], cs["frames"], capacity,
-                  fill, pending, self.view.zoom_percent()))
+                  fill, decode_txt, pending, self.view.zoom_percent()))
+        # How fast the PICTURE can be produced - the whole display path, QC
+        # check included when one is on. Separate from the "N fps" playback
+        # counter, which is what actually reached the screen: this one is the
+        # ceiling the drawing imposes, so when the two disagree you can see
+        # straight away whether the limit is drawing or decoding. Which zoom is
+        # cheap is genuinely unobvious (the visible area GROWS as you zoom out
+        # and the step only comes in whole numbers), so it is worth reading
+        # rather than reasoning about.
+        # Put at the very FRONT further down - the label does not wrap, so
+        # anything at the far right is simply cut off.
+        v = self.active.view
+        qc_txt = ""
+        # The extremes cost a pass over the whole frame, so they are measured
+        # on a HELD frame only. During playback the label keeps the last value
+        # rather than blanking: a number that flickers in and out is harder to
+        # ignore than one that is simply still.
+        if not self._playing:
+            ext = v.frame_extremes()
+            self._range_lbl.setText(
+                "" if ext is None else "fMIN %s   fMAX %s"
+                % (_fmt_value(ext[0]), _fmt_value(ext[1])))
+        if v.last_render_ms > 0.0:
+            st, es = v.last_render_scale
+            steps = "step %d" % st if es == st else "step %d/%d" % (st, es)
+            qc_txt = ("render %.0f fps @ %.2fM px (%s) | "
+                      % (1000.0 / v.last_render_ms, v.last_render_px / 1e6,
+                         steps))
+        # Said at the FRONT, with the render figures: a difference computed over
+        # a resampled input is a different measurement from one over two
+        # matching plates, and that has to be visible without going looking.
+        if v.last_resample:
+            qc_txt = v.last_resample + " | " + qc_txt
+        # The slow path is worth shouting about: the pure Python reader is
+        # ~2.3x slower than Nuke's OpenEXRCore, and landing on it is an
+        # anomaly (a missing/renamed DLL), not a choice.
+        if reader.backend_name() != "nuke-dll":
+            txt += "  | SLOW READER (no OpenEXRCore)"
+        # An honest word when the DECODE is the bottleneck: playing, still
+        # frames left to decode, and the shown rate is under target. It clears
+        # itself once the region is cached (pending -> 0, shown -> target), so
+        # it never nags during smooth playback.
+        target = float(self._settings.get("fps", 24.0)) or 24.0
+        if (self._playing and pending > 0 and self._fps_shown
+                and self._fps_shown < target * 0.9):
+            txt += ("  | decode-limited: %.0f/%.0f fps - more threads / lighter layer"
+                    % (self._fps_shown, target))
         if failures:
             txt += "  | errors %d" % failures
         if self.view.ocio_active():
@@ -2368,7 +3235,9 @@ class PlayerPanel(QtWidgets.QWidget):
                 or self.active.legend)      # the QC legend of the active window
         if note:
             txt = note + "     ||     " + txt
+        txt = qc_txt + txt              # in front of the legend too - see above
         self._status.setText(txt)
+        self._status.setToolTip(txt)    # nothing is lost when the line is cut off
         # errors, a duplicate and a disconnected input -> make them obvious
         if (self._follow_note or self._knob_note or self._input_note
                 or self._temporal_note.startswith("!!")):

@@ -72,6 +72,8 @@ def probe(path):
             if core.get("supported"):
                 core["backend"] = "nuke-dll"
                 core["channels"] = info.get("channels", [])
+                # the DLL probe does not report it; square is the safe answer
+                core.setdefault("pixel_aspect", 1.0)
                 # we know the compression name even for the ones our Python
                 # reader cannot handle - the panel should say "DWAA", not "id 8"
                 cid = core.get("compression_id")

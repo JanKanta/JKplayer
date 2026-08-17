@@ -12,7 +12,8 @@ import nuke
 # docked in Nuke.
 from . import panel as _panel_module          # makes sure exrplayer.panel exists
 
-_floating = None
+_floating = None                 # the fallback window, when there is no Viewer
+_docked = None                   # the pane beside the Viewer, once opened
 
 
 def _expose_in_main():
@@ -22,14 +23,77 @@ def _expose_in_main():
         import exrplayer
         setattr(__main__, "exrplayer", exrplayer)
     except Exception as exc:
-        nuke.tprint("EXRplayer: cannot expose in __main__: %s" % exc)
+        nuke.tprint("JKplayer: cannot expose in __main__: %s" % exc)
 
 
-def open_panel():
-    """Opens the EXRplayer panel as a floating window."""
-    global _floating
+PANEL_ID = "com.honza.EXRplayerPanel"
+PANEL_NAME = "JKplayer"
+
+# The widget is named as an EXPRESSION, evaluated later in __main__ - which is
+# what _expose_in_main is for.
+_WIDGET_EXPR = ("__import__('nukescripts').panels.WidgetKnob("
+                "exrplayer.panel.PlayerPanel)")
+
+
+def _new_pane_panel():
+    """A Nuke pane wrapping our widget.
+
+    The same thing nukescripts.registerWidgetAsPanel builds, made here so it
+    can be docked into a CHOSEN pane: the ready-made one only ever lands in
+    nuke.thisPane(), which is set while a Pane menu entry is being run and
+    nowhere else. Built here it also leaves the Pane menu alone - registering
+    again just to get an instance would re-add the entry.
+    """
+    import nukescripts
+    panel = nukescripts.PythonPanel(PANEL_NAME, PANEL_ID)
+    panel.addKnob(nuke.PyCustom_Knob(PANEL_NAME, "", _WIDGET_EXPR))
+    return panel
+
+
+def _viewer_pane():
+    """The pane the Viewer lives in, or None when there is no Viewer."""
+    for name in ("Viewer.1", "Viewer1"):
+        try:
+            pane = nuke.getPaneFor(name)
+        except Exception:
+            pane = None
+        if pane is not None:
+            return pane
+    return None
+
+
+def open_panel(force=False):
+    """Opens the panel DOCKED beside the Viewer, floating only as a fallback.
+
+    `force` opens another one even if we already opened one - that is the menu
+    entry. Everything else reuses, because a second panel would fight the first
+    over the same node and fill a second cache in RAM.
+    """
+    global _floating, _docked
+    if not force and _docked is not None:
+        return _docked
+    if not force and _floating is not None:
+        try:
+            if _floating.isVisible():
+                _floating.raise_()
+                _floating.activateWindow()
+                return _floating
+        except RuntimeError:
+            _floating = None        # Qt threw the window away, build a new one
+
+    pane = _viewer_pane()
+    if pane is not None:
+        try:
+            _docked = _new_pane_panel()
+            _docked.addToPane(pane)
+            return _docked
+        except Exception as exc:
+            _docked = None
+            nuke.tprint("JKplayer: could not dock beside the Viewer (%s), "
+                        "opening a window instead" % exc)
+
     _floating = _panel_module.PlayerPanel()
-    _floating.setWindowTitle("EXRplayer")
+    _floating.setWindowTitle(PANEL_NAME)
     _floating.resize(1280, 820)
     _floating.show()
     _floating.raise_()
@@ -37,8 +101,16 @@ def open_panel():
 
 
 def create_node():
+    """Creates the node AND shows the panel - the node on its own displays
+    nothing, so making one and seeing no picture is a puzzle, not a workflow."""
     from . import node as nodemod
-    return nodemod.create()
+    node = nodemod.create()
+    try:
+        open_panel()
+    except Exception as exc:
+        # a panel that will not open must not lose you the node
+        nuke.tprint("JKplayer: node created, panel did not open: %s" % exc)
+    return node
 
 
 _guard_busy = False
@@ -47,7 +119,7 @@ _knob_watch_installed = False
 
 
 def _viewer_guard():
-    """Disconnects any Viewer that has an EXRplayer node on its input.
+    """Disconnects any Viewer that has an JKplayer node on its input.
 
     Registered with nodeClass='Viewer', so it only runs for Viewers (not for
     every node in the graph) and `nuke.thisNode()` is that very Viewer.
@@ -68,8 +140,8 @@ def _viewer_guard():
         else:
             names = nodemod.enforce_no_viewer()
         if names:
-            nuke.tprint("EXRplayer: a Viewer cannot be attached - disconnected "
-                        "(%s). Display is handled by the EXRplayer panel."
+            nuke.tprint("JKplayer: a Viewer cannot be attached - disconnected "
+                        "(%s). Display is handled by the JKplayer panel."
                         % ", ".join(set(names)))
     except Exception:
         pass
@@ -85,7 +157,7 @@ def _install_viewer_guard():
         nuke.addUpdateUI(_viewer_guard, nodeClass="Viewer")
         _guard_installed = True
     except Exception as exc:
-        nuke.tprint("EXRplayer: cannot install the Viewer guard: %s" % exc)
+        nuke.tprint("JKplayer: cannot install the Viewer guard: %s" % exc)
 
 
 def _on_knob_changed():
@@ -125,7 +197,7 @@ def _install_knob_watch():
             nuke.addKnobChanged(_on_knob_changed, nodeClass=cls)
             ok = True
         except Exception as exc:
-            nuke.tprint("EXRplayer: cannot install the knob watch for %s: "
+            nuke.tprint("JKplayer: cannot install the knob watch for %s: "
                         "%s" % (cls, exc))
     _knob_watch_installed = ok
 
@@ -151,24 +223,26 @@ def register():
 
     try:
         import nukescripts
+        # Puts JKplayer in the Pane menu and makes the layout able to restore
+        # it. Opening one ourselves goes through _new_pane_panel instead - see
+        # there for why.
         nukescripts.registerWidgetAsPanel(
-            "exrplayer.panel.PlayerPanel", "EXRplayer",
-            "com.honza.EXRplayerPanel", create=True)
+            "exrplayer.panel.PlayerPanel", PANEL_NAME, PANEL_ID)
     except Exception as exc:
-        nuke.tprint("EXRplayer: panel registration failed: %s" % exc)
+        nuke.tprint("JKplayer: panel registration failed: %s" % exc)
 
     try:
-        m = nuke.menu("Nuke").addMenu("EXRplayer")
-        m.addCommand("Create EXRplayer Node",
+        m = nuke.menu("Nuke").addMenu("JKplayer")
+        m.addCommand("Create JKplayer Node",
                      "import exrplayer.register as r; r.create_node()")
-        m.addCommand("Open EXRplayer Panel",
-                     "import exrplayer.register as r; r.open_panel()")
+        m.addCommand("Open JKplayer Panel",
+                     "import exrplayer.register as r; r.open_panel(force=True)")
     except Exception as exc:
-        nuke.tprint("EXRplayer: menu failed: %s" % exc)
+        nuke.tprint("JKplayer: menu failed: %s" % exc)
 
     try:
         nuke.menu("Nodes").addCommand(
-            "EXRplayer/EXRplayer",
+            "JKplayer/JKplayer",
             "import exrplayer.register as r; r.create_node()")
     except Exception:
         pass

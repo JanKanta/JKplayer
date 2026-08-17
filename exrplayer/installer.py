@@ -1,7 +1,7 @@
 """
 Fetching numpy and scipy for the Nuke that is missing them.
 
-They are not shipped with EXRplayer any more. A compiled wheel is locked to
+They are not shipped with JKplayer any more. A compiled wheel is locked to
 both the platform and the CPython version, so shipping one build would only
 ever help the people who happen to run that exact Nuke on that exact OS, while
 everyone else carries a hundred-odd megabytes of libraries they cannot load.
@@ -25,9 +25,28 @@ from .paths import nuke_dirs, platform_tag
 
 # scipy is not required, but the grain and high-pass checks lose their sliders
 # without it, so it is fetched together with numpy rather than left as homework.
-PACKAGES = ("numpy", "scipy")
+#
+# RANGES, not bare names and not pins. Bare names mean whoever installs next
+# year gets a different set than the one this was tested against, and a bug
+# report cannot be reproduced. A pin cannot work either: this is fetched by
+# Nuke's own interpreter, which is cp39 on Nuke 14 and cp311 on 16/17, and no
+# single version has wheels for all of them. A range lets pip pick the newest
+# build that fits the Nuke doing the asking, which is the whole point of
+# fetching rather than shipping.
+#
+# The upper bounds are the next MAJOR: numpy 2.0 moved the C ABI under
+# everyone's feet and 3.0 may do it again, and scipy renames and removes
+# functions across majors.
+PACKAGES = ("numpy>=1.24,<3", "scipy>=1.10,<2")
 
 DOWNLOAD_MB = 50          # measured: numpy 12.6 + scipy 36.6; grows slowly
+
+# A managed install - a studio rollout - has its libraries put there on
+# purpose, and must never ask an artist to download anything: on two hundred
+# workstations that is two hundred dialogs, most of which then hit the
+# firewall. Either marker turns the offer into a line in the console.
+NO_FETCH_ENV = "EXRPLAYER_NO_FETCH"
+MANAGED_MARKER = "MANAGED"
 
 
 def package_root():
@@ -43,6 +62,21 @@ def user_pylibs():
     die on it.
     """
     return os.path.join(os.path.expanduser("~"), ".nuke", "pylibs", platform_tag())
+
+
+def managed():
+    """Whether this install is looked after by somebody else. (reason, ) or None.
+
+    Returns the reason as text so the console can say WHICH marker did it -
+    "it just did not ask" is the kind of thing that costs an afternoon.
+    """
+    value = os.environ.get(NO_FETCH_ENV, "").strip()
+    if value and value.lower() not in ("0", "false", "no"):
+        return "%s=%s" % (NO_FETCH_ENV, value)
+    marker = os.path.join(package_root(), "pylibs", MANAGED_MARKER)
+    if os.path.isfile(marker):
+        return marker
+    return None
 
 
 def _writable(path):
@@ -85,7 +119,7 @@ def nuke_python():
 
 
 def pip_command(target, executable=None, packages=PACKAGES):
-    """The exact command that would be run. Also what we show people to run by hand."""
+    """The exact command that would be run, as an argv list for subprocess."""
     return [executable or nuke_python() or "<nuke>/python",
             "-m", "pip", "install",
             "--target", target,
@@ -95,6 +129,23 @@ def pip_command(target, executable=None, packages=PACKAGES):
             "--only-binary=:all:",
             "--no-input",
             "--disable-pip-version-check"] + list(packages)
+
+
+def pip_command_text(target, executable=None, packages=PACKAGES):
+    """The same command as ONE LINE somebody can paste into a shell.
+
+    Not " ".join(argv): a requirement carries '>' and '<', which every shell
+    there is reads as redirection - `pip install numpy>=1.24,<3` writes an
+    empty file called '=1.24,' and installs nothing. Anything with a space or
+    a shell character gets quoted, so what is printed is what runs.
+    """
+    out = []
+    for arg in pip_command(target, executable, packages):
+        if any(c in arg for c in ' <>|&^"'):
+            out.append('"%s"' % arg.replace('"', '\\"'))
+        else:
+            out.append(arg)
+    return " ".join(out)
 
 
 def install(target=None, packages=PACKAGES, log=None):
@@ -118,7 +169,7 @@ def install(target=None, packages=PACKAGES, log=None):
         return False, "cannot create %s: %s" % (target, exc)
 
     cmd = pip_command(target, exe, packages)
-    say(" ".join(cmd))
+    say(pip_command_text(target, exe, packages))
 
     kwargs = {}
     if sys.platform == "win32":

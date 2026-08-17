@@ -19,9 +19,13 @@ the cache and decodes nothing, it only recomputes the display from data that is
 already loaded.
 """
 
+import time
+
 import numpy as np
 from .qtcompat import QtCore, QtGui, QtWidgets, event_pos
 
+from . import annotate
+from . import resample
 from . import effects as fx
 from . import nukelut
 from . import ocio as ocio_mod
@@ -37,16 +41,37 @@ CH_RGB, CH_R, CH_G, CH_B, CH_A, CH_LUMA = range(6)
 # where you are looking at it.
 EFFECT_PIXEL_BUDGET = 2000000
 
-# The blurring checks (grain, high-pass) have their own, stricter ceiling: they
-# do two gaussian blurs, so they cost 2-3x more than the rest. With a shared
-# ceiling the cost when zoomed out swung between 37 and 93 ms (10 to 27 fps)
-# depending on whether it had just jumped to a coarser step - and that read as
-# stutter.
-BLUR_PIXEL_BUDGET = 600000
 EFFECT_MARGIN = 0.10        # a smaller margin than ordinary display (0.35):
                             # thanks to that we fit under the ceiling at 100 %
                             # and grain is computed EXACTLY (step 1) where you
                             # are inspecting it
+
+# Grain / high-pass are computed at (near) FULL resolution and the RESULT is
+# averaged down to screen size, rather than point-subsampling the source first.
+# Point-subsampling a high-pass aliases the grain: it comes out coarse and it
+# CRAWLS when you pan or zoom, because the sampling grid slides under it (a 1px
+# pan picks a different set of pixels). Averaging a full-res result is what the
+# eye expects - fine, even grain that sits still, the same as looking at a baked
+# grain pass.
+#
+# This is the ceiling on that COMPUTE. At screen resolution (zoom >= 100 %) the
+# visible crop is at most a screenful, so it sits under this and is computed
+# exactly. Zoomed out the source crop is larger; the compute step is then
+# raised just enough to fit here, and the result is still averaged down, so it
+# stays steady. Deliberately near a screenful (not the whole 6K plate): the
+# extra resolution would not be visible and would only cost frames.
+GRAIN_SS_BUDGET = 3_000_000
+
+# While PLAYING or moving the view, the blur-heavy checks render at this much
+# compute so playback stays smooth; a moment after everything goes quiet they
+# re-render at the full budget above. Half the full budget: the fast and full
+# renders then match outright from ~125 % up (both full resolution there), and
+# where they still differ - around 100 % and when zoomed right out - the grain
+# brightness is already matched (see effects._es_comp) and the coarse render is
+# drawn smoothed (see paintEvent), so the refinement is a gentle sharpen, not a
+# jump. Raise it toward the full budget for an even smaller step (fewer fps),
+# lower it for more fps.
+GRAIN_FAST_BUDGET = 1_500_000
 
 _HALF_VALUES = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
 
@@ -67,6 +92,31 @@ def build_lut(gain=1.0, gamma=1.0):
     return (np.clip(v, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
+def build_lut_f(gain=1.0, gamma=1.0):
+    """The same curve as build_lut, in float32 and WITHOUT the clip.
+
+    build_lut ends in uint8, so everything at or above display white lands on
+    255 and everything below black on 0. That is right for a picture and wrong
+    for a CHECK: a high pass over a flattened highlight finds no texture there,
+    because the flattening happened before it looked. On a plate that goes over
+    1.0 - a CG render, a practical, an unclamped grade - the check would be
+    blind exactly where one most wants to look.
+
+    So the curve is continued instead of clipped (sRGB's power arm carries on
+    perfectly well above 1.0) and mirrored through zero for negatives, keeping
+    their sign. Still scaled by 255, so the gain and pedestal of the checks
+    mean the same as before.
+    """
+    v = np.nan_to_num(_HALF_VALUES, nan=0.0, posinf=1e4, neginf=-1e4) * float(gain)
+    sign = np.sign(v)
+    a = np.abs(v)
+    a = np.where(a <= 0.0031308, a * 12.92,
+                 1.055 * np.power(a, 1.0 / 2.4) - 0.055)
+    if abs(gamma - 1.0) > 1e-6:
+        a = np.power(np.maximum(a, 0.0), 1.0 / max(gamma, 1e-3))
+    return (sign * a * 255.0).astype(np.float32)
+
+
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)   # Rec.709
 
 # Luminance through tables: every channel has its own 65536-entry table already
@@ -84,6 +134,61 @@ def _luma_bits(bits):
     return y.astype(np.float16).view(np.uint16)
 
 
+def _halve(img):
+    """Average 2x2 blocks -> (ceil(h/2), ceil(w/2), ...).
+
+    Kept in uint16: four bytes always fit, so nothing is promoted to float and
+    the arithmetic happens on the SMALL output rather than on a float copy of
+    the whole input. Measured on 2.2 Mpx that is 55 ms down to 7 ms.
+
+    An odd side replicates its last row/column first, so the result is ceil,
+    exactly what a point subsample of the same step would have produced - the
+    coverage test compares those sizes and would re-render every frame if they
+    disagreed by even one row.
+    """
+    if img.shape[0] % 2:
+        img = np.concatenate([img, img[-1:]], axis=0)
+    if img.shape[1] % 2:
+        img = np.concatenate([img, img[:, -1:]], axis=1)
+    s = img[0::2, 0::2].astype(np.uint16)
+    s += img[1::2, 0::2]
+    s += img[0::2, 1::2]
+    s += img[1::2, 1::2]
+    s += 2                                  # round to nearest, not down
+    s >>= 2
+    return s.astype(np.uint8)
+
+
+def _block_mean(img, f):
+    """Average f x f blocks -> (ceil(h/f), ceil(w/f), ...).
+
+    Anchored to pixel 0 of the crop, and every pixel is weighted the same, so
+    the shrunk result does not crawl the way a point subsample does.
+
+    Halving repeatedly where it can (see _halve); an odd factor finishes on
+    reduceat, which sums whole blocks including a short final one, so dividing
+    by the real count per block keeps the edge blocks right.
+    """
+    if f <= 1:
+        return img
+    while f > 1 and f % 2 == 0:
+        img = _halve(img)
+        f //= 2
+    if f <= 1:
+        return img
+    h, w = img.shape[0], img.shape[1]
+    src = img.astype(np.float32)
+    yi = np.arange(0, h, f)
+    xi = np.arange(0, w, f)
+    s = np.add.reduceat(np.add.reduceat(src, yi, axis=0), xi, axis=1)
+    yc = np.add.reduceat(np.ones(h, np.float32), yi)
+    xc = np.add.reduceat(np.ones(w, np.float32), xi)
+    cnt = yc[:, None] * xc[None, :]
+    if src.ndim == 3:
+        cnt = cnt[:, :, None]
+    return (s / cnt + 0.5).astype(np.uint8)
+
+
 def _make_qimage(rgb):
     """A QImage over a numpy array - both colour (h,w,3) and grey (h,w)."""
     if rgb.ndim == 2:
@@ -97,6 +202,7 @@ def _make_qimage(rgb):
 # the check should change, not what the check measures. CC is therefore applied
 # ON TOP of the result (see _apply_cc).
 NEUTRAL_LUT = build_lut()
+NEUTRAL_LUT_F = build_lut_f()    # the same, unclipped, for the band checks
 
 
 def build_cc_lut(gain, gamma):
@@ -145,6 +251,8 @@ class ImageView(QtWidgets.QWidget):
     probeChanged = QtCore.Signal(object)     # pixel values under the cursor
     viewportChanged = QtCore.Signal()        # zoom/pan - the other window follows
     picked = QtCore.Signal()                 # a click = this window is active
+    annotated = QtCore.Signal()              # a note was added or taken back
+    textWanted = QtCore.Signal(float, float)  # image point a note was asked for
 
     def __init__(self, parent=None):
         super(ImageView, self).__init__(parent)
@@ -180,14 +288,58 @@ class ImageView(QtWidgets.QWidget):
         self._gamma_lut = None       # gamma top-up with OCIO (see build_gamma_lut)
         self._cc_lut = None          # CC over a QC effect result (build_cc_lut)
         self._fx_lut = None          # NEUTRAL_LUT + input linearisation
+        self._fx_lut_f = None        # ... and its unclipped float twin
         self._fx_lut_src = None      # the table _fx_lut was built from
         self.effect = fx.NONE
         self.effect_params = {}      # settings of the active effect (see overlay.py)
+        # Threads the blur-heavy QC checks are computed on (cv_qc_threads).
+        # They are the only expensive thing left on the GUI thread, and they
+        # are what limits the DISPLAY rate - see effects._apply_banded.
+        self.qc_threads = 1
+        # Playing? Then the margin around the visible area is dropped - see
+        # _visible_box. Set by the panel from its play button.
+        self.playing = False
+        # Annotation mode. The store is shared by the panel (one set of notes
+        # for the shot, not one per window); the tool is None unless a pencil
+        # or the text button is armed.
+        self.annotations = None
+        self.annot_tool = None       # None | "draw" | "text"
+        self.annot_color = 0
+        self.annot_pen = annotate.LINE_W
+        self.annot_text = annotate.TEXT_H
+        self.annot_frame = 0
+        self._stroke = None          # the stroke being drawn, in image pixels
+        self._note_drag = None       # the note being dragged, while it is held
+        # What the last redraw cost, for the status line. Covers the WHOLE
+        # display path - crop, colour transform and the QC check when one is on
+        # - so it is the rate the picture itself can be produced at, in every
+        # mode. Which zoom is cheap is genuinely unobvious (the visible area
+        # grows as you zoom out), so this is the number to read.
+        self.last_render_ms = 0.0
+        self.last_render_px = 0
+        self.last_render_scale = (1, 1)      # (display step, compute step)
+        # Set when a comparison had to fit B onto A. Shown in the status
+        # line - a difference over a resampled input is not the same
+        # measurement as one over two matching plates, and the person
+        # reading it has to know.
+        self.last_resample = ""
+        # ON = never render a check coarse, not even while playing: a QC check
+        # showing an approximation is a check you cannot trust (cv_qc_full_play).
+        self.qc_full_play = True
 
         self._zoom = 0.0             # 0 = fit
         self._pan = [0.0, 0.0]
         self._drag = None
         self._syncing = False        # currently taking the view from the other window
+
+        # Progressive rendering for the blur-heavy checks: coarse (and fast)
+        # while playing or moving, then refined to full quality once things go
+        # quiet. _fast is the current mode; the timer fires the refinement.
+        self._fast = False
+        self._refine_timer = QtCore.QTimer(self)
+        self._refine_timer.setSingleShot(True)
+        self._refine_timer.setInterval(130)
+        self._refine_timer.timeout.connect(self._refine_now)
         # In Wipe this window is drawn OVER the other one. Below 1.0 the
         # background must not be filled - otherwise the image would blend with
         # the grey fill instead of with the other input. Siblings draw into one
@@ -195,7 +347,9 @@ class ImageView(QtWidgets.QWidget):
         # underneath.
         self._opacity = 1.0
         self.last_error = None
-        self._note = None            # e.g. "previous frame missing"
+        self._note = None
+        self._extremes = None        # (min, max) of the frame - frame_extremes
+        self._extremes_for = None    # frame AND colour space they were taken in            # e.g. "previous frame missing"
 
     # ------------------------------------------------------------- content
     def set_frame(self, arr, prev=None, other=None, matte=None):
@@ -207,6 +361,7 @@ class ImageView(QtWidgets.QWidget):
         self._other = other
         self._matte = matte
         self._dirty = True
+        self._begin_fast()          # a new frame (playback / scrub) -> render coarse
         self.update()
 
     def set_matte(self, channels, lightness=1.0, gain=1.0, gamma=1.0):
@@ -265,6 +420,15 @@ class ImageView(QtWidgets.QWidget):
     def ocio_active(self):
         return self.ocio is not None and self.ocio.ready()
 
+    def ocio_key(self):
+        """Something that changes when the OCIO transform does.
+
+        Used to date a cached measurement (see frame_extremes): the same frame
+        read through a different input space has different values, and a cache
+        that only knew about the frame would keep answering with the old ones.
+        """
+        return id(self.ocio) if self.ocio_active() else None
+
     # ---- input linearisation; works the same in both modes -----------------
     def is_linear_input(self):
         if self.ocio_active():
@@ -302,6 +466,35 @@ class ImageView(QtWidgets.QWidget):
         self._rendered = None
         self.update()
 
+    def _begin_fast(self):
+        """Enter the coarse, fast render and arm the refinement. Only the
+        blur-heavy checks are slow enough to bother; the rest already render at
+        full rate, so for them this does nothing and no refinement is armed.
+        """
+        if self.qc_full_play:
+            return                          # real data always - see qc_full_play
+        if self.effect in fx.BLUR_HEAVY:
+            self._fast = True
+            self._dirty = True
+            self._refine_timer.start()      # restart: refine when it goes quiet
+
+    def _refine_now(self):
+        """The view has been still for a moment - re-render at full quality."""
+        if self._fast:
+            self._fast = False
+            self._dirty = True
+            self.update()
+
+    def _ss_budget(self):
+        """Compute budget for the blur-heavy checks: small while interacting.
+
+        qc_full_play wins outright, so flipping it mid-playback takes effect at
+        once rather than waiting for the coarse render to expire.
+        """
+        if self.qc_full_play:
+            return GRAIN_SS_BUDGET
+        return GRAIN_FAST_BUDGET if self._fast else GRAIN_SS_BUDGET
+
     def set_effect(self, effect, params=None):
         """A QC effect (see effects.py). NONE = ordinary display."""
         if effect != self.effect:
@@ -321,25 +514,36 @@ class ImageView(QtWidgets.QWidget):
         self.effect_params = params
         self._dirty = True
         self._rendered = None          # canvas may want a different crop
+        self._begin_fast()             # dragging a slider -> render coarse, then refine
         self.update()
 
     def _pick_step(self):
         """Which pixel to take every time.
 
         When the image is scaled down into the window, there is no point
-        computing pixels that will not be seen anyway. The step is chosen so
-        the result is still at least at screen resolution (z * step <= 1) - so
-        it never scales up and nothing gets smeared.
+        computing pixels that will not be seen anyway. The step is picked so the
+        computed image lands as close to SCREEN RESOLUTION as a whole step can.
 
         CAREFUL with powers of two: the step used to double, so the real
         overhead swung between 1x and 2x screen resolution. 6K in a window fell
         on the worst end (step 2 = 1.9x, 4.8 Mpx per frame). An arbitrary whole
         step levels it out at ~1.3x (step 3, 2.1 Mpx) - measured 71 -> 32 ms.
+
+        ROUNDED, not truncated. Truncating guarantees the result is never below
+        screen resolution, but it also means that just under a whole step the
+        picture is computed at up to 4x the pixels that are shown: measured on
+        4K, zoom 59 % computed the entire 8.85 Mpx plate to fill a 2.2 Mpx
+        window, while zoom 50 % - where the step finally ticked over - computed
+        2.2 Mpx and ran fast. Rounding removes that cliff (59 % is now 5.6x
+        cheaper) at the cost of at most a 1.5x magnification of the computed
+        image, so in that band the picture is a touch softer and fine detail can
+        alias. Deliberate trade: the band 50-99 % was the slowest place in the
+        player and it is where a whole frame is usually reviewed.
         """
         z = self._effective_zoom()
         if z >= 1.0:
             return 1
-        return max(1, min(8, int(1.0 / z)))
+        return max(1, min(8, int(round(1.0 / z))))
 
     def _visible_box(self, z, margin=None):
         """The area of the image (x0,y0,x1,y1) that is visible, plus a margin.
@@ -348,6 +552,12 @@ class ImageView(QtWidgets.QWidget):
         image is already drawn a bit further than what is visible. Pass
         margin=0 for the box that is EXACTLY on screen (the scopes want that -
         see visible_linear).
+
+        WHILE PLAYING there is no margin. It buys nothing there - every frame
+        is new, so the whole crop is recomputed anyway - and a 0.35 margin is
+        1.35^2 = 1.8x the pixels through the display transform. Measured on 4K
+        that is the difference between 25 and ~40 fps at 92 % zoom. The moment
+        playback stops the margin is back, so panning stays free.
         """
         w, h = self.image_size
         if not w or not h:
@@ -358,7 +568,10 @@ class ImageView(QtWidgets.QWidget):
         cx = w / 2.0 + self._pan[0]
         cy = h / 2.0 + self._pan[1]
         if margin is None:
-            margin = EFFECT_MARGIN if self.effect != fx.NONE else self.margin
+            if self.playing:
+                margin = 0.0
+            else:
+                margin = EFFECT_MARGIN if self.effect != fx.NONE else self.margin
         half_w = vw / (2.0 * z) * (1.0 + margin)
         half_h = vh / (2.0 * z) * (1.0 + margin)
         x0 = int(max(0, cx - half_w))
@@ -390,38 +603,80 @@ class ImageView(QtWidgets.QWidget):
         x0, y0, x1, y1 = box
         s = max(1, step)
         if self.effect in fx.BLUR_HEAVY:
-            while s < 16 and ((x1 - x0) // s) * ((y1 - y0) // s) > BLUR_PIXEL_BUDGET:
-                s += 1
-            return s
+            # Bound the COMPUTE (not the display) by the supersample budget.
+            # Pick the coarsest-affordable compute step `es`, then the display
+            # step is the screen step rounded UP to a multiple of es, so the
+            # result averages down to it cleanly (see _supersample_step /
+            # _block_mean). Zoomed in the crop is small, es stays 1 and the
+            # display step stays 1 - crisp, no average-down. Zoomed out es rises
+            # and the result is averaged, so the grain stays fine and steady
+            # instead of crawling. This replaces the old "raise the display step
+            # to fit", which smeared the zoomed-in view.
+            area = max(1, x1 - x0) * max(1, y1 - y0)
+            budget = self._ss_budget()
+            es = 1
+            while es < 16 and area / float(es * es) > budget:
+                es += 1
+            return ((s + es - 1) // es) * es
         while s < 16 and ((x1 - x0) // s) * ((y1 - y0) // s) > EFFECT_PIXEL_BUDGET:
             s *= 2
         return s
 
+    # How much MORE than the screen shows a blur-heavy check may compute. One
+    # 2x2 average is what stops the grain crawling; beyond that the extra
+    # samples are thrown away by the averaging and buy nothing you can see.
+    SUPERSAMPLE_MAX = 2
+
+    def _supersample_step(self, box, step):
+        """For a blur-heavy check: the finest step (a divisor of `step`) that
+        fits the supersample budget, but never finer than SUPERSAMPLE_MAX times
+        the display step. The effect is computed at that step and the result
+        averaged down by step // estep, so the grain is computed on real
+        neighbours (fine, and it does not crawl). estep == step means no
+        supersampling - the old point-subsample path.
+
+        The cap matters when zoomed out, where the visible area is the whole
+        plate but the screen shows a thumbnail of it: budget alone picked the
+        finest affordable step and ended up computing 2.21 Mpx to draw 0.13 Mpx
+        - 17x oversampled, and the frame rate went DOWN as you zoomed out, which
+        is the opposite of what anyone expects.
+        """
+        if step <= 1 or self.effect not in fx.BLUR_HEAVY:
+            return step
+        x0, y0, x1, y1 = box
+        area = max(1, x1 - x0) * max(1, y1 - y0)
+        budget = self._ss_budget()
+        finest = max(1, -(-step // self.SUPERSAMPLE_MAX))    # ceil
+        for es in range(finest, step + 1):
+            if step % es == 0 and area / float(es * es) <= budget:
+                return es
+        return step
+
 
     def _isolate_channel(self, arr):
-        """Produces an (h,w,4) where RGB holds only the selected channel.
+        """The selected channel alone, as (h,w,1). With RGB nothing is copied.
 
-        Thanks to that the R/G/B/A/Y keys work in QC modes too: the check is
-        then computed DIRECTLY FROM THAT CHANNEL (e.g. grain in red only),
-        which is exactly what switching channels is for. With RGB nothing is
-        copied.
+        Thanks to this the R/G/B/A/Y keys work in QC modes too: the check is
+        computed DIRECTLY FROM THAT CHANNEL (e.g. grain in red only), which is
+        exactly what switching channels is for.
+
+        ONE channel, not the same one written into three. Three copies made the
+        check cost MORE than plain RGB - it did the identical arithmetic three
+        times over and threw two thirds of it away: measured on 2.2 Mpx, grain
+        in red was 31 ms against 25 ms for full RGB, and in luminance 48 ms.
+        On one channel it is 7 ms, for a bit-identical result.
         """
         if self.channels == CH_RGB:
             return arr
-        if self.channels in (CH_R, CH_G, CH_B):
-            src = arr[:, :, {CH_R: 0, CH_G: 1, CH_B: 2}[self.channels]]
-        elif self.channels == CH_A:
-            src = arr[:, :, 3]
-        else:                                     # luminance
+        if self.channels == CH_LUMA:
             src = _luma_bits(arr.view(np.uint16)).view(np.float16)
-        out = np.empty(arr.shape, dtype=arr.dtype)
-        out[:, :, 0] = src
-        out[:, :, 1] = src
-        out[:, :, 2] = src
-        out[:, :, 3] = arr[:, :, 3]
-        return out
+        elif self.channels in (CH_R, CH_G, CH_B):
+            src = arr[:, :, {CH_R: 0, CH_G: 1, CH_B: 2}[self.channels]]
+        else:                                     # alpha
+            src = arr[:, :, 3]
+        return np.ascontiguousarray(src[:, :, None])
 
-    def _render_effect(self, arr, prev_crop):
+    def _render_effect(self, arr, prev_crop, es=1):
         """The QC check. It separates two things that are often confused:
 
         The INPUT transform (log -> linear) decides WHAT the numbers mean -
@@ -439,7 +694,7 @@ class ImageView(QtWidgets.QWidget):
         shifted crop, and it is displayed completely normally including the
         chosen display transform.
         """
-        arr, prev_crop, lut = self._effect_inputs(arr, prev_crop)
+        arr, prev_crop, lut, lut_f = self._effect_inputs(arr, prev_crop)
 
         # The saturation check measures the RATIO BETWEEN channels, so it has
         # to be computed from the whole of RGB - an isolated channel is
@@ -448,17 +703,28 @@ class ImageView(QtWidgets.QWidget):
         # contributes to the resulting colour. The other checks isolate before
         # the computation, where it makes sense (grain and exposure per channel).
         if self.effect == fx.SAT:
-            out = fx.apply(fx.SAT, arr, lut, self.effect_params)
+            out = fx.apply(fx.SAT, arr, lut, self.effect_params, es,
+                           self.qc_threads)
             return None if out is None else self._isolate_result(out, arr)
 
         src = self._isolate_channel(arr)
         if self.effect == fx.TEMPORAL:
-            return fx.temporal(src, self._isolate_channel(prev_crop),
-                               lut, self.effect_params)
-        if self.effect == fx.DIFF:
-            return fx.difference(src, self._isolate_channel(prev_crop),
-                                 lut, self.effect_params)
-        return fx.apply(self.effect, src, lut, self.effect_params)
+            out = fx.temporal(src, self._isolate_channel(prev_crop),
+                              lut, self.effect_params, self.qc_threads)
+        elif self.effect == fx.DIFF:
+            out = fx.difference(src, self._isolate_channel(prev_crop),
+                                lut, self.effect_params, self.qc_threads)
+        elif self.effect == fx.HPDIFF:
+            out = fx.hp_difference(src, self._isolate_channel(prev_crop),
+                                   lut_f, self.effect_params, self.qc_threads)
+        else:
+            # es lets grain keep a constant brightness across samplings (fast
+            # vs full, and across zoom) - see effects._es_comp.
+            out = fx.apply(self.effect, src, lut, self.effect_params, es,
+                           self.qc_threads, lut_f)
+        if out is not None and out.ndim == 3 and out.shape[2] == 1:
+            out = out[:, :, 0]      # one channel stays GREY to the QImage
+        return out
 
     def _effect_inputs(self, arr, other):
         """Data and table prepared for the QC computation.
@@ -469,7 +735,7 @@ class ImageView(QtWidgets.QWidget):
         conversion into display, so baking the linearisation into the table is
         enough - and that is free (9.5 ms against 9.4 ms without it).
         """
-        lut = NEUTRAL_LUT
+        lut, lut_f = NEUTRAL_LUT, NEUTRAL_LUT_F
         if not self.is_linear_input():
             table = self.linear_table()
             if table is None or self.effect == fx.VALUEMAP \
@@ -477,8 +743,8 @@ class ImageView(QtWidgets.QWidget):
                 arr = self._linearize(arr, table)
                 other = self._linearize(other, table)
             else:
-                lut = self._effect_lut(table)
-        return arr, other, lut
+                lut, lut_f = self._effect_lut(table)
+        return arr, other, lut, lut_f
 
     def _isolate_result(self, rgb8, arr):
         """Picks a channel out of an already computed check result (uint8 RGB)."""
@@ -495,11 +761,17 @@ class ImageView(QtWidgets.QWidget):
         return np.repeat(g[:, :, None], 3, axis=2)
 
     def _effect_lut(self, table):
-        """NEUTRAL_LUT with the input linearisation already baked in."""
+        """(display table, unclipped float twin), input linearisation baked in.
+
+        Both are composed the same way, so the band checks see exactly the
+        curve everything else does - only without the ends cut off.
+        """
         if self._fx_lut_src is not table:
             self._fx_lut_src = table
-            self._fx_lut = NEUTRAL_LUT[np.ascontiguousarray(table).view(np.uint16)]
-        return self._fx_lut
+            bits = np.ascontiguousarray(table).view(np.uint16)
+            self._fx_lut = NEUTRAL_LUT[bits]
+            self._fx_lut_f = NEUTRAL_LUT_F[bits]
+        return self._fx_lut, self._fx_lut_f
 
     def _linearize(self, arr, table):
         """Straightens the input space into scene-linear (only where necessary)."""
@@ -609,6 +881,27 @@ class ImageView(QtWidgets.QWidget):
                 "sat_matrix": self._sat_matrix,
                 "linearize": self.linearize_fn()}
 
+    def scope_source_for(self, arr, rgb, look=None):
+        """A scope context for a frame that is NOT the one on screen.
+
+        Same shape as scope_source(), but over the WHOLE frame and the look the
+        export is rendering - so the scopes written into a JPEG describe that
+        picture, not whatever the viewport happened to be showing.
+        """
+        look = look or self.current_look()
+        # ALL FOUR channels, exactly as visible_linear() hands them over - the
+        # scopes reach for the alpha themselves (see scopes._planes_float), so
+        # an RGB-only slice quietly gives them nothing to measure.
+        return {"linear": arr,
+                "display": rgb,
+                "qc": look.get("effect", fx.NONE) != fx.NONE,
+                "channels": int(look.get("channels", CH_RGB)),
+                "gain": float(look.get("gain", 1.0)),
+                "gamma": float(look.get("gamma", 1.0)),
+                "sat_matrix": build_saturation_matrix(
+                    float(look.get("saturation", 1.0))),
+                "linearize": self.linearize_fn()}
+
     def _apply_saturation(self, rgb):
         """Saturation in the display domain (like CC in a viewer).
 
@@ -619,7 +912,10 @@ class ImageView(QtWidgets.QWidget):
         of 1.0 it is skipped entirely, so ordinary display costs nothing extra,
         and it is computed only from the visible crop.
         """
-        if self._sat_matrix is None:
+        # A grey image (a single channel, see _isolate_channel) has no colour to
+        # mix, so there is nothing for the matrix to do - and it does not have
+        # the three columns the matrix expects either.
+        if self._sat_matrix is None or rgb.ndim != 3 or rgb.shape[2] != 3:
             return rgb
         flat = rgb.reshape(-1, 3).astype(np.float32) @ self._sat_matrix
         return np.clip(flat, 0, 255).astype(np.uint8).reshape(rgb.shape)
@@ -630,6 +926,7 @@ class ImageView(QtWidgets.QWidget):
         self._qimage = None
         self._rgb = None
         self._rendered = None
+        self.last_resample = ""      # re-decided below, per render
         arr = self._frame
         if arr is None or arr.ndim != 3 or arr.shape[2] < 4:
             return
@@ -646,23 +943,34 @@ class ImageView(QtWidgets.QWidget):
                 self.last_error = None
                 self._note = "(difference: the second input is not connected)"
                 return
-            if self._other.shape != arr.shape:
-                self.last_error = None
-                self._note = "(difference: the inputs have different resolutions)"
-                return
-            prev_crop = self._other[y0:y1:step, x0:x1:step]
+            # Different sizes used to stop the check outright. Now BOTH inputs
+            # are fitted onto the compare size - a 4K render against a 6K plate
+            # is a comparison people actually want. It is OUR resample, not a
+            # Reformat, so the note says so: on a difference check the filter
+            # used is part of what you are looking at.
+            #
+            # The crop box was worked out against THIS window's frame, so when
+            # the compare size is something else the whole thing is computed at
+            # the frame's own size and only the comparison inputs are fitted.
+            other = resample.fit(self._other, arr.shape)
+            self.last_resample = resample.label(self._other.shape, arr.shape)
+            prev_crop = other[y0:y1:step, x0:x1:step]
+        # Blur-heavy checks compute at a finer step (es) and average the result
+        # down by step // es; everything else has es == step (no change).
+        es = self._supersample_step(box, step)
         if self.effect == fx.CANVAS:
             # shifting the coordinates with wraparound -> the crop is already
-            # "swapped"
-            fh, fw = arr.shape[0], arr.shape[1]
-            ys, xs = fx.canvas_source_index(x0, y0, x1, y1, step, fh, fw,
-                                            self.effect_params)
-            arr = arr[np.ix_(ys, xs)]
+            # "swapped". Assembled from contiguous blocks rather than gathered
+            # per pixel - see effects.canvas_crop, it is 3x the difference.
+            arr = fx.canvas_crop(arr, x0, y0, x1, y1, step, self.effect_params)
         else:
-            arr = arr[y0:y1:step, x0:x1:step]
+            arr = arr[y0:y1:es, x0:x1:es]
         if arr.size == 0:
             return
         rows, cols = arr.shape[0], arr.shape[1]
+        # how much this redraw is really chewing through, whatever path follows
+        self.last_render_px = rows * cols
+        self.last_render_scale = (step, es)
         try:
             # Difference in overlay mode shows the REAL image - it therefore
             # has to go through the chosen display transform just like ordinary
@@ -673,7 +981,7 @@ class ImageView(QtWidgets.QWidget):
             self._diff_mask = None
             if self.effect == fx.DIFF and fx.diff_is_overlay(self.effect_params):
                 if prev_crop is not None:
-                    a, b, fx_lut = self._effect_inputs(arr, prev_crop)
+                    a, b, fx_lut, _f = self._effect_inputs(arr, prev_crop)
                     self._diff_mask = fx.difference_mask(
                         self._isolate_channel(a), self._isolate_channel(b),
                         fx_lut, self.effect_params)
@@ -683,10 +991,14 @@ class ImageView(QtWidgets.QWidget):
                 # runs over the channel you switched to. Canvas never gets
                 # here - it is already handled by the shifted crop above and is
                 # displayed completely normally.
-                rgb = self._render_effect(arr, prev_crop)
+                rgb = self._render_effect(arr, prev_crop, es)
                 if rgb is None:
                     return
-                self._finish(self._apply_cc(rgb), box, step, cols, rows)
+                rgb = self._apply_cc(rgb)
+                f = step // es                  # >1 only for the blur-heavy path
+                if f > 1:                       # full-res grain -> screen res
+                    rgb = _block_mean(rgb, f)
+                self._finish(rgb, box, step, rgb.shape[1], rgb.shape[0])
                 return
             if self.ocio_active():
                 rgb = self._render_ocio(arr)
@@ -719,6 +1031,115 @@ class ImageView(QtWidgets.QWidget):
             self.last_error = "render: %s" % exc
             self._qimage = None
             self._rendered = None
+
+    def current_look(self):
+        """What the window is showing right now, enough to reproduce it later.
+
+        Stored with an annotation so the export can put the note back on the
+        picture it was drawn on - a circle around a grain problem says nothing
+        over a plain plate.
+        """
+        return {"effect": self.effect,
+                "params": dict(self.effect_params),
+                "channels": self.channels,
+                "gain": self.gain,
+                "gamma": self.gamma,
+                "saturation": self.saturation}
+
+    def render_full(self, arr, look=None):
+        """A WHOLE scene-linear frame as uint8 RGB (h,w,3), for the export.
+
+        `look` is a dict from current_look(); without one the window's present
+        state is used. Not the crop path: an export must not depend on where
+        the viewport happened to be, nor on the coarser step a zoomed-out view
+        is computed at.
+        """
+        if arr is None or arr.ndim != 3 or arr.shape[2] < 4:
+            return None
+        look = look or self.current_look()
+        effect = look.get("effect", fx.NONE)
+        channels = int(look.get("channels", CH_RGB))
+        gain = float(look.get("gain", 1.0))
+        gamma = float(look.get("gamma", 1.0))
+
+        # Its own tables, built from the look - the window is not disturbed,
+        # and an export started while someone is dragging a slider still comes
+        # out as the note was made.
+        if abs(gain - self.gain) > 1e-9 or abs(gamma - self.gamma) > 1e-9:
+            lut = nukelut.display_lut(self.nuke_display, self.nuke_input,
+                                      gain, gamma)
+        else:
+            lut = self._lut
+        sat = build_saturation_matrix(float(look.get("saturation", 1.0)))
+
+        if effect not in (fx.NONE, fx.CANVAS):
+            # A check decides the whole picture. Both inputs are needed for the
+            # comparisons; without the other one there is nothing to compare,
+            # so the plain image is the honest answer.
+            src = self._isolate_for(arr, channels)
+            _a, _b, fx_lut, fx_lut_f = self._effect_inputs(arr, None)
+            if effect in (fx.DIFF, fx.HPDIFF):
+                # fitted the same way the viewer fitted it, so the exported
+                # JPEG is the picture the note was written on
+                other = resample.fit(self._other, arr.shape)
+                if other is None:
+                    rgb = None
+                else:
+                    mate = self._isolate_for(other, channels)
+                    # the export must go through the same tables the viewer
+                    # did, or a note would point at something else
+                    fn = fx.difference if effect == fx.DIFF else fx.hp_difference
+                    rgb = fn(src, mate,
+                             fx_lut if effect == fx.DIFF else fx_lut_f,
+                             look.get("params"), self.qc_threads)
+            elif effect == fx.TEMPORAL:
+                rgb = None                  # a still frame has no previous one
+            elif effect == fx.SAT:
+                out = fx.apply(fx.SAT, arr, fx_lut, look.get("params"), 1,
+                               self.qc_threads)
+                rgb = None if out is None else self._isolate_result(out, arr)
+            else:
+                rgb = fx.apply(effect, src, fx_lut, look.get("params"), 1,
+                               self.qc_threads, fx_lut_f)
+            if rgb is not None:
+                if rgb.ndim == 3 and rgb.shape[2] == 1:
+                    rgb = rgb[:, :, 0]
+                return self._as_rgb888(self._apply_cc(rgb))
+
+        if self.ocio_active():
+            rgb = self._render_ocio(arr)
+        else:
+            bits = arr.view(np.uint16)
+            if channels == CH_RGB:
+                rgb = lut[bits[:, :, :3]]
+                if sat is not None:
+                    flat = rgb.reshape(-1, 3).astype(np.float32) @ sat
+                    rgb = np.clip(flat, 0, 255).astype(np.uint8).reshape(rgb.shape)
+            elif channels in (CH_R, CH_G, CH_B):
+                rgb = lut[bits[:, :, {CH_R: 0, CH_G: 1, CH_B: 2}[channels]]]
+            elif channels == CH_A:
+                a = np.clip(arr[:, :, 3].astype(np.float32), 0.0, 1.0)
+                rgb = (a * 255.0 + 0.5).astype(np.uint8)
+            else:
+                rgb = lut[_luma_bits(bits)]
+        return self._as_rgb888(rgb)
+
+    @staticmethod
+    def _as_rgb888(rgb):
+        """(h,w,3) uint8, contiguous - what QImage wants."""
+        if rgb is None:
+            return None
+        if rgb.ndim == 2:                  # grey -> colour
+            rgb = np.repeat(rgb[:, :, None], 3, axis=2)
+        return np.ascontiguousarray(rgb)
+
+    def _isolate_for(self, arr, channels):
+        """_isolate_channel, but for a GIVEN channel choice (see render_full)."""
+        was, self.channels = self.channels, channels
+        try:
+            return self._isolate_channel(arr)
+        finally:
+            self.channels = was
 
     def _finish(self, rgb, box, step, cols, rows):
         """The common tail of every path: DiMatte mattes, buffer, QImage.
@@ -784,9 +1205,21 @@ class ImageView(QtWidgets.QWidget):
         self._zoom = 1.0
         self._moved()
 
+    def set_zoom_percent(self, percent):
+        """Zoom straight to a value, keeping the point in the MIDDLE of the
+        window where it is (the same as the wheel does around the cursor, and
+        the same as picking a zoom in the Nuke Viewer).
+        """
+        new = max(0.02, min(64.0, float(percent) / 100.0))
+        if abs(new - self._effective_zoom()) < 1e-6:
+            return
+        self._zoom = new
+        self._moved()
+
     # ---- the shared view in double display --------------------------------
     def _moved(self):
         """Zoom or pan changed - redraw and tell the other view."""
+        self._begin_fast()          # moving the view -> render coarse, refine after
         self.update()
         if not self._syncing:
             self.viewportChanged.emit()
@@ -807,6 +1240,7 @@ class ImageView(QtWidgets.QWidget):
             self._pan = [px, py]
         finally:
             self._syncing = False
+        self._begin_fast()          # the synced view moved -> render coarse
         self.update()
 
     def wheelEvent(self, event):
@@ -829,12 +1263,64 @@ class ImageView(QtWidgets.QWidget):
     def mousePressEvent(self, event):
         # even a plain click makes this the active window (scopes, readout)
         self.picked.emit()
+        if event.button() == QtCore.Qt.LeftButton and self.annot_tool:
+            # A tool is armed, so the left button writes instead of panning -
+            # the middle button still pans, which is how you move around while
+            # annotating without putting the pencil down.
+            at = self._widget_to_image(event_pos(event))
+            if at is not None:
+                if self.annot_tool == "text":
+                    self._press_note(float(at[0]), float(at[1]))
+                else:
+                    self._stroke = [(float(at[0]), float(at[1]))]
+                return
         if event.button() == QtCore.Qt.LeftButton:
             self._drag = event_pos(event)
             self.setCursor(QtCore.Qt.ClosedHandCursor)
+        elif event.button() == QtCore.Qt.MiddleButton and self.annot_tool:
+            self._drag = event_pos(event)
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+
+    def _press_note(self, x, y):
+        """The text tool was pressed on the image.
+
+        Landing ON a note takes hold of it instead of asking for a new one:
+        the note is only opened for editing on RELEASE, and only if it was not
+        dragged anywhere. That way one press does both jobs - a click edits, a
+        drag moves - and neither can happen by accident.
+        """
+        index = None
+        if self.annotations is not None:
+            index = self.annotations.text_at(
+                self.annot_frame, x, y, self.current_look(),
+                self.image_size[0], self.image_size[1])
+        if index is None:
+            self.textWanted.emit(x, y)      # empty ground - a new note
+            return
+        ox, oy = self.annotations.text_pos(self.annot_frame, index)
+        self._note_drag = {"index": index, "grab": (x, y),
+                           "origin": (ox, oy), "moved": False}
+        self.setCursor(QtCore.Qt.SizeAllCursor)
 
     def mouseMoveEvent(self, event):
         p = event_pos(event)
+        if self._note_drag is not None:
+            at = self._widget_to_image(p, clamp=True)
+            if at is not None:
+                gx, gy = self._note_drag["grab"]
+                ox, oy = self._note_drag["origin"]
+                if self.annotations.move_text(
+                        self.annot_frame, self._note_drag["index"],
+                        ox + (at[0] - gx), oy + (at[1] - gy)):
+                    self._note_drag["moved"] = True
+                    self.update()
+            return
+        if self._stroke is not None:
+            at = self._widget_to_image(p)
+            if at is not None:
+                self._stroke.append((float(at[0]), float(at[1])))
+                self.update()
+            return
         if self._drag is None:
             self._emit_probe(p)
             return
@@ -849,14 +1335,34 @@ class ImageView(QtWidgets.QWidget):
             self.probeChanged.emit(None)
 
     def mouseReleaseEvent(self, _event):
+        if self._note_drag is not None:
+            drag, self._note_drag = self._note_drag, None
+            self.unsetCursor()
+            if drag["moved"]:
+                self.annotated.emit()       # it was dragged: put it down
+            else:
+                gx, gy = drag["grab"]       # it was only clicked: open it
+                self.textWanted.emit(gx, gy)
+            return
+        if self._stroke is not None:
+            stroke, self._stroke = self._stroke, None
+            if (self.annotations is not None
+                    and self.annotations.add_stroke(
+                        self.annot_frame, stroke, self.annot_color,
+                        self.annot_pen, self.current_look())):
+                self.annotated.emit()
+            self.update()
         self._drag = None
         self.unsetCursor()
 
     # -------------------------------------------------------------- probe
-    def _widget_to_image(self, pos):
+    def _widget_to_image(self, pos, clamp=False):
         """A point in the window -> image pixel coordinates, or None outside.
 
         Exactly the inverse of the transform used to draw in paintEvent.
+        `clamp` holds the point at the edge instead of dropping it, which is
+        what dragging wants: letting go of a note the moment the pointer left
+        the picture would leave it wherever it happened to be.
         """
         w, h = self.image_size
         if not w or not h:
@@ -866,6 +1372,8 @@ class ImageView(QtWidgets.QWidget):
         oy = self.height() / 2.0 - (self._pan[1] + h / 2.0) * z
         ix = int((pos.x() - ox) / z)
         iy = int((pos.y() - oy) / z)
+        if clamp:
+            return max(0, min(w - 1, ix)), max(0, min(h - 1, iy))
         if 0 <= ix < w and 0 <= iy < h:
             return ix, iy
         return None
@@ -874,6 +1382,73 @@ class ImageView(QtWidgets.QWidget):
         if self.probe_frozen:
             return
         self.probeChanged.emit(self.probe_at(self._widget_to_image(pos)))
+
+    def frame_extremes(self):
+        """(min, max) scene-linear over the WHOLE frame, or None.
+
+        Not over a subsample: a single stray pixel - one negative, one value
+        that should not be up at 60 - is exactly what this is for, and a
+        subsample is precisely what would miss it.
+
+        Done on the half BITS rather than on the floats. For a positive half
+        the bit pattern sorts in value order, and a negative one has the top
+        bit set, so as unsigned it sorts above every positive; that gives both
+        ends from two integer passes instead of a float conversion of the whole
+        frame. Measured on 6K: 133 ms as floats, 42 ms this way.
+
+        Cached against the frame object, because nothing about it changes until
+        a new frame arrives.
+        """
+        arr = self._frame
+        if arr is None or arr.ndim != 3 or arr.shape[2] < 3:
+            return None
+        key = (id(arr), self.nuke_input, self.ocio_key())
+        if self._extremes_for == key:
+            return self._extremes
+
+        # WHICH HALF VALUES OCCUR, not what the smallest bit pattern is. A half
+        # has only 65536 possible values, so one count over the frame says
+        # exactly which of them are in it - and then the input transform can be
+        # applied to those 65536 instead of to 28 million pixels.
+        #
+        # Counting rather than taking min/max of the raw bits also means no
+        # assumption about the transform: a curve that is not monotonic would
+        # move which value is the largest, and mapping only the two raw
+        # extremes would then report a number that is not in the picture.
+        bits = np.ascontiguousarray(arr[:, :, :3]).view(np.uint16)
+        counts = np.bincount(bits.ravel(), minlength=65536)
+        present = np.flatnonzero(counts)
+        if present.size == 0:
+            return None
+
+        # present holds BIT PATTERNS, so it is viewed as half to get the raw
+        # values. The linear table, on the other hand, already holds VALUES
+        # (nukelut.linear_table / ocio.linear_table both return float16) and is
+        # only INDEXED by the bits - casting it to uint16 turned 0.214 into 0
+        # and 33.0 into a denormal, which is how a log input came out with a
+        # maximum of a billionth.
+        table = None if self.is_linear_input() else self.linear_table()
+        if table is not None:
+            vals = np.asarray(table)[present]
+        else:
+            vals = present.astype(np.uint16).view(np.float16)
+        vals = np.asarray(vals, dtype=np.float32)
+        if table is None and not self.is_linear_input() and self.ocio_active():
+            # OCIO with no table of its own - exact, and only ever over the
+            # handful of values that are actually in the frame
+            try:
+                buf = np.ascontiguousarray(
+                    vals.reshape(1, -1, 1).repeat(3, axis=2))
+                vals = self.ocio.to_linear(buf)[0, :, 0]
+            except Exception:
+                pass
+
+        finite = vals[np.isfinite(vals)]
+        if finite.size == 0:
+            return None
+        out = (float(finite.min()), float(finite.max()))
+        self._extremes_for, self._extremes = key, out
+        return out
 
     def probe_at(self, xy):
         """The values of one pixel: raw, linearised and as displayed."""
@@ -901,6 +1476,9 @@ class ImageView(QtWidgets.QWidget):
 
         lum = float(np.dot(lin, LUMA))
         return {"x": ix, "y": iy,
+                # the waveform needs it to place the column marker, and only
+                # the view knows how wide the picture is
+                "image_w": self.image_size[0],
                 "raw": raw,                     # what is in the file
                 "linear": lin,                  # after the input transform
                 "shown": np.asarray(shown, dtype=np.int32),
@@ -948,7 +1526,9 @@ class ImageView(QtWidgets.QWidget):
         # the user moved outside the already drawn area (hence the margin)
         if self._dirty or step != self._step or not self._covers(box, step):
             self._step = step
+            t0 = time.perf_counter()
             self._render(box, step)
+            self.last_render_ms = (time.perf_counter() - t0) * 1000.0
         if self._qimage is None or self._rendered is None:
             painter.setPen(QtGui.QColor(150, 150, 150))
             painter.drawText(self.rect(), QtCore.Qt.AlignCenter,
@@ -956,11 +1536,35 @@ class ImageView(QtWidgets.QWidget):
             return
 
         w, h = self.image_size            # the FULL image size
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, z < 1.0)
+        rx0, ry0, cols, rows, rstep = self._rendered
+        # Smooth whenever the rendered image is MAGNIFIED on screen, i.e. one
+        # rendered pixel covers more than one screen pixel (rstep * z > 1). That
+        # is the zoomed-out case (z < 1) as before, but ALSO the coarse fast
+        # grain render (rstep > 1 at z = 1): bilinear makes its half-res grain
+        # read as slightly soft fine grain instead of hard blocks, so it barely
+        # changes when the full-resolution refinement lands.
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform,
+                              rstep * z > 1.001)
         # the top left corner of the WHOLE image on screen
         ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * z
         oy = self.height() / 2.0 - (self._pan[1] + h / 2.0) * z
-        rx0, ry0, cols, rows, rstep = self._rendered
         target = QtCore.QRectF(ox + rx0 * z, oy + ry0 * z,
                                cols * rstep * z, rows * rstep * z)
         painter.drawImage(target, self._qimage)
+
+        # The notes go on LAST and use the same ox/oy/z the picture was drawn
+        # with, so they sit on the pixels they were drawn on at any zoom.
+        if self.annotations is not None:
+            self.annotations.draw(painter, self.annot_frame, ox, oy, z,
+                                  self.current_look(), w, h)
+            if self._stroke and len(self._stroke) > 1:
+                pen = QtGui.QPen(QtGui.QColor(*annotate.COLORS[
+                    self.annot_color % len(annotate.COLORS)]))
+                pen.setWidthF(max(1.0, self.annot_pen * z))
+                pen.setCapStyle(QtCore.Qt.RoundCap)
+                pen.setJoinStyle(QtCore.Qt.RoundJoin)
+                painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                painter.setPen(pen)
+                painter.drawPolyline(QtGui.QPolygonF(
+                    [QtCore.QPointF(ox + x * z, oy + y * z)
+                     for x, y in self._stroke]))
