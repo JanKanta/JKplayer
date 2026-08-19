@@ -1,12 +1,46 @@
 # JKplayer
 
-An EXR review player for Nuke. It reads the EXR files itself instead of going
-through `nuke.execute`, so playback comes off a RAM cache rather than the comp
-graph — a 1080p ZIP plate decodes at about 55 fps on 8 threads, against 22 fps
-for Nuke's own viewer on the same material.
+A review player for Nuke. It reads the files itself instead of going through
+`nuke.execute`, so playback comes off a RAM cache rather than the comp graph —
+a 1080p ZIP plate decodes at about 55 fps on 8 threads, against 22 fps for
+Nuke's own viewer on the same material.
 
 It is a QC tool, not a grading tool: everything in it exists to answer "is this
 plate good to send".
+
+## Formats
+
+**EXR** — through Nuke's own OpenEXR library when it is there (every
+compression, and about 2.3x faster), with a pure Python reader as the fallback
+for NONE, ZIP and ZIPS. Both were checked against each other and give
+bit-identical results.
+
+**DPX** — 8, 10, 12 and 16 bit, both endiannesses, RGB / RGBA / ABGR /
+luminance. What comes out is the code value normalised to 0–1, not linear
+light, because that is exactly what the Cineon input transform already expects
+— so a 10-bit log DPX needs the input space set and nothing else. Run-length
+encoding, flipped orientation, depth maps and anything else not understood are
+**refused by name**, on the grounds that a wrong picture is worse than no
+picture.
+
+**Movies** — `.mov`, `.mp4`, `.mxf`, `.m4v` through ffmpeg. ProRes, DNxHD/HR,
+MJPEG and the other all-intra codecs seek for the cost of one frame; long-GOP
+works too and is frame-accurate, but a jump costs up to a whole group of
+pictures. H.264 is tested; H.265 goes down the same path and has not been.
+Which kind a file is comes back from `probe()`, so the panel can say so —
+though it does not show it yet. Movies need **ffmpeg installed** — see
+Requirements.
+
+A movie is one file for every frame, which the rest of the player cannot say —
+it addresses frames by path. So internally a movie frame is written
+`clip.mov|1042`. It is a small lie in a string, and it buys not touching the
+cache key, the loader queue or the sequence cache at all.
+
+Mind the **chroma**: a 4:2:2 codec carries half the colour resolution and 4:2:0
+a quarter. It is reported in the metadata, because a difference check between an
+EXR comp and a 4:2:0 delivery shows artefacts that are in the codec and not in
+the comp. It is not yet said out loud where it would matter most, which is in
+the Difference mode itself.
 
 ## What it does
 
@@ -67,6 +101,18 @@ radii and the graticule would stop meaning anything.
 the whole frame, every pixel counted rather than sampled, through the input
 transform. One stray negative is the thing worth catching. Held frames only.
 
+**Metadata** — the headers of both inputs, read fresh every frame (a header is
+a kilobyte at the front of the file, measured at 0.05 ms, so following the
+playhead is free). The **META** button puts them bottom left of the image, one
+panel per window showing that window's own input — in Sync the two windows are
+two different files, and a single shared panel could only ever be right about
+one of them.
+
+Which fields, and in what order, is set on the node's Metadata tab: the file's
+whole catalogue on the left with a search, the drawn list on the right, one
+input at a time. DPX gives the most here — timecode, slate, keycode, frame
+position, the scanner and its serial number.
+
 **Colour** — Nuke's built-in transforms (one table, fast) or full OCIO with the
 studio config. Input transforms for log material (LogC, S-Log3, Cineon,
 Log3G10 and the rest).
@@ -124,6 +170,35 @@ no longer suppressed, which is most of the point of the grain check.
 PyOpenColorIO and the OpenEXR libraries come with Nuke and are found next to
 the running Nuke automatically, on every platform.
 
+### ffmpeg, for movies only
+
+EXR and DPX are read by this package alone. Movies are not: ProRes and H.264
+are not things to decode in numpy, so `.mov`, `.mp4`, `.mxf` and `.m4v` go
+through **ffmpeg**, which Nuke does not ship. Everything else works without it.
+
+**Both `ffmpeg` and `ffprobe` are needed**, and a machine with only the first
+counts as having no movie support at all. ffprobe is the only one that reports
+the frame rate as the exact ratio it is: ffmpeg's own output rounds 24000/1001
+to "23.98", and since a seek is `frame / fps` that error grows with the frame
+number — about one whole frame by six thousand in. A player that quietly hands
+back the neighbouring frame is worse than one that will not open the file.
+
+They are looked for in three places, first hit wins:
+
+1. `$JKPLAYER_FFMPEG` — a folder, for a studio that keeps its own copy
+2. `jkplayer/bin/` — a copy dropped in beside the code
+3. `PATH`
+
+When neither is found the panel says which one is missing and where it looked,
+and nothing else in the player is affected.
+
+They are not bundled here, and that is a decision rather than an oversight.
+The obvious pip route, `imageio-ffmpeg`, ships **ffmpeg without ffprobe** (88 MB
+of it), which by the paragraph above is not enough. Shipping both ourselves
+means picking a build: we only ever decode, and the encoders — x264, x265 —
+are what make a build GPL, so an LGPL build covers this and carries no such
+obligation.
+
 ## Install
 
 1. Copy this whole `JKplayer` folder into `~/.nuke/`
@@ -178,18 +253,18 @@ difference between answering a support mail and doing archaeology.
 
 ## Use
 
-1. **JKplayer > Create JKplayer Node** and connect a Read with an `.exr`
-   sequence to input **Comp** (optionally a second one to **Plate**, and a
-   matte to **DiMatte** if the mattes come as their own files).
+1. **JKplayer > Create JKplayer Node** and connect a Read to input **Comp**
+   (optionally a second one to **Plate**, and a matte to **DiMatte** if the
+   mattes come as their own files). An EXR or DPX sequence, or a movie.
 2. **JKplayer > Open JKplayer Panel**, or dock the panel from the pane menu.
 3. The node holds all the settings; the panel follows whichever JKplayer node
    is selected.
 
-Only Read nodes with `.exr` can be attached (a Dot on the way is fine) —
-anything else is disconnected and the status line says which node it was and
-what is allowed instead. The player reads the files off disk itself, so a node
-that changes the picture cannot be honoured: it would show the untouched plate
-and pass it off as the result. Shifting in time is done on the node, not with a
+Only Read nodes pointing at a format this player decodes can be attached (a Dot
+on the way is fine) — anything else is disconnected and the status line says
+which node it was and what is allowed instead. The player reads the files off
+disk itself, so a node that changes the picture cannot be honoured: it would
+show the untouched plate and pass it off as the result. Shifting in time is done on the node, not with a
 TimeOffset; fitting one input onto the other is done by the player when it
 compares them, not with a Reformat.
 
@@ -231,11 +306,19 @@ is one copy of the code, so there is nothing to keep in sync.
 What they cover, since the Qt layer cannot be tested inside Nuke at all (the
 terminal only has a `QCoreApplication` and a standalone `QApplication`
 freezes): both EXR readers against a reference set in every compression, the
-colour transforms against OCIO, the scopes, the QC modes, every knob on the
-node, and the geometry that Qt only draws - the wipe mask, where the in-image
-panels are anchored, the slider curves. Plus a static check that catches calls
-to methods that do not exist and wrong argument counts, which is otherwise the
-kind of thing that only surfaces in Nuke as "the panel does not work".
+DPX reader against files from a second implementation, movie frame identity on
+clips that carry their own frame number, the colour transforms against OCIO,
+the scopes, the QC modes, every knob on the node, and the geometry that Qt only
+draws - the wipe mask, where the in-image panels are anchored, the slider
+curves. Plus a static check that catches calls to methods that do not exist and
+wrong argument counts, which is otherwise the kind of thing that only surfaces
+in Nuke as "the panel does not work".
+
+The parts that talk to Qt but hold real logic - the Metadata tab, the banded
+display path - are tested against a stub that validates every Qt name against
+the real PySide6, so an attribute that does not exist fails here rather than in
+Nuke. What the stub cannot do is store items or lay anything out, so which row
+a click lands on is still something only Nuke can answer.
 
 ## What has actually been run
 
@@ -257,6 +340,42 @@ Tests.
 
 Reports from other platforms are welcome; that table is how it gets shorter.
 
+### The newer formats
+
+DPX and movies are younger than the rest and their evidence is thinner, so:
+
+| | how far it has been taken |
+|---|---|
+| DPX | against files written by ffmpeg — a second implementation — at 8, 10 and 16 bit, both endiannesses, plus hand-built headers for the film and television fields ffmpeg omits. **Not yet against a DPX from a real pipeline.** |
+| ProRes, DNxHR, MJPEG | frame identity proved on clips whose frame number is painted into them as black and white blocks: 96 frames each, every one fetched by its own cold seek, forwards, backwards and at random |
+| H.264 / long-GOP | the same, with a 250-frame group of pictures |
+| Both | concurrent access from several threads, the open-file cap, and no leaked processes |
+
+The 10-bit DPX packing convention was settled by decoding a reference file both
+ways and seeing which gave back the values that went in. The spec sentence can
+be read either way, and a guess would have been wrong half the time with
+nothing to show for it.
+
+Movie frame identity is checked with **blocks, not pixel values**. The first
+attempt wrote the frame number into a pixel and reported DNxHR as broken; it
+was not — DNxHR is tagged limited range, so the value came back scaled and the
+instrument was blaming the frame for what the colour path did.
+
+Measured on this machine (Ryzen 9 9950X), decoding only:
+
+| | |
+|---|---|
+| 4K EXR ZIP | 103 fps at 24 threads |
+| 4K DPX 10-bit | 25 fps at 16 threads |
+| HD ProRes 422 HQ | 72 fps |
+| 4K ProRes 422 HQ | 15–17 fps |
+
+4K movies are held back by the pipe out of ffmpeg, not by the decoder: 53 MB a
+frame in 16-bit RGB against about 1100 MB/s. HD and 2K have room to spare.
+
+Stepping one frame on in a 4K movie costs 56 ms; a jump backwards restarts
+ffmpeg and costs about half a second, because a pipe cannot be run in reverse.
+
 ## Layout
 
 ```
@@ -269,10 +388,14 @@ jkplayer/
   register.py   registration into Nuke's menus
   loader.py     background decoding, two queues
   cache.py      RAM cache with a byte budget
-  sequence.py   frame number -> file path
+  sequence.py   frame number -> what the reader is handed
   exrcore.py    EXR through Nuke's own library (ctypes)
   exrread.py    pure Python EXR reader, the fallback
-  reader.py     picks between the two
+  dpxread.py    DPX reader
+  movread.py    movies, through ffmpeg
+  reader.py     picks between them - the whole format boundary is four calls
+  meta.py       which header fields are shown, and in what order
+  metaknob.py   the Metadata tab on the node
   scopes.py     histogram, vectorscope, waveform
   effects.py    the QC modes
   annotate.py   notes on frames: storage, drawing, export, CSV
