@@ -16,7 +16,7 @@ window so a long shot does not thrash, and a timeline that shows what is
 cached. Realtime mode holds the target FPS and skips uncached frames; turn it
 off and every frame is shown.
 
-**Two inputs, six view modes** — Single, Double (side by side or stacked),
+**Two inputs, six view modes** — Base, Sync (side by side or stacked),
 Difference (A/B dissolve with a plain or high-pass compare), Wipe (draggable,
 rotatable line with a blend handle), DiMatte (mattes drawn over the image as
 colours) and Annotation. Both windows share zoom and pan, so the pixels line
@@ -213,7 +213,7 @@ F            fit into the window
 1-7          QC mode
 I O          mark in / out
 P            freeze the pixel readout
-X            switch window (in Double)
+X            switch window (in Sync)
 -            swap the window between Comp and Plate
 ;            pencil / text tools live in the image, in Annotation mode
 ```

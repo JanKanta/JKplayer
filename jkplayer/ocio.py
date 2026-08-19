@@ -60,11 +60,6 @@ LOG_MIN, LOG_MAX = -12.0, 12.0
 CUBE_SIZE = 96
 
 
-def white_on_node():
-    """Does 1.0 land exactly on a node? If not, white will not be white (see above)."""
-    idx = 1.0 + (CUBE_SIZE - 2) * (0.0 - LOG_MIN) / (LOG_MAX - LOG_MIN)
-    return abs(idx - round(idx)) < 1e-6
-
 _HALF = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
 _HALF_SAFE = np.nan_to_num(_HALF, nan=0.0, posinf=2.0 ** LOG_MAX, neginf=0.0)
 

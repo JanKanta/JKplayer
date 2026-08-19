@@ -125,12 +125,6 @@ class FrameLoader(object):
         with self._lock:
             return self._seq
 
-    def request(self, frame, priority=0):
-        """Queues one frame (ignored when already cached or in flight)."""
-        with self._lock:
-            self._enqueue_locked(frame, priority)
-            self._lock.notify()
-
     def set_playhead(self, frame, direction=1, ahead=24, behind=4,
                      lo=None, hi=None):
         """Rebuilds the URGENT queue around the playhead. Call on every move.
@@ -202,11 +196,6 @@ class FrameLoader(object):
 
     def cancel_background(self):
         with self._lock:
-            self._background.clear()
-
-    def cancel_all(self):
-        with self._lock:
-            self._urgent = []
             self._background.clear()
 
     def stop(self):

@@ -83,10 +83,6 @@ CC_PARAMS = [
 SLIDER_STEPS = 400
 
 
-def cc_defaults():
-    return {p[0]: p[4] for p in CC_PARAMS}
-
-
 class _Slider(QtWidgets.QSlider):
     """A slider that steals neither the keyboard nor the wheel.
 
@@ -586,9 +582,6 @@ class _Panel(QtWidgets.QFrame):
     def _scaled(self):
         """Overridden by subclasses that scale their content as well as the width."""
 
-    def set_title(self, text):
-        self._title.setText(text)
-
     def set_opacity(self, value):
         """Backdrop opacity (0 = outlines only, 1 = opaque)."""
         alpha = int(round(max(0.0, min(1.0, float(value))) * 255))
@@ -688,18 +681,6 @@ class _Panel(QtWidgets.QFrame):
         # what a middle click goes back to - the DEFAULT, which is not the same
         # as the value the panel happens to open with
         self._defaults[key] = value if default is None else default
-
-    def set_choice(self, key, index):
-        """A menu choice from outside. No signal is sent."""
-        combo = self._choices.get(key)
-        if combo is None:
-            return
-        index = max(0, min(combo.count() - 1, int(round(index))))
-        self._values[key] = float(index)
-        if combo.currentIndex() != index:
-            combo.blockSignals(True)
-            combo.setCurrentIndex(index)
-            combo.blockSignals(False)
 
     def _add_choice(self, key, label, choices, value):
         """A menu instead of a slider - for parameters whose values are named
@@ -873,7 +854,7 @@ QToolButton#cvToggle:disabled {
 }
 """
 
-# The scopes take a lot of room in the image, so in Double (where each window
+# The scopes take a lot of room in the image, so in Sync (where each window
 # is only half the size) they are not available - the H and V toggles grey out.
 SCOPE_KEYS = ("hist", "vscope", "wave")
 
@@ -886,6 +867,9 @@ PANEL_BUTTONS = (
     ("hist", "H", "Histogram: axis 0 to 55, the line at 1.0 marks clipping."),
     ("vscope", "V", "Vectorscope: pixel colour as it is on screen."),
     ("wave", "W", "Waveform: values along the columns, line at 1.0, top 55."),
+    ("meta", "META",
+     "The EXR headers, bottom left of the image - both inputs at once, "
+     "each line tagged with which one it came from."),
 )
 
 
@@ -923,14 +907,24 @@ class OverlayPanel(_Panel):
         for index, label in enumerate(labels):
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(4)
-            # The same boxed tile the window bars use, so A and B read as the
-            # inputs they are. Not clickable here: in this mode window A IS
-            # input A, so there is nothing to choose.
-            name = QtWidgets.QLabel(label, self)
+            # The same boxed tile the window bars use, so the two inputs
+            # read as the inputs they are. It has to be a QToolButton and not
+            # a QLabel: SLOT_STYLE selects on QToolButton#cvSlot, so a label
+            # with that object name matched nothing and came out as bare text
+            # with no box at all.
+            #
+            # It is NOT clickable - in this mode there is nothing to choose -
+            # but it is left ENABLED, because a disabled button greys itself
+            # out and would no longer look like the ones elsewhere. Mouse
+            # events pass straight through it instead, so it cannot be pressed
+            # and never lights up on hover.
+            name = QtWidgets.QToolButton(self)
             name.setObjectName("cvSlot")
             name.setStyleSheet(SLOT_STYLE)
+            name.setText(label)
             name.setFixedSize(24, 20)
-            name.setAlignment(QtCore.Qt.AlignCenter)
+            name.setFocusPolicy(QtCore.Qt.NoFocus)
+            name.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
             row.addWidget(name)
             combo = _Combo(self)
             combo.addItem("rgba")
@@ -992,18 +986,14 @@ class OverlayPanel(_Panel):
         host.setContentsMargins(0, 2, 0, 0)
         host.setSpacing(2)
         self.form = host              # from here on the sliders go in the host
-        # Every comparison gets the SAME room, measured once from the tallest
-        # of them. Difference is two menus and two sliders, the high-pass one
-        # is four sliders, and menus are taller - so without this the panel
-        # changed height every time the comparison was switched and everything
-        # under the cursor moved.
-        self._params_h = 0
-        for mode in fx.OVERLAY_MODES:
-            self._mode = mode
-            self._build_params(measure=True)
-            host.activate()               # or sizeHint is the one from before
-            self._params_h = max(self._params_h,
-                                 self._params_host.sizeHint().height())
+        # NO RESERVED HEIGHT. Every comparison used to be given the same room,
+        # measured from the tallest of them, so that switching between them
+        # moved nothing. That was the wrong trade once Display and the colour
+        # left this panel: Difference is a single slider and the high-pass one
+        # is four, so Difference sat under three empty rows of picture and Off
+        # never quite collapsed. The panel is the only one in this mode and
+        # nothing is anchored under it, so it can simply be the size of what it
+        # holds.
         self._mode = fx.NONE
         self._build_params()
 
@@ -1074,7 +1064,7 @@ class OverlayPanel(_Panel):
         self._build_params()
         self.modeChanged.emit(self._mode)
 
-    def _build_params(self, values=None, measure=False):
+    def _build_params(self, values=None):
         """The sliders of the chosen comparison. Off has none, so the block
         disappears entirely rather than leaving a gap."""
         self._clear_form()
@@ -1093,17 +1083,53 @@ class OverlayPanel(_Panel):
                                  default=default)
         self.qc.setToolTip(fx.DESCRIPTION.get(self._mode, "")
                            or "Compares input A against input B.")
-        if measure:
-            self._params_host.setVisible(True)
-            return
-        # A FIXED height, not a minimum: with a minimum the block only ever
-        # grew, so turning the comparison off left the panel as tall as the
-        # comparison had made it. Every comparison gets the same reserved
-        # height (measured in __init__) so switching between them moves
-        # nothing; Off gets none at all and the panel really does shrink.
-        specs_h = getattr(self, "_params_h", 0) if specs else 0
+        # The block is hidden outright when there is nothing in it, so Off
+        # leaves no gap. Anything left over from a previous height is cleared -
+        # a limit from the last comparison would otherwise survive the switch.
+        self._params_host.setMaximumHeight(16777215)
+        self._params_host.setMinimumHeight(0)
         self._params_host.setVisible(bool(specs))
-        self._params_host.setFixedHeight(specs_h)
+        if specs:
+            # THE SLIDERS GET THEIR ROOM, GUARANTEED. Freshly created widgets
+            # have not been polished yet, so at this moment their size hints
+            # are not final and the panel worked out a height that was too
+            # small for them - the four high-pass sliders came out squashed and
+            # only sorted themselves out when the panel was next dragged, which
+            # is what finally made Qt lay it out for real.
+            #
+            # Asking the LAYOUT rather than the widget: the layout adds up the
+            # rows it holds, and that sum is right as soon as the rows exist.
+            self._params_host.ensurePolished()
+            inner = self._params_host.layout()
+            inner.invalidate()
+            inner.activate()
+            self._params_host.setMinimumHeight(inner.sizeHint().height())
+        # ACTIVATE EVERY LAYOUT FROM THE SLIDERS OUTWARDS, before asking for
+        # the size. sizeHint is cached and changing what is inside a child does
+        # not invalidate the parent's copy, so the panel was resizing to the
+        # hint from BEFORE the change - always one comparison behind. That is
+        # what squeezed the high-pass sliders into the height Difference needed
+        # and then left Difference and Off standing at the high-pass height.
+        #
+        # Walked up the PARENT CHAIN rather than through a list of layouts:
+        # self.form is reassigned to the host's layout in __init__, so a list
+        # naming it missed self._body.layout() entirely - the middle layer, and
+        # the one that actually had to recompute.
+        # BOUNDED: the chain is three deep (host, body, panel) and stopping at
+        # self is the normal exit. The limit is there so a widget that is not
+        # our child - or a parentWidget that never answers None - cannot walk
+        # off up the whole application and hang the repaint.
+        widget = self._params_host
+        for _ in range(8):
+            if widget is None:
+                break
+            lay = widget.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+            if widget is self:
+                break
+            widget = widget.parentWidget()
         self.updateGeometry()
         self.adjustSize()
         self.resize(self.sizeHint())       # adjustSize alone would not shrink
@@ -1598,6 +1624,118 @@ class AnnotOptions(QtWidgets.QFrame):
         return self.y() + self.height()
 
 
+class MetaPanel(QtWidgets.QFrame):
+    """The EXR headers, bottom left of the image.
+
+    Not a _Panel: those live in a column that grows downwards from a top
+    anchor, and this one hangs off the BOTTOM edge - it has to grow upwards
+    from where it sits, or a long header would push itself off the picture.
+
+    Deliberately plain text rather than a table. There is no interaction here,
+    nothing to sort and nothing to click; what a table would add is grid lines
+    over the picture, which is the one thing an overlay should not spend.
+    """
+
+    KEY_W = 150                  # room for the key column before the value
+    MAX_ROWS = 24                # past this the panel would cover the shot
+
+    def __init__(self, parent=None):
+        super(MetaPanel, self).__init__(parent)
+        self.setObjectName("cvOverlay")
+        self.setStyleSheet(STYLE)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self._anchor = (0, 0)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 5, 10, 6)
+        lay.setSpacing(0)
+        lay.setSizeConstraint(QtWidgets.QLayout.SetFixedSize)
+
+        self._label = QtWidgets.QLabel("", self)
+        self._label.setTextFormat(QtCore.Qt.RichText)
+        self._label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self._label.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
+        font = self._label.font()
+        # BIGGER THAN THE REST OF THE FURNITURE. The other overlays are labels
+        # on controls you are already looking at; this one is read off the
+        # picture, from a chair, and a point under the default was too small
+        # for a timecode to be picked out at a glance.
+        font.setPointSize(max(9, font.pointSize() + 2))
+        self._label.setFont(font)
+        lay.addWidget(self._label)
+        self._rows = None
+
+    def set_rows(self, rows):
+        """[(tag, key, value)] - tag is which input the line came from.
+
+        ONE INPUT MARKER, not one per line. Each window draws the input it is
+        showing, so repeating the tag down every row said the same thing over
+        and over in the widest colour on the panel. When a window really does
+        show both files - a difference, a matte - the per-line tag comes back,
+        because then it is the only thing telling the halves apart.
+        """
+        rows = list(rows or [])
+        if rows == self._rows:
+            return
+        self._rows = rows
+        if not rows:
+            self._label.setText(
+                "<span style='color:#8a8a8a'>no metadata "
+                "(nothing attached, or the headers are empty)</span>")
+            self.adjustSize()
+            return
+        tags = []
+        for tag, _key, _value in rows:
+            if tag not in tags:
+                tags.append(tag)
+        one = len(tags) == 1
+
+        cut = rows[:self.MAX_ROWS]
+        out = []
+        if one:
+            out.append("<div style='color:#e0a020; font-weight:bold; "
+                       "padding-bottom:2px'>%s</div>" % _esc(tags[0]))
+        out.append("<table cellspacing='0' cellpadding='0'>")
+        for tag, key, value in cut:
+            cells = ""
+            if not one:
+                cells = ("<td style='color:#e0a020; padding-right:6px'>%s</td>"
+                         % _esc(tag))
+            out.append(
+                "<tr>%s"
+                "<td style='color:#9a9a9a; padding-right:10px'>%s</td>"
+                "<td style='color:#e8e8e8'>%s</td>"
+                "</tr>" % (cells, _esc(key), _esc(value)))
+        if len(rows) > self.MAX_ROWS:
+            span = 2 if one else 3
+            out.append("<tr><td colspan='%d' style='color:#8a8a8a'>"
+                       "... and %d more</td></tr>"
+                       % (span, len(rows) - self.MAX_ROWS))
+        out.append("</table>")
+        self._label.setText("".join(out))
+        self.adjustSize()
+
+    def set_anchor(self, x, y):
+        """x, y of the BOTTOM LEFT corner - the panel grows upwards from it."""
+        anchor = (int(x), int(y))
+        if anchor == self._anchor and self.pos().x() == anchor[0]:
+            self._place()
+            return
+        self._anchor = anchor
+        self._place()
+
+    def _place(self):
+        x, bottom = self._anchor
+        self.move(x, max(0, bottom - self.height()))
+        self.raise_()
+
+
+def _esc(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
 class SlotBar(QtWidgets.QFrame):
     """The controls of one window, sitting RIGHT INSIDE IT (top left).
 
@@ -1606,7 +1744,7 @@ class SlotBar(QtWidgets.QFrame):
     can show the same input and differ only by layer (rgba against depth of the
     same plate).
 
-    Why in the image and not in the top bar: in Double each set of controls
+    Why in the image and not in the top bar: in Sync each set of controls
     belongs to its own half, and with a single shared bar at the top there is
     no telling which pair is which. This way it is right by the window you are
     looking at.
@@ -1654,7 +1792,7 @@ class SlotBar(QtWidgets.QFrame):
         lay.addWidget(self.layer)
 
         # Panel toggles. The panels are shared across the whole image, so in
-        # Double both bars show the same thing - you switch from the one you
+        # Sync both bars show the same thing - you switch from the one you
         # happen to be at and the other follows.
         self._toggles, self._tips = {}, {}
         for key, label, tip in PANEL_BUTTONS:
@@ -1662,7 +1800,12 @@ class SlotBar(QtWidgets.QFrame):
             b.setObjectName("cvToggle")
             b.setText(label)
             b.setCheckable(True)
-            b.setFixedSize(24, 20)
+            # WIDE ENOUGH FOR THE WORD. A flat 24 px fits H and CC but not
+            # META, and Qt does not overflow a button - it shortens the text,
+            # so the button read "..." and said nothing at all. The short
+            # labels keep their old width, which is what lines the strip up.
+            b.setFixedSize(max(24, b.fontMetrics().horizontalAdvance(label) + 10),
+                           20)
             b.setFocusPolicy(QtCore.Qt.NoFocus)
             self._tips[key] = (
                 "%s\n\nA click switches both at once - the computation and the\n"
@@ -1685,7 +1828,7 @@ class SlotBar(QtWidgets.QFrame):
         self._reposition()
 
     # ---- anchoring -----------------------------------------------------
-    # The position is decided by the panel (see _Stage): in Single and Double
+    # The position is decided by the panel (see _Stage): in Base and Sync
     # the bar sits in the corner of its window, in Wipe the windows overlap and
     # the bar of input B stands BELOW the controls of input A.
     def set_anchor(self, x, y):
@@ -1756,9 +1899,6 @@ class SlotBar(QtWidgets.QFrame):
         self.layer.blockSignals(False)
         self.layer.setEnabled(len(layers) > 1)
 
-    def current_layer(self):
-        return self.layer.currentText()
-
     def set_panel(self, key, on):
         """The toggle state from the node. No signal is sent."""
         b = self._toggles.get(key)
@@ -1768,14 +1908,14 @@ class SlotBar(QtWidgets.QFrame):
             b.blockSignals(False)
 
     def set_scopes_available(self, available):
-        """In Double the scopes are unavailable - the H and V toggles grey out."""
+        """In Sync the scopes are unavailable - the H and V toggles grey out."""
         for key in SCOPE_KEYS:
             b = self._toggles.get(key)
             if b is None or b.isEnabled() == bool(available):
                 continue
             b.setEnabled(bool(available))
             b.setToolTip(self._tips[key] if available else
-                         "The scopes are Single only - in Double they would\n"
+                         "The scopes are Base only - in Sync they would\n"
                          "leave almost nothing of two half-size windows.")
 
 
@@ -2429,7 +2569,7 @@ class _Stack(QtWidgets.QWidget):
         x, y = self._anchor
         if self._below is not None:
             # It stands below the bar of its window - in BOTH axes. When only y
-            # was taken, the stack stayed at the default x and in Double the
+            # was taken, the stack stayed at the default x and in Sync the
             # controls of the right window opened under the left half.
             x, y = self._below.x(), self._below.bottom() + self.GAP
         if self.RIGHT:
@@ -2446,7 +2586,7 @@ class _Stack(QtWidgets.QWidget):
     def _apply(self, pairs):
         """CAREFUL: no "only set it when it differs from isVisible()".
         isVisible() is False even when the PARENT is hidden - and that is an
-        ordinary state (window 2 in Single, or the whole panel before it is
+        ordinary state (window 2 in Base, or the whole panel before it is
         first shown). Hiding was then skipped and the panel popped up as soon
         as the parent appeared; the button could no longer close it."""
         for panel, want in pairs:

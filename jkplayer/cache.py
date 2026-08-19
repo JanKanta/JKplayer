@@ -95,20 +95,12 @@ class FrameCache(object):
             return self._bytes
 
     @property
-    def budget_bytes(self):
-        return self._budget
-
-    @property
     def mb_used(self):
         return self.bytes_used / (1024.0 * 1024.0)
 
     @property
     def budget_mb(self):
         return self._budget / (1024.0 * 1024.0)
-
-    @property
-    def fill_ratio(self):
-        return self.bytes_used / float(self._budget) if self._budget else 0.0
 
     def frame_capacity(self, frame_nbytes):
         """How many frames of that size fit into the budget."""
@@ -126,16 +118,6 @@ class FrameCache(object):
         if key_fn is None:
             key_fn = seq.key_for
         return [f for f in seq.frames() if key_fn(f) in keys]
-
-    def cached_runs(self, seq, key_fn=None):
-        """Continuous runs [(from,to), ...] - cheaper to draw than single frames."""
-        runs = []
-        for f in self.cached_frames(seq, key_fn):
-            if runs and f == runs[-1][1] + 1:
-                runs[-1][1] = f
-            else:
-                runs.append([f, f])
-        return runs
 
     def stats(self):
         with self._lock:

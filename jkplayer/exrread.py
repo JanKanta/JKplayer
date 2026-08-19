@@ -208,20 +208,6 @@ class ExrFile(object):
                 return planes[key]
         return None
 
-    def read_rgb_float(self):
-        """(h,w,3) float32 in R,G,B order, SCENE-LINEAR (no tonemapping)."""
-        planes = self._planes()
-        out = []
-        for name in ("R", "G", "B"):
-            p = self._pick(planes, name)
-            if p is None:                     # mono/luminance fallback
-                p = self._pick(planes, "Y")
-            if p is None:
-                p = next(iter(planes.values())) if planes else None
-            out.append(np.zeros((self.height, self.width), np.float32)
-                       if p is None else p.astype(np.float32))
-        return np.stack(out, axis=-1)
-
     def read_rgba_half(self, layer=None):
         """(h,w,4) float16 R,G,B,A scene-linear = THE CACHE FORMAT.
 
@@ -284,24 +270,6 @@ def read_display_rgb8(path):
         return None
 
 
-def read_linear_rgb(path):
-    """float32 scene-linear (h,w,3) (for the value map), or None."""
-    try:
-        return ExrFile(path).read_rgb_float()
-    except (ExrUnsupported, ValueError, OSError, zlib.error):
-        return None
-
-
-def read_cache_frame(path):
-    """(h,w,4) float16 scene-linear RGBA - the format kept in the cache. None on error."""
-    try:
-        return ExrFile(path).read_rgba_half()
-    except (ExrUnsupported, ValueError, OSError, zlib.error):
-        return None
-    except Exception:
-        return None
-
-
 def _parse_channels(body):
     """List of [(name, pixtype)] from the 'channels' block in the header."""
     out, j = [], 0
@@ -360,3 +328,168 @@ def probe(path):
     except Exception as exc:
         return {"supported": False, "reason": "%s: %s" % (type(exc).__name__, exc),
                 "channels": channel_names(path)}
+
+
+# ---------------------------------------------------------------- metadata
+# Every attribute in the header, not just the four the decoder needs.
+#
+# It costs almost nothing: the loop in ExrFile already walks name, type and
+# body of each one and simply drops what it does not recognise. The header is
+# also never compressed and sits at the front of the file, so this reads a few
+# kilobytes rather than the frame.
+#
+# Deliberately NOT going through the DLL. exrcore would need another set of
+# ctypes struct layouts, which is the part of it that has broken before across
+# OpenEXR versions - and there is nothing to gain, because parsing a header is
+# not where time goes.
+
+HEADER_CHUNK = 64 * 1024        # read this much first; grow if the header is longer
+HEADER_MAX = 4 * 1024 * 1024    # a header past this is not a header any more
+
+# Attributes the rest of the player already shows in its own words. Kept out of
+# the metadata list so it does not repeat the status line back at you.
+_METADATA_SKIP = ("channels", "dataWindow", "displayWindow", "lineOrder",
+                  "tiles", "chunkCount")
+
+_LINE_ORDER = {0: "increasing Y", 1: "decreasing Y", 2: "random Y"}
+_ENVMAP = {0: "latlong", 1: "cube"}
+
+
+def _fmt_floats(body, count, fmt="%g"):
+    if len(body) < 4 * count:
+        return None
+    return " ".join(fmt % v for v in struct.unpack_from("<%df" % count, body))
+
+
+def _fmt_ints(body, count):
+    if len(body) < 4 * count:
+        return None
+    return " ".join(str(v) for v in struct.unpack_from("<%di" % count, body))
+
+
+def _fmt_timecode(body):
+    """SMPTE timecode. The digits are BCD inside the first word."""
+    if len(body) < 8:
+        return None
+    tf = struct.unpack_from("<I", body)[0]
+    def two(units_shift, tens_shift, tens_mask):
+        return ((tf >> tens_shift) & tens_mask) * 10 + ((tf >> units_shift) & 0x0F)
+    return "%02d:%02d:%02d:%02d" % (two(24, 28, 0x3), two(16, 20, 0x7),
+                                    two(8, 12, 0x7), two(0, 4, 0x3))
+
+
+def _fmt_keycode(body):
+    if len(body) < 28:
+        return None
+    f, m, p, c, pc, ppf, pppc = struct.unpack_from("<7i", body)
+    return "mfc %d film %d prefix %d count %d perf %d" % (f, m, p, c, pc)
+
+
+def _fmt_stringvector(body):
+    out, i = [], 0
+    while i + 4 <= len(body):
+        n = struct.unpack_from("<i", body, i)[0]
+        i += 4
+        if n < 0 or i + n > len(body):
+            break
+        out.append(body[i:i + n].decode("latin-1", "replace"))
+        i += n
+    return ", ".join(out) if out else None
+
+
+def _decode_attr(atype, body):
+    """One header attribute as text, or None when we cannot make sense of it."""
+    try:
+        if atype == "string":
+            return body.decode("utf-8", "replace")
+        if atype == "int":
+            return str(struct.unpack_from("<i", body)[0])
+        if atype == "float":
+            return "%g" % struct.unpack_from("<f", body)[0]
+        if atype == "double":
+            return "%g" % struct.unpack_from("<d", body)[0]
+        if atype in ("v2i", "v3i", "box2i", "box2f"):
+            n = {"v2i": 2, "v3i": 3, "box2i": 4, "box2f": 4}[atype]
+            return (_fmt_ints(body, n) if atype != "box2f"
+                    else _fmt_floats(body, n))
+        if atype in ("v2f", "v3f", "m33f", "m44f", "chromaticities"):
+            n = {"v2f": 2, "v3f": 3, "m33f": 9, "m44f": 16,
+                 "chromaticities": 8}[atype]
+            return _fmt_floats(body, n)
+        if atype == "rational":
+            a, b = struct.unpack_from("<iI", body)
+            return "%d/%d" % (a, b)
+        if atype == "timecode":
+            return _fmt_timecode(body)
+        if atype == "keycode":
+            return _fmt_keycode(body)
+        if atype == "stringvector":
+            return _fmt_stringvector(body)
+        if atype == "compression":
+            return COMPRESSION_NAMES.get(body[0], str(body[0]))
+        if atype == "lineOrder":
+            return _LINE_ORDER.get(body[0], str(body[0]))
+        if atype == "envmap":
+            return _ENVMAP.get(body[0], str(body[0]))
+    except (struct.error, IndexError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def header_attributes(path):
+    """[(name, type, body)] straight out of the header, in file order.
+
+    Raises ValueError when the file is not an EXR. Reads in chunks: a header is
+    normally a few kB, but one carrying a preview image or a long history can
+    run to megabytes, and the frame behind it is not worth reading for this.
+    """
+    size = HEADER_CHUNK
+    while True:
+        with open(path, "rb") as fh:
+            data = fh.read(size)
+        if len(data) < 8 or struct.unpack_from("<i", data)[0] != MAGIC:
+            raise ValueError("not an EXR file")
+        out = []
+        i = 8
+        complete = False
+        try:
+            while True:
+                name, i = _read_cstr(data, i)
+                if name == "":
+                    complete = True
+                    break
+                atype, i = _read_cstr(data, i)
+                n = struct.unpack_from("<i", data, i)[0]
+                i += 4
+                if n < 0 or i + n > len(data):
+                    break               # ran off the end of what we read
+                out.append((name, atype, data[i:i + n]))
+                i += n
+        except (ValueError, struct.error):
+            pass                        # the same: read more and try again
+        if complete or len(data) < size or size >= HEADER_MAX:
+            return out
+        size *= 4
+
+
+def metadata(path):
+    """[(name, text)] - the header as something a person can read.
+
+    Order is the file's own, which is how the tools that wrote it grouped
+    things. Attributes the player already reports in its own words are left
+    out, and one it cannot decode is still LISTED, with its type and size:
+    knowing something is there beats it quietly not existing.
+    """
+    try:
+        attrs = header_attributes(path)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for name, atype, body in attrs:
+        if name in _METADATA_SKIP:
+            continue
+        text = _decode_attr(atype, body)
+        if text is None:
+            text = "<%s, %d bytes>" % (atype, len(body))
+        out.append((name, text))
+    return out

@@ -195,9 +195,6 @@ class Timeline(QtWidgets.QWidget):
         self.update()
         self.rangeChanged.emit(self._in, self._out)
 
-    def reset_in_out(self):
-        self.set_in_out(self._first, self._last)
-
     @property
     def frame(self):
         return self._frame

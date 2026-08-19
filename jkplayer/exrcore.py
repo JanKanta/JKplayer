@@ -42,18 +42,6 @@ _LIB_PATTERNS = {
 _LIB_PATTERNS_DEFAULT = ["libOpenEXRCore*.so*"]        # Linux and the rest
 
 
-# Offsets in exr_decode_pipeline_t. They are NOT the same in every OpenEXR:
-# Nuke 17 ships 3.3, where the struct has a field in front of the channel list,
-# and Nuke 16 ships an older one where it does not - with the 3.3 numbers
-# hard-coded, Nuke 16 fell back to the pure Python reader ("unexpected pipeline
-# layout") and read EXRs about 2.3x slower for no reason.
-#
-# So they are searched for instead of assumed, once per session, in
-# _pipeline_layout: the header already says how wide the picture is and which
-# pixel types are legal, and a wrong guess fails that immediately. These stay as
-# the first candidate because they are what the current Nuke uses.
-OFFSET_CHANNELS = 8
-OFFSET_CHANNEL_COUNT = 16
 PIPELINE_SIZE = 8192              # generous headroom, we do not model the struct
 
 
@@ -230,10 +218,6 @@ def library():
 
 def available():
     return library() is not None
-
-
-def library_error():
-    return _LIB_ERROR
 
 
 # ------------------------------------------------------------------ reading

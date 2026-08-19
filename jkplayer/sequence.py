@@ -1,5 +1,5 @@
 """
-EXR sequence - translates "frame number -> file path".
+Sequence - translates "frame number -> what the reader should be handed".
 
 No Qt and no Nuke, so it can be tested from the console.
 Supported path notations (the same ones a Nuke Read node uses):
@@ -10,6 +10,8 @@ Supported path notations (the same ones a Nuke Read node uses):
 
 import os
 import re
+
+from . import movread
 
 _RE_PRINTF = re.compile(r"%0?(\d*)d")
 _RE_HASH = re.compile(r"#+")
@@ -29,8 +31,10 @@ class ExrSequence(object):
         self.last = int(last) + self.offset
         if self.last < self.first:
             self.last = self.first
-        self.is_still = not (_RE_PRINTF.search(self.pattern)
-                             or _RE_HASH.search(self.pattern))
+        # A MOVIE IS ONE FILE FOR EVERY FRAME, which the rest of the player
+        # cannot express - it addresses frames by path. So for a movie
+        # path_for hands back "clip.mov|1042" instead; see movread.
+        self.is_movie = movread.is_mov(self.pattern)
         # paths are asked for over and over at runtime (display, look-ahead,
         # cache bar) and regex substitution is not free -> remember them
         self._paths = {}
@@ -47,7 +51,11 @@ class ExrSequence(object):
             return cached
         f = key - self.offset          # back to the frame the file is named by
         p = self.pattern
-        if _RE_PRINTF.search(p):
+        if self.is_movie:
+            # 0-based inside the movie: the Read reports its own first frame
+            # (1 for most movies) and the movie itself starts at zero.
+            out = movread.make_ref(p, f - (self.first - self.offset))
+        elif _RE_PRINTF.search(p):
             out = _RE_PRINTF.sub(lambda m: ("%0*d" % (int(m.group(1) or 0), f)), p)
         elif _RE_HASH.search(p):
             out = _RE_HASH.sub(lambda m: str(f).zfill(len(m.group(0))), p)
@@ -69,18 +77,6 @@ class ExrSequence(object):
         return range(self.first, self.last + 1)
 
     # ---- helpers ----
-    def exists(self, frame):
-        return os.path.isfile(self.path_for(frame))
-
-    def missing_frames(self, limit=None):
-        out = []
-        for f in self.frames():
-            if not self.exists(f):
-                out.append(f)
-                if limit and len(out) >= limit:
-                    break
-        return out
-
     def label(self):
         name = os.path.basename(self.pattern)
         # The shift is SAID OUT LOUD. Otherwise the per-input timing is
@@ -107,8 +103,14 @@ class ExrSequence(object):
             self.pattern, self.first, self.last, self.offset)
 
 
+# What a Read may point at. The name is_exr stayed after DPX was added: it is
+# what every caller asks - "can the player show this" - and renaming it would
+# have touched the node, the panel and the messages for no gain.
+READABLE = (".exr", ".dpx") + movread.EXTENSIONS
+
+
 def is_exr(path):
-    return bool(path) and os.path.splitext(path)[1].lower() == ".exr"
+    return bool(path) and os.path.splitext(path)[1].lower() in READABLE
 
 
 # Nodes that hand the picture straight on. Walked THROUGH, so wiring with a

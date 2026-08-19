@@ -16,7 +16,7 @@ two windows with the same input and layer share the same data for free.
 Colour (CC) and the check mode (QC) are per window: comparing two images only
 makes sense when both are measured with the same ruler.
 
-In Double both windows are exactly the same size (stretch 1:1), so the divider
+In Sync both windows are exactly the same size (stretch 1:1), so the divider
 always sits in the middle regardless of the panel's aspect ratio. Zoom and pan
 are carried between the windows, so the pixels line up.
 
@@ -42,6 +42,7 @@ from .qtcompat import QtCore, QtGui, QtWidgets, QShortcut, event_pos
 from . import annotate
 from . import effects as fx
 from . import exrcore
+from . import meta as meta_mod
 from . import node as exrnode
 from . import nukelut
 from . import ocio
@@ -51,8 +52,6 @@ from .imageview import ImageView
 from .loader import FrameLoader
 from . import overlay as overlay_mod
 from .overlay import ControlStack, ScopeStack, SlotBar
-
-_Stack_GAP = ControlStack.GAP        # the gap between the controls of both inputs
 
 # The top bar - the look of the Nuke Viewer: a dark strip, low flat controls
 # with no raised edges, thin separators. Applies ONLY inside #cvTopBar.
@@ -242,7 +241,7 @@ class _Slot(object):
     """One panel window.
 
     It has its own selected input, layer, loader, image - and also ITS OWN
-    panels (CC, QC, histogram, vectorscope). In Double two different images are
+    panels (CC, QC, histogram, vectorscope). In Sync two different images are
     being compared and each deserves its own scope and its own check mode.
     """
 
@@ -258,6 +257,8 @@ class _Slot(object):
         self.loader = FrameLoader(cache, workers=workers, on_ready=on_ready)
         self.controls = None             # ControlStack (CC, QC) - on the left
         self.scopes = None               # ScopeStack (H, V) - on the right
+        self.meta = None                 # MetaPanel - bottom left of THIS window
+        self.meta_rows = None            # what it is showing, to skip rebuilds
         self.bar = None                  # SlotBar, created by _build_ui
         self.fx_params = {}              # slider settings, remembered per mode
         self.legend = ""                 # explanation of the active QC mode
@@ -293,7 +294,7 @@ class _Stage(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super(_Stage, self).__init__(parent)
         self.views = []
-        self.mode = exrnode.VIEW_SINGLE
+        self.mode = exrnode.VIEW_BASE
         self.split = exrnode.SPLIT_SIDE
         self.wipe = [0.5, 0.5, 0.0]  # share of width, share of height, angle in degrees
         self.wipe_opacity = 1.0      # blend intensity (drawn at the circle)
@@ -320,7 +321,7 @@ class _Stage(QtWidgets.QWidget):
             return
         w, h = self.width(), self.height()
         gap = 2                                  # a thin divider
-        if self.mode == exrnode.VIEW_DOUBLE:
+        if self.mode == exrnode.VIEW_SYNC:
             if self.split == exrnode.SPLIT_STACK:
                 half = max(1, (h - gap) // 2)
                 boxes = [(0, 0, w, half), (0, half + gap, w, h - half - gap)]
@@ -328,8 +329,8 @@ class _Stage(QtWidgets.QWidget):
                 half = max(1, (w - gap) // 2)
                 boxes = [(0, 0, half, h), (half + gap, 0, w - half - gap, h)]
         else:
-            # Single, Wipe and Overlay: both windows over the whole area. In
-            # Single the second one is hidden, in Wipe it is clipped by a mask,
+            # Base, Wipe and Overlay: both windows over the whole area. In
+            # Base the second one is hidden, in Wipe it is clipped by a mask,
             # in Overlay it is simply drawn over the first at its own opacity.
             boxes = [(0, 0, w, h), (0, 0, w, h)]
         for view, box in zip(self.views, boxes):
@@ -574,7 +575,7 @@ class PlayerPanel(QtWidgets.QWidget):
         self._tl_range = None            # the range already set on the timeline
         self._active = 0                 # which window the scopes and probe read
         self._placing = False            # currently placing the controls (see below)
-        self._view_mode = exrnode.VIEW_SINGLE
+        self._view_mode = exrnode.VIEW_BASE
         self._split = exrnode.SPLIT_SIDE
         self._frame_ready.connect(self._on_frame_ready)
 
@@ -593,6 +594,7 @@ class PlayerPanel(QtWidgets.QWidget):
         self._ui_timer = QtCore.QTimer(self)    # refreshing the bar and stats
         self._ui_timer.setInterval(200)
         self._ui_timer.timeout.connect(self._refresh_status)
+        self._ui_timer.timeout.connect(self._meta_tick)
         self._ui_timer.start()
         self._follow_timer = QtCore.QTimer(self)
         self._follow_timer.setInterval(400)
@@ -632,9 +634,9 @@ class PlayerPanel(QtWidgets.QWidget):
         return [s.view for s in self._slots]
 
     def _both_slots(self):
-        """Are both windows visible? (Double side by side, Wipe and Overlay
+        """Are both windows visible? (Sync side by side, Wipe and Overlay
         over each other)"""
-        return self._view_mode in (exrnode.VIEW_DOUBLE, exrnode.VIEW_WIPE,
+        return self._view_mode in (exrnode.VIEW_SYNC, exrnode.VIEW_WIPE,
                                    exrnode.VIEW_OVERLAY)
 
     # it used to be called _double(); the name stays as a shorthand for the same
@@ -643,7 +645,7 @@ class PlayerPanel(QtWidgets.QWidget):
     def _live_slots(self):
         """Windows that are VISIBLE and have something to show.
 
-        Only for those is anything pre-fetched and cached - in Single,
+        Only for those is anything pre-fetched and cached - in Base,
         decoding the second window would be RAM and time thrown away.
 
         The exception is the difference: it needs BOTH inputs even when only
@@ -695,13 +697,13 @@ class PlayerPanel(QtWidgets.QWidget):
         bar.setSpacing(3)
 
         # How many windows. Which input and layer is picked inside each window
-        # (see SlotBar), so in Double it is clear which controls are which.
+        # (see SlotBar), so in Sync it is clear which controls are which.
         self._mode_combo = QtWidgets.QComboBox()
         self._mode_combo.addItems(exrnode.VIEW_MODES)
         self._mode_combo.setFixedWidth(78)
         self._mode_combo.setToolTip(
-            "Single = one window.\n"
-            "Double = two side by side or stacked (the split is on the node).\n"
+            "Base = one window.\n"
+            "Sync = two side by side or stacked (the split is on the node).\n"
             "Wipe   = both over each other, revealed by a line:\n"
             "         drag the circle to move it, the line to rotate it.\n"
             "Each window picks its own input and layer - top left inside it.")
@@ -764,7 +766,7 @@ class PlayerPanel(QtWidgets.QWidget):
         bar.addStretch(1)
         root.addWidget(bar_host)
 
-        # The stage lays the windows out itself (see _Stage): in Double into
+        # The stage lays the windows out itself (see _Stage): in Sync into
         # exact halves, so the divider sits in the middle even after an aspect
         # change, and in Wipe over each other. The control panels are children
         # of the STAGE, not of a window - in Wipe a window is clipped by a mask
@@ -799,7 +801,7 @@ class PlayerPanel(QtWidgets.QWidget):
 
             # The controls (CC, QC) on the left below the bar, the measuring
             # panels (histogram, vectorscope) opposite, top right. Each window
-            # has its own set: in Double they are two different images and
+            # has its own set: in Sync they are two different images and
             # measuring them with one scope would make no sense.
             ctrl = ControlStack(self._stage, below=sb)
             ctrl.cc.changed.connect(lambda vals, s=slot: self._on_cc(s, vals))
@@ -820,6 +822,13 @@ class PlayerPanel(QtWidgets.QWidget):
                 # expanding or enlarging a panel = compute that scope right away
                 scope.resized.connect(lambda s=slot: self._refresh_scopes(s))
             slot.scopes = sc
+
+            # A META PANEL PER WINDOW, not one for the picture. In Sync the two
+            # windows are two different files, so one shared panel could only
+            # ever be right about one of them - and which one was not even
+            # written down anywhere.
+            slot.meta = overlay_mod.MetaPanel(self._stage)
+            slot.meta.hide()
             # in Wipe the controls of input B stand below those of input A, so
             # when A changes height (collapse, on/off), B has to move
             ctrl.refitted.connect(self._place_overlays)
@@ -849,6 +858,7 @@ class PlayerPanel(QtWidgets.QWidget):
         self._annot_bar.clearWanted.connect(self._annot_clear)
         self._annot_bar.hide()
         # a panel of its own, so picking a tool up does not resize the strip
+
         self._annot_opts = overlay_mod.AnnotOptions(self._stage)
         self._annot_opts.colorChanged.connect(self._on_annot_color)
         self._annot_opts.sizeChanged.connect(self._on_annot_size)
@@ -870,9 +880,9 @@ class PlayerPanel(QtWidgets.QWidget):
         self._stage.wipeOpacityChanged.connect(self._on_wipe_opacity)
         root.addWidget(self._stage, 1)
 
-        # the default state (Single) has to apply straight away - _apply_settings
+        # the default state (Base) has to apply straight away - _apply_settings
         # would not set it when it matches the node's default value
-        self._apply_view_mode(exrnode.VIEW_SINGLE)
+        self._apply_view_mode(exrnode.VIEW_BASE)
 
         # timeline (cache bar, frame numbers, mark IN/OUT and playhead in one)
         self.timeline = Timeline(self)
@@ -1006,7 +1016,8 @@ class PlayerPanel(QtWidgets.QWidget):
             "       C CC, Q QC, H histogram, V vectorscope, W waveform\n"
             "       F fit into the window\n"
             "       1-7 QC modes, I/O mark in/out, P freeze the readout\n"
-            "       X switch window (in Double), - swap Comp/Plate")
+            "       M metadata (both EXR headers, bottom left)\n"
+            "       X switch window (in Sync), - swap Comp/Plate")
         self._status.setContentsMargins(4, 0, 4, 2)
         root.addWidget(self._status)
 
@@ -1153,7 +1164,7 @@ class PlayerPanel(QtWidgets.QWidget):
                 view.set_viewport(state)
 
     def _apply_view_mode(self, mode=None, split=None):
-        """Single / Double / Wipe and how the window is split in Double."""
+        """Base / Sync / Wipe and how the window is split in Sync."""
         if mode is not None:
             self._view_mode = max(0, min(len(exrnode.VIEW_MODES) - 1, int(mode)))
         if split is not None:
@@ -1163,7 +1174,7 @@ class PlayerPanel(QtWidgets.QWidget):
         # The per-window bars and stacks are hidden by _apply_slot_visibility
         # (called just above) and kept hidden by _apply_panel_flags - deciding
         # it here as well would be a third opinion on the same thing.
-        # Annotation looks like Single - one window with its usual controls -
+        # Annotation looks like Base - one window with its usual controls -
         # and adds the tool strip under them.
         annot_on = self._view_mode == exrnode.VIEW_ANNOTATE
         self._annot_bar.setVisible(annot_on)
@@ -1193,7 +1204,7 @@ class PlayerPanel(QtWidgets.QWidget):
             self._mode_combo.blockSignals(True)
             self._mode_combo.setCurrentIndex(self._view_mode)
             self._mode_combo.blockSignals(False)
-        # Single/Double decides whether the scopes are available -> reapply the panels
+        # Base/Sync decides whether the scopes are available -> reapply the panels
         for slot in self._slots:
             self._apply_panel_flags(self._settings, slot)
         self._sync_panel_buttons(self._settings)
@@ -1206,7 +1217,7 @@ class PlayerPanel(QtWidgets.QWidget):
         """Which windows are visible, which is active and where its controls go."""
         both = self._both_slots()
         if not both:
-            self._active = 0              # in Single window 1 is always active
+            self._active = 0              # in Base window 1 is always active
         visible = self._live_slots_all()
         # In Difference the one panel replaces the per-window bars and stacks.
         # The WINDOWS still show - it is only their furniture that goes. This
@@ -1228,7 +1239,7 @@ class PlayerPanel(QtWidgets.QWidget):
     def _place_overlays(self):
         """Where each window's controls belong.
 
-        In Single and Double they sit in the corner of their window. In Wipe
+        In Base and Sync they sit in the corner of their window. In Wipe
         the windows overlap, so the controls would overlap too - therefore they
         stand one below the other: input A first, input B below it.
         """
@@ -1270,6 +1281,7 @@ class PlayerPanel(QtWidgets.QWidget):
             self._annot_opts.set_anchor(
                 overlay_mod.EDGE,
                 self._annot_bar.bottom() + overlay_mod.EDGE)
+        self._place_meta()
         self._raise_overlays()
 
     def _raise_overlays(self):
@@ -1279,6 +1291,8 @@ class PlayerPanel(QtWidgets.QWidget):
         if self._annot_opts.isVisible():
             self._annot_opts.raise_()
         for slot, sb in zip(self._slots, self._slot_bars):
+            if slot.meta is not None and slot.meta.isVisible():
+                slot.meta.raise_()
             sb.raise_()
             slot.controls.raise_()
             slot.scopes.raise_()
@@ -1286,7 +1300,7 @@ class PlayerPanel(QtWidgets.QWidget):
     def _set_active_slot(self, index):
         """Switches which window the scopes and the pixel readout read from.
 
-        It only makes sense in Double - in Single only window 1 is visible, so
+        It only makes sense in Sync - in Base only window 1 is visible, so
         that is the active one too.
         """
         index = max(0, min(len(self._slots) - 1, int(index)))
@@ -1313,7 +1327,7 @@ class PlayerPanel(QtWidgets.QWidget):
     # A key per toggle, matching the letter on it. Fit sits on F, so that H is
     # left for the histogram.
     PANEL_KEYS = {"cc": "C", "qc": "Q", "hist": "H", "vscope": "V",
-                  "wave": "W"}
+                  "wave": "W", "meta": "M"}
 
     def _flag(self, s, name, slot, default=False):
         """The value of a per-window setting. On the node it is a tuple, one item per window."""
@@ -1322,20 +1336,11 @@ class PlayerPanel(QtWidgets.QWidget):
             return value[slot.index] if slot.index < len(value) else default
         return value                      # an older node had one shared value
 
-    def _set_slot_value(self, s, name, slot, value):
-        """Sets a tuple item for one window and returns the new settings dict."""
-        values = list(s.get(name, ()))
-        while len(values) <= slot.index:
-            values.append(False)
-        values[slot.index] = value
-        s[name] = tuple(values)
-        return s
-
     def _toggle_panel(self, key):
         """The C/Q/H/V/W keys: toggle a panel of the ACTIVE window.
 
-        In Single that is window 1, in Double the one you touched last. The
-        scopes are unavailable in Double, so there the key stays silent - just
+        In Base that is window 1, in Sync the one you touched last. The
+        scopes are unavailable in Sync, so there the key stays silent - just
         like the greyed-out toggle.
         """
         if key in overlay_mod.SCOPE_KEYS and not self._scopes_allowed():
@@ -1382,12 +1387,12 @@ class PlayerPanel(QtWidgets.QWidget):
         self._toggle_note_t = time.monotonic()
 
     def _scopes_allowed(self):
-        """The scopes are Single only.
+        """The scopes are Base only.
 
-        In Double each window is half the size and the histogram with the
+        In Sync each window is half the size and the histogram with the
         vectorscope would leave almost nothing of it. The setting on the node
         is NOT overwritten - it just does not apply for the time being, so
-        after going back to Single the scope is exactly as it was.
+        after going back to Base the scope is exactly as it was.
         """
         return not self._double()
 
@@ -1415,9 +1420,104 @@ class PlayerPanel(QtWidgets.QWidget):
         wave = self._flag(s, "wave", slot) and scopes_ok
         slot.scopes.set_visibility(hist, vscope, wave)
         slot.scopes.set_scope_active(hist, vscope, wave)
+        self._sync_meta()
         self._on_cc(slot, slot.controls.cc.values())                  # cc
         self._apply_effect(slot, slot.controls.fx.combo.currentIndex())  # qc
         self._refresh_scopes(slot)
+
+    def _meta_wanted(self, slot=None):
+        """Is META on - for this window, or for any of them at all?"""
+        if self._view_mode == exrnode.VIEW_OVERLAY:
+            return False              # that mode has its own single panel
+        shown = self._live_slots_all()
+        if slot is not None:
+            return slot in shown and self._flag(self._settings, "meta", slot)
+        return any(self._flag(self._settings, "meta", sl) for sl in shown)
+
+    def _meta_sources(self, slot):
+        """Which inputs THIS window is showing, as indices into _sequences.
+
+        Normally the one it is set to. The comparisons are the exception: a
+        difference, a wipe and a matte all put both files in one window, so
+        naming only one of them would be a lie about what is on screen.
+        """
+        if (self._view_mode == exrnode.VIEW_DIMATTE
+                or fx.needs_other(slot.view.effect)):
+            return [0, 1]
+        # Wipe has two live windows, one input each, so it is NOT a case for
+        # both - the wipe line splits the picture, it does not merge the files.
+        return [slot.source]
+
+    def _sync_meta(self):
+        """Fills the META panel from the headers of the current frame.
+
+        Read per frame, not once per sequence: timecode and the frame-varying
+        attributes change with it, and a header is a kilobyte at the front of
+        the file - measured 0.05 ms - so following the playhead is free. Only
+        while the panel is open, though; there is no reason to touch the disk
+        for something nobody is looking at.
+        """
+        if self._node_name:
+            # So the table on the node can ask for a read of its own, which it
+            # has to be able to do with the panels switched off.
+            meta_mod.set_harvester(self._node_name, self._harvest_meta)
+        if not self._meta_wanted():
+            for slot in self._slots:
+                if slot.meta is not None:
+                    slot.meta.setVisible(False)
+            return
+
+        rows = self._harvest_meta()
+        if self._node_name:
+            meta_mod.set_available(self._node_name, rows)
+        order = meta_mod.parse_order(self._settings.get("meta_keys", ""))
+
+        for slot in self._slots:
+            if slot.meta is None:
+                continue
+            on = self._meta_wanted(slot)
+            slot.meta.setVisible(on)
+            if not on:
+                continue
+            # Only the inputs this window is actually showing. What is DRAWN is
+            # also the node's choice, in the node's order; what is HARVESTED is
+            # everything the files have, or the panel would be a wall of forty
+            # attributes and the node tab would have nothing left to offer.
+            tags = {exrnode.INPUT_TAGS[i] for i in self._meta_sources(slot)}
+            mine = [r for r in rows if r[0] in tags]
+            shown = meta_mod.select(mine, order)
+            if shown != slot.meta_rows:
+                slot.meta_rows = shown
+                # THE NAME, not the letter. C and P are how the choice is
+                # stored and how the bars label themselves, where there is
+                # room for one glyph and no more; a metadata panel has the
+                # width to say Comp, so it says Comp.
+                slot.meta.set_rows([(exrnode.input_name(t), k, v) for t, k, v in shown])
+        self._place_meta()
+
+    def _harvest_meta(self):
+        """[(tag, key, value)] from the headers of both inputs on this frame."""
+        rows = []
+        for i, label in enumerate(exrnode.INPUT_TAGS):
+            seq = self._sequences[i] if i < len(self._sequences) else None
+            if seq is None:
+                continue
+            try:
+                pairs = reader.metadata(seq.path_for(self.frame))
+            except Exception:
+                continue              # a missing frame is not worth a traceback
+            for key, value in pairs:
+                rows.append((label, key, value))
+        return rows
+
+    def _place_meta(self):
+        """Bottom left of the window it belongs to."""
+        for slot in self._slots:
+            if slot.meta is None or not slot.meta.isVisible():
+                continue
+            box = slot.view.geometry()
+            slot.meta.set_anchor(box.x() + overlay_mod.EDGE,
+                                 box.bottom() - overlay_mod.EDGE)
 
     def _sync_panel_buttons(self, s):
         """A toggle lights up when the panel is on in that window."""
@@ -1671,7 +1771,7 @@ class PlayerPanel(QtWidgets.QWidget):
         else:
             params = self._overlay_params.setdefault(
                 self._overlay_qc, fx.defaults(self._overlay_qc))
-            top.view.set_effect(self._overlay_qc, params)
+            top.view.set_effect(self._overlay_qc, self._with_diff_look(params))
             top.legend = fx.legend(self._overlay_qc)
         # the comparison reads the OTHER window's frame, so both have to be
         # decoded and in the cache before it can draw anything
@@ -1694,7 +1794,20 @@ class PlayerPanel(QtWidgets.QWidget):
         if self._overlay_qc == fx.NONE:
             return
         self._overlay_params[self._overlay_qc] = dict(values)
-        self._slots[1].view.set_effect_params(dict(values))
+        self._slots[1].view.set_effect_params(self._with_diff_look(values))
+
+    def _with_diff_look(self, values):
+        """The comparison parameters plus the two that live on the node.
+
+        The check itself does not care where a value was set, so the colour and
+        the intensity are simply folded in here - that way there is one place
+        that knows they come from the node, instead of the check having to ask.
+        """
+        out = dict(values)
+        if self._overlay_qc == fx.DIFF:
+            out["color"] = self._settings.get("diff_color", 0)
+            out["intensity"] = self._settings.get("diff_intensity", 1.0)
+        return out
 
     def _on_overlay_layer(self, index, layer):
         """A layer picked in the Overlay panel - the same path a slot bar takes."""
@@ -1764,7 +1877,7 @@ class PlayerPanel(QtWidgets.QWidget):
         self._apply_view_mode(mode=index)
         self._write_knob("cv_view_mode", self._view_mode)
         self._settings["view_mode"] = self._view_mode
-        # in Single there is no point showing the settings of window 2 on the node
+        # in Base there is no point showing the settings of window 2 on the node
         node = self._get_node()
         if node is not None:
             exrnode.apply_view_visibility(node)
@@ -1784,7 +1897,7 @@ class PlayerPanel(QtWidgets.QWidget):
 
         The quickest A/B there is: one key, the same frame, the same zoom and
         pan, so the two land on the eye in the same place. Wired to the ACTIVE
-        window, so it does the obvious thing in Double as well.
+        window, so it does the obvious thing in Sync as well.
         """
         slot = self.active
         if slot is None or len(self._sequences) < 2:
@@ -1951,15 +2064,16 @@ class PlayerPanel(QtWidgets.QWidget):
             return ("node '%s' has only one input (it is from an earlier "
                     "version) - create a new one for A/B: JKplayer > Create "
                     "JKplayer Node" % node.name())
-        return ("input %s is empty - attach a Read with .exr to it "
+        return ("input %s is empty - attach a Read with %s to it "
                 "(a Dot in between is fine)"
-                % " and ".join(sorted(set(empty))))
+                % (" and ".join(sorted(set(empty))),
+                   " or ".join(exrnode.sequence.READABLE)))
 
     def _live_slots_all(self):
         """Windows that are VISIBLE (even when they currently have no sequence).
 
-        In Single it is ALWAYS window 1 - "single" means one view, not a switch
-        between two. Whoever wants to see both switches to Double.
+        In Base it is ALWAYS window 1 - "single" means one view, not a switch
+        between two. Whoever wants to see both switches to Sync.
         """
         return self._slots if self._double() else [self._slots[0]]
 
@@ -2050,16 +2164,16 @@ class PlayerPanel(QtWidgets.QWidget):
             view.qc_full_play = qc_full
             if qc_changed:
                 view.invalidate()
-        # the window sources before the mode: switching to Double reveals the
+        # the window sources before the mode: switching to Sync reveals the
         # second window and it should already know which input it shows
         for i, slot in enumerate(self._slots):
             want = s.get("sources", ())
             want = want[i] if i < len(want) else slot.source
             if want != slot.source:
                 self._set_source(slot, want)
-        if (s.get("view_mode", exrnode.VIEW_SINGLE) != old.get("view_mode")
+        if (s.get("view_mode", exrnode.VIEW_BASE) != old.get("view_mode")
                 or s.get("split", exrnode.SPLIT_SIDE) != old.get("split")):
-            self._apply_view_mode(s.get("view_mode", exrnode.VIEW_SINGLE),
+            self._apply_view_mode(s.get("view_mode", exrnode.VIEW_BASE),
                                   s.get("split", exrnode.SPLIT_SIDE))
         if any(s.get(k) != old.get(k)
                for k in ("color_mgmt", "ocio_config", "ocio_display",
@@ -2549,7 +2663,7 @@ class PlayerPanel(QtWidgets.QWidget):
     def _frame_cached(self, frame):
         """Is the frame cached for ALL visible inputs?
 
-        In Double there is no point jumping to a frame only one window has -
+        In Sync there is no point jumping to a frame only one window has -
         it would be compared against whatever was left in the other one.
         """
         live = self._live_slots()
@@ -2818,7 +2932,7 @@ class PlayerPanel(QtWidgets.QWidget):
     def _show_probe(self, info, slot=None):
         """Scene-linear RGBA of the pixel under the cursor, coloured per channel.
 
-        The values come from the window the mouse is over - so in Double the
+        The values come from the window the mouse is over - so in Sync the
         input of that window is written in front of them.
         """
         # The marker on the scopes follows the cursor. It goes to the window
@@ -3102,7 +3216,7 @@ class PlayerPanel(QtWidgets.QWidget):
 
         In a comparison _live_slots returns BOTH inputs even though only one
         window is on screen, so two sizes are listed - and then they have to
-        say WHICH is which. They used to be tagged only in Double, which left
+        say WHICH is which. They used to be tagged only in Sync, which left
         a difference reading "3780x2520 || 4096x2160" with no way to tell
         which one was being fitted onto the other.
         """
@@ -3117,6 +3231,12 @@ class PlayerPanel(QtWidgets.QWidget):
                                           slot.source_info) if tagged
                          else "%s  [%s]" % (name, slot.source_info))
         return "   ||   ".join(parts)
+
+    def _meta_tick(self):
+        """Re-read the headers when the frame moved. Cheap; see _sync_meta."""
+        if any(sl.meta is not None and sl.meta.isVisible()
+               for sl in self._slots):
+            self._sync_meta()
 
     def _refresh_status(self):
         if not self._playing:

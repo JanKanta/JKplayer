@@ -6,8 +6,8 @@ files ourselves), so it is just a settings holder. Python = no compilation, no
 DLL locked while Nuke runs, instant changes.
 
 Rules (the v2 brief):
-  * two inputs A and B, and ONLY Read nodes with .exr (anything else is
-    disconnected)
+  * two inputs A and B, and ONLY Read nodes with a format we decode ourselves
+    (see sequence.READABLE - anything else is disconnected)
   * the inputs may cover different frame ranges - it is only reported, and
     the shorter one holds its end frame
   * a Viewer node cannot be attached
@@ -51,6 +51,16 @@ INPUT_KEYS = ("a", "b")
 INPUT_LABELS = ("Comp", "Plate")
 INPUT_TAGS = ("C", "P")
 
+
+def input_name(tag):
+    """"C" -> "Comp". The letter is for storage and for the buttons in the
+    image, where one glyph is all that fits; anything wider says the name."""
+    try:
+        return str(INPUT_LABELS[list(INPUT_TAGS).index(tag)])
+    except (ValueError, IndexError):
+        return str(tag)
+
+
 # The third input carries mattes in its RGBA channels. It is not an image, so a
 # window does not pick it as a source - it is only used in DiMatte mode to draw
 # a coloured overlay over what is visible.
@@ -76,9 +86,9 @@ SLOT_LABELS = ("1", "2")
 
 # CAREFUL when adding one: a .nk stores an enumeration by its NAME, so the
 # order here may change, but a name that has been released must not.
-(VIEW_SINGLE, VIEW_DOUBLE, VIEW_OVERLAY, VIEW_WIPE, VIEW_DIMATTE,
+(VIEW_BASE, VIEW_SYNC, VIEW_OVERLAY, VIEW_WIPE, VIEW_DIMATTE,
  VIEW_ANNOTATE) = range(6)
-VIEW_MODES = ["Single", "Double", "Difference", "Wipe", "DiMatte", "Annotation"]
+VIEW_MODES = ["Base", "Sync", "Difference", "Wipe", "DiMatte", "Annotation"]
 
 SPLIT_SIDE, SPLIT_STACK = range(2)
 SPLIT_MODES = ["Side by side", "Stacked"]
@@ -90,7 +100,7 @@ MGMT_NUKE, MGMT_OCIO = range(2)      # the order of the items in cv_color_mgmt
 # disabled one neither. There used to be two checkboxes (compute / show) and
 # there was no telling which one applied - the button in the image toggled both
 # anyway.
-# Everything is OFF by default: the panel opens on a clean image in Single and
+# Everything is OFF by default: the panel opens on a clean image in Base and
 # you switch on what you need. CC on at startup would push a colour correction
 # into the image and QC on would push some check mode straight away.
 PANELS = (
@@ -107,9 +117,11 @@ PANELS = (
      "Pixel colour as it is on screen (angle = hue, radius = saturation)."),
     ("wave", "Waveform", False,
      "Values along the image columns (0 at the bottom, 55 at the top, line at 1.0)."),
+    ("meta", "META", False,
+     "The EXR headers of both inputs, bottom left of the image."),
 )
 
-# Panels available only in Single (greyed out in the image, hidden on the
+# Panels available only in Base (greyed out in the image, hidden on the
 # node). A test checks that this matches overlay.SCOPE_KEYS - overlay
 # deliberately does not import node, so it stays free of any nuke dependency.
 SCOPE_KEYS = ("hist", "vscope", "wave")
@@ -196,7 +208,7 @@ def _add_knobs(node):
     # The view mode comes first: it decides what else on the node makes sense
     # at all. Here and at the top of the panel - both sides follow each other.
     k = nuke.Enumeration_Knob("cv_view_mode", "View", VIEW_MODES)
-    k.setTooltip("Single = one window (always window 1), Double = both.\n"
+    k.setTooltip("Base = one window (always window 1), Sync = both.\n"
                  "The same control is at the top left of the panel.")
     add(k)
 
@@ -347,6 +359,25 @@ def _add_knobs(node):
                  "down dissolves the comparison back over A.")
     add(k)
 
+    k = nuke.Enumeration_Knob("cv_diff_color", "Difference colour",
+                              list(effects.DIFF_COLOR_NAMES))
+    k.setTooltip("The colour Difference fills the changed places with, in the\n"
+                 "Difference view mode.\n"
+                 "All of them are dark and low in saturation on purpose: they\n"
+                 "are unmistakable over the picture, but they do not pull the\n"
+                 "eye the way a pure colour would and do not read as an error.\n"
+                 "Set here and not in the image - it is a look you pick once,\n"
+                 "not something touched while comparing.")
+    add(k)
+
+    k = nuke.Double_Knob("cv_diff_intensity", "Difference intensity")
+    k.setValue(1.0)
+    k.setRange(0.0, 8.0)
+    k.setTooltip("How bright that colour is drawn. 0 leaves the picture\n"
+                 "untouched, which is a quick way to see what is underneath\n"
+                 "the overlay without switching the comparison off.")
+    add(k)
+
     k = nuke.Double_Knob("cv_overlay_mix", "Overlay mix")
     k.setValue(1.0)
     k.setRange(0.0, 1.0)
@@ -356,7 +387,7 @@ def _add_knobs(node):
     add(k)
 
     k = nuke.Enumeration_Knob("cv_split", "Image split", SPLIT_MODES)
-    k.setTooltip("How the window is split in Double.\n"
+    k.setTooltip("How the window is split in Sync.\n"
                  "It is always split exactly in half, so the divider stays in\n"
                  "the middle even when the panel is resized to another aspect.\n"
                  "Zoom and pan are shared - the pixels line up.")
@@ -372,7 +403,7 @@ def _add_knobs(node):
         k.setValue(min(i, len(INPUT_LABELS) - 1))     # window 1 = A, window 2 = B
         add_hidden(k)
 
-    # EVERY WINDOW has its own panels - in Double two different images are
+    # EVERY WINDOW has its own panels - in Sync two different images are
     # being compared and each deserves its own scope and its own check mode.
     for slot in SLOT_LABELS:
         add(nuke.Text_Knob("cv_panels_head_%s" % slot,
@@ -389,7 +420,7 @@ def _add_knobs(node):
             add(k)
 
         # Opacity belongs with the scopes, so it sits right below them. It is
-        # shared and the scopes only exist in Single, so window 1 is enough.
+        # shared and the scopes only exist in Base, so window 1 is enough.
         if slot == SLOT_LABELS[0]:
             k = nuke.Double_Knob("cv_scope_opacity", "Scope opacity")
             k.setValue(DEFAULT_SCOPE_OPACITY)
@@ -469,6 +500,28 @@ def _add_knobs(node):
                      "For the usual 'it is one frame out' - the placement stays "
                      "where it is and this says by how much." % label)
         add(k)
+
+    # ---- Metadata ----
+    add(nuke.Tab_Knob("cv_meta_tab", "Metadata"))
+
+    # The chosen fields and their order, as text. A knob so it is saved with
+    # the script; a STRING so it can be read in the .nk and fixed by hand if it
+    # ever has to be. One "tag:key" per line, top line drawn first.
+    k = nuke.Multiline_Eval_String_Knob("cv_meta_keys", "Shown")
+    k.setValue("")
+    k.setFlag(nuke.INVISIBLE)
+    add(k)
+
+    # No explanatory paragraph here: the two panels are labelled Available and
+    # META, the arrows point at what they do, and the tooltips carry the rest.
+    try:
+        k = nuke.PyCustom_Knob(
+            "cv_meta_table", "",
+            "__import__('jkplayer.metaknob', fromlist=['x']).MetaKnob"
+            "(nuke.thisNode().name(), 'cv_meta_keys')")
+        add(k)
+    except Exception as exc:                  # pragma: no cover - old Nuke
+        nuke.tprint("JKplayer: no metadata table (%s)" % exc)
 
     # ---- Cache ----
     add(nuke.Tab_Knob("cv_cache_tab", "Cache"))
@@ -619,20 +672,14 @@ OCIO_KNOBS = ("cv_ocio_config", "cv_ocio_input", "cv_ocio_display",
 NUKE_KNOBS = ("cv_nuke_display", "cv_nuke_input")
 
 
-def slot_knobs(slot):
-    """The knobs belonging to one window (apart from the hidden ones)."""
-    return (["cv_panels_head_%s" % slot, "cv_effect_%s" % slot]
-            + ["cv_%s_%s" % (key, slot) for key, _l, _d, _t in PANELS])
-
-
 def apply_view_visibility(node):
     """Shows only what makes sense in the current state.
 
     A setting that cannot change anything is worse than no setting at all - a
     person toggles it and wonders why nothing happened. Hence:
-      * the image split only in Double (in Single there is nothing to split)
-      * window 2 only in Double
-      * the histogram and the vectorscope only in Single (in Double they are
+      * the image split only in Sync (in Base there is nothing to split)
+      * window 2 only in Sync
+      * the histogram and the vectorscope only in Base (in Sync they are
         not available, see overlay.SCOPE_KEYS)
       * the QC mode only when the QC panel is on
     """
@@ -640,14 +687,14 @@ def apply_view_visibility(node):
         mode = int(node["cv_view_mode"].getValue())
     except Exception:
         return
-    both = mode in (VIEW_DOUBLE, VIEW_WIPE, VIEW_OVERLAY)   # two live windows
-    # DiMatte is like Single: one window, only with mattes over it
+    both = mode in (VIEW_SYNC, VIEW_WIPE, VIEW_OVERLAY)   # two live windows
+    # DiMatte is like Base: one window, only with mattes over it
 
     def show(name, want):
         if name in node.knobs():
             node[name].setVisible(bool(want))
 
-    show("cv_split", mode == VIEW_DOUBLE)     # a wipe is not split, it overlaps
+    show("cv_split", mode == VIEW_SYNC)     # a wipe is not split, it overlaps
     show("cv_wipe_opacity", mode == VIEW_WIPE)
     show("cv_overlay_mix", mode == VIEW_OVERLAY)
     show("cv_overlay_qc", mode == VIEW_OVERLAY)
@@ -655,27 +702,34 @@ def apply_view_visibility(node):
                  "cv_annot_pen", "cv_annot_text", "cv_annot_line",
                  "cv_annot_scopes", "cv_annot_stamp", "cv_annot_csv"):
         show(name, mode == VIEW_ANNOTATE)
-    show("cv_scope_opacity", not both)        # belongs to the scopes, Single only
+    show("cv_scope_opacity", not both)        # belongs to the scopes, Base only
     show("cv_matte_head", mode == VIEW_DIMATTE)
     show("cv_matte_source", mode == VIEW_DIMATTE)
     # The layer applies to EITHER source - a DiMatte input is an EXR too and
     # may carry its mattes in a layer of its own - so it is offered for both.
     show("cv_matte_layer", mode == VIEW_DIMATTE)
+    show("cv_diff_color", mode == VIEW_OVERLAY)
+    show("cv_diff_intensity", mode == VIEW_OVERLAY)
     for name in ("cv_matte_light", "cv_matte_gain", "cv_matte_gamma"):
         show(name, mode == VIEW_DIMATTE)
     for ch in MATTE_CHANNELS:
         show("cv_matte_%s" % ch, mode == VIEW_DIMATTE)
-    for i, slot in enumerate(SLOT_LABELS):
-        used = both or i == 0
-        show("cv_panels_head_%s" % slot, used)
+    for slot in SLOT_LABELS:
+        # The CC / QC / histogram / vectorscope / waveform switches are NOT on
+        # the node any more, and neither is the heading that sat over them.
+        # The buttons inside the image do exactly the same thing and are where
+        # you are already looking; two controls for one state only ever raise
+        # the question of which one is in charge. They stay as KNOBS, so the
+        # choice is still saved with the script - just invisible.
+        show("cv_panels_head_%s" % slot, False)
         for key, _l, _d, _t in PANELS:
-            show("cv_%s_%s" % (key, slot),
-                 used and not (both and key in SCOPE_KEYS))
-        try:
-            qc_on = bool(node["cv_qc_%s" % slot].value())
-        except Exception:
-            qc_on = True
-        show("cv_effect_%s" % slot, used and qc_on)
+            show("cv_%s_%s" % (key, slot), False)
+        # The check is not on the node either. Which check is running is a
+        # thing of the moment - you press 1 to 7 while looking at the picture
+        # and watch what it does - and the panel in the image is where that
+        # happens. A copy of it on the node is a second place to set the same
+        # state, with no way to see the result from there.
+        show("cv_effect_%s" % slot, False)
 
 
 def apply_color_visibility(node):
@@ -990,7 +1044,7 @@ def settings(node):
                         or exrcore.ROOT_LAYER for s in SLOT_LABELS),
         "sources": tuple(enum("cv_source_%s" % s, min(i, 1))
                          for i, s in enumerate(SLOT_LABELS)),
-        "view_mode": enum("cv_view_mode", VIEW_SINGLE),
+        "view_mode": enum("cv_view_mode", VIEW_BASE),
         "split": enum("cv_split", SPLIT_SIDE),
         "channels": enum("cv_channels", 0),      # 0 RGB,1 R,2 G,3 B,4 A,5 Luma
         "color_mgmt": enum("cv_color_mgmt", MGMT_NUKE),
@@ -1004,6 +1058,8 @@ def settings(node):
         "wipe_opacity": float(val("cv_wipe_opacity", 1.0)),
         "overlay_mix": float(val("cv_overlay_mix", 1.0)),
         "overlay_qc": enum("cv_overlay_qc", 0),
+        "diff_color": enum("cv_diff_color", 0),
+        "diff_intensity": float(val("cv_diff_intensity", 1.0)),
         "annot_dir": str(val("cv_annot_dir", "")),
         "annot_name": str(val("cv_annot_name", "annotation_####.jpg")),
         "annot_color": enum("cv_annot_color", 0),
@@ -1013,6 +1069,7 @@ def settings(node):
         "annot_scopes": bool(val("cv_annot_scopes", False)),
         "annot_csv": bool(val("cv_annot_csv", True)),
         "annot_stamp": bool(val("cv_annot_stamp", True)),
+        "meta_keys": str(val("cv_meta_keys", "")),
         "matte_source": enum("cv_matte_source", MATTE_FROM_INPUT),
         "matte_layer": str(val("cv_matte_layer", exrcore.ROOT_LAYER)),
         "matte": tuple(bool(val("cv_matte_%s" % ch, False))
@@ -1030,7 +1087,7 @@ def settings(node):
 
 
 # ---------------------------------------------------------------------------
-# Input policing: only a Read with .exr, no Viewer
+# Input policing: only a Read we can decode ourselves, no Viewer
 # ---------------------------------------------------------------------------
 def enforce_no_viewer():
     """Disconnects every Viewer that has an JKplayer node on its input.
@@ -1118,9 +1175,10 @@ def _enforce_one(node, index):
         path = read["file"].value()
     except Exception:
         path = ""
-    if not path.lower().endswith(".exr"):
+    if not sequence.is_exr(path):
         node.setInput(index, None)
-        return "Input %s: the Read must point at an .exr sequence." % label
+        return ("Input %s: the Read must point at %s."
+                % (label, " or ".join(sequence.READABLE)))
     return None
 
 

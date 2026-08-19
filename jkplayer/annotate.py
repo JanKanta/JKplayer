@@ -26,10 +26,6 @@ COLOR_NAMES = ("Red", "Yellow", "Green", "Blue", "White", "Black")
 LINE_W = 3.0            # in IMAGE pixels, so the stroke keeps its weight
 TEXT_H = 34.0           # cap height of a note, also in image pixels
 
-# The mark in the timeline, and the tint over the annotated frames.
-MARK = QtGui.QColor(70, 150, 255)
-
-
 def look_key(look):
     """What makes two views the same for annotation purposes.
 
@@ -40,21 +36,6 @@ def look_key(look):
     if not look:
         return (None, None)
     return (look.get("effect"), look.get("channels"))
-
-
-def same_view(a, b):
-    """Do two looks show the same THING?
-
-    Only the check and the channels count. A note is about what is on screen,
-    so it has no business over a different check - but nudging the exposure, or
-    a slider of the very check it was drawn in, must not make it disappear.
-
-    A missing look means a note from before any were recorded; those belong
-    everywhere rather than nowhere.
-    """
-    if a is None or b is None:
-        return True
-    return look_key(a) == look_key(b)
 
 
 class Annotations(object):
@@ -95,9 +76,6 @@ class Annotations(object):
             else:
                 out.append([f, f])
         return out
-
-    def is_empty(self):
-        return not (self._strokes or self._texts)
 
     # ---- editing -------------------------------------------------------
     def add_stroke(self, frame, points, color=0, width=LINE_W, look=None):
@@ -298,10 +276,6 @@ class Annotations(object):
                 else:
                     del store[frame]
         return removed
-
-    def clear_all(self):
-        self._strokes.clear()
-        self._texts.clear()
 
     # ---- drawing -------------------------------------------------------
     def draw(self, painter, frame, ox=0.0, oy=0.0, zoom=1.0, look=None,

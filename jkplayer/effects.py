@@ -87,13 +87,6 @@ MATTE_COLORS = ((255, 48, 48), (48, 255, 72), (64, 110, 255), (240, 240, 240))
 
 DIFF_COLORS = [(38, 46, 68), (38, 60, 44), (68, 42, 42)]
 DIFF_COLOR_NAMES = ["Blue-grey", "Green-grey", "Red-grey"]
-DIFF_COLOR = DIFF_COLORS[0]
-DIFF_OVERLAY, DIFF_PLAIN = 0, 1
-DIFF_MODES = ["Overlay", "Difference"]
-DIFF_PLAIN_GAIN = 8.0        # so that an intensity of 1.00 on the plain
-                             # difference matches how it looked with the
-                             # original gain
-
 # A marker in PARAMS: parameters tagged like this are not drawn as separate
 # sliders but as ONE slider with several handles (see overlay._BandSlider).
 BANDS = "bands"
@@ -141,13 +134,11 @@ PARAMS = {
         ("black", "Black level", 0.0, 0.5, 0.0, 3),
     ],
     DIFF: [
-        # a seventh element = a menu instead of a slider (see overlay.EffectPanel)
-        ("mode", "Display", 0, len(DIFF_MODES) - 1, DIFF_OVERLAY, 0,
-         DIFF_MODES),
-        ("color", "Overlay colour", 0, len(DIFF_COLORS) - 1, 0, 0,
-         DIFF_COLOR_NAMES),
+        # Threshold is the only thing left in the image. The colour and the
+        # intensity moved to the NODE: they are a look you set once for a
+        # session, not something touched while comparing, and every row here
+        # is a row of picture you cannot see.
         ("threshold", "Threshold", 0.0, 0.2, 0.01, 3),
-        ("intensity", "Intensity", 0.0, 8.0, 1.0, 2),
     ],
     GRAIN: [
         ("contrast", "Grain contrast", 1.0, 40.0, GRAIN_CONTRAST, 1),
@@ -335,13 +326,13 @@ def needs_other(effect):
     return effect in NEEDS_BOTH
 
 
-def diff_is_overlay(params):
-    """Is an overlay drawn over the image (rather than a plain difference)?"""
-    return int(round(param(params, "mode", DIFF_OVERLAY))) == DIFF_OVERLAY
-
-
 def difference_color(params):
-    """The overlay colour including the intensity."""
+    """The overlay colour including its intensity.
+
+    Both come off the NODE (cv_diff_color, cv_diff_intensity) and are passed in
+    with the rest of the parameters, so the check itself does not care where
+    they were set.
+    """
     idx = max(0, min(len(DIFF_COLORS) - 1, int(round(param(params, "color", 0)))))
     intensity = max(0.0, param(params, "intensity", 1.0))
     return tuple(min(255, int(round(c * intensity))) for c in DIFF_COLORS[idx])
@@ -373,33 +364,24 @@ def difference_mask(cur, other, lut, params=None):
 def difference(cur, other, lut, params=None, threads=1):
     """The difference of two inputs. `cur` and `other` are (h,w,4) half scene-linear.
 
+    THE IMAGE STAYS AND WHAT CHANGED IS COLOURED IN. There used to be a second
+    display, a plain |A-B|, and it was dropped: the high-pass difference in the
+    same menu already answers "how much do they differ", it answers it better,
+    and a plain difference of two graded plates lights up everywhere and says
+    nothing. What this one is for is WHERE they differ, which wants the picture
+    left underneath to point at.
+
     Computed in the display domain (through `lut`), not in scene-linear: the
-    threshold and the gain then mean the same thing a person sees on screen,
-    and it does not matter whether the plate is log or linear. Everything runs
-    in uint8 - the difference of two bytes is a whole number 0-255, so a table
-    is enough for the gain.
+    threshold then means the same thing a person sees on screen, and it does
+    not matter whether the plate is log or linear.
     """
-    overlay = diff_is_overlay(params)
-    color = difference_color(params) if overlay else None
-    intensity = max(0.0, param(params, "intensity", 1.0))
-    table = np.clip(np.arange(256, dtype=np.float32)
-                    * (intensity * DIFF_PLAIN_GAIN), 0, 255).astype(np.uint8)
+    color = difference_color(params)
 
     def band(c, o):
-        a = lut[c[:, :, :3].view(np.uint16)]
-        if overlay:
-            # Overlay: the image stays, changed places get a solid colour.
-            out = np.ascontiguousarray(a)
-            out[difference_mask(c, o, lut, params)] = color
-            return out
-        # The plain difference. Intensity means the gain on the difference
-        # here; the DIFF_PLAIN_GAIN multiplier is there so that an intensity of
-        # 1.00 looks the same as it used to - small differences would otherwise
-        # not be visible at all.
-        b = lut[o[:, :, :3].view(np.uint16)]
-        d = np.maximum(a, b)
-        d -= np.minimum(a, b)                   # |a - b| unsigned, no floats
-        return table[d]
+        # The image stays, changed places get a solid colour.
+        out = np.ascontiguousarray(lut[c[:, :, :3].view(np.uint16)])
+        out[difference_mask(c, o, lut, params)] = color
+        return out
 
     bands = _band_count(cur.shape[0], int(threads), 0)
     if bands > 1:

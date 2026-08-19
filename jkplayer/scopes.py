@@ -175,11 +175,6 @@ def pos_lut(gain=1.0, gamma=1.0):
     return lut
 
 
-# which bin is already clipping (value > 1.0). Independent of gain - the axis
-# is always the same, gain only moves the values along it.
-CLIP_BIN = int(_pos_to_bin(value_to_pos(np.float32(1.0))))
-
-
 def subsample(arr, budget):
     """A step such that at most `budget` pixels remain (speed, see the header)."""
     h, w = arr.shape[0], arr.shape[1]
