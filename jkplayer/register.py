@@ -12,8 +12,22 @@ import nuke
 # docked in Nuke.
 from . import panel as _panel_module          # makes sure jkplayer.panel exists
 
-_floating = None                 # the fallback window, when there is no Viewer
-_docked = None                   # the pane beside the Viewer, once opened
+# ONE PANEL PER NODE, kept by the node's own id (node.uid_of). Two panels on
+# one node would write each other's settings over and fill two caches with the
+# same frames, which is what following the SELECTION used to cause the moment
+# there was more than one node in the script.
+#
+# AND A REGISTRATION OF ITS OWN. Nuke keys panels by the id given to
+# registerWidgetAsPanel: that id is what the Pane menu entry restores and what
+# a saved layout writes down. One shared id for every panel meant Nuke could
+# not tell two of them apart, which is the real reason a second node made
+# things go strange - our own binding was only half of it.
+#
+# So each node registers a panel named after the node (JKplayer, JKplayer1,
+# JKplayer2) under an id built from the node's own uid, and the widget
+# expression carries that uid - see panel.bound.
+_panels = {}                     # uid -> the panel object we opened for it
+_pane_entries = {}               # uid -> the name its Pane entry goes by
 
 
 def _expose_in_main():
@@ -35,7 +49,7 @@ _WIDGET_EXPR = ("__import__('nukescripts').panels.WidgetKnob("
                 "jkplayer.panel.PlayerPanel)")
 
 
-def _new_pane_panel():
+def _new_pane_panel(name=None, uid=""):
     """A Nuke pane wrapping our widget.
 
     The same thing nukescripts.registerWidgetAsPanel builds, made here so it
@@ -45,8 +59,13 @@ def _new_pane_panel():
     again just to get an instance would re-add the entry.
     """
     import nukescripts
-    panel = nukescripts.PythonPanel(PANEL_NAME, PANEL_ID)
-    panel.addKnob(nuke.PyCustom_Knob(PANEL_NAME, "", _WIDGET_EXPR))
+    title = name or PANEL_NAME
+    ident = panel_id_for(uid) if uid else PANEL_ID
+    expr = ("jkplayer.panel.bound(%r)" % uid) if uid else _WIDGET_EXPR
+    panel = nukescripts.PythonPanel(title, ident)
+    panel.addKnob(nuke.PyCustom_Knob(
+        title, "",
+        "__import__('nukescripts').panels.WidgetKnob(%s)" % expr))
     return panel
 
 
@@ -62,42 +81,195 @@ def _viewer_pane():
     return None
 
 
-def open_panel(force=False):
-    """Opens the panel DOCKED beside the Viewer, floating only as a fallback.
+def panel_id_for(uid):
+    """The id Nuke knows this node's panel by."""
+    return "%s.%s" % (PANEL_ID, uid)
 
-    `force` opens another one even if we already opened one - that is the menu
-    entry. Everything else reuses, because a second panel would fight the first
-    over the same node and fill a second cache in RAM.
+
+def register_for_node(node):
+    """Give the node a panel of its own in the Pane menu. Returns its uid.
+
+    Idempotent: registering the same node twice would add the Pane entry
+    twice, so what has been done is remembered in _pane_entries.
     """
-    global _floating, _docked
-    if not force and _docked is not None:
-        return _docked
-    if not force and _floating is not None:
+    import nukescripts
+    from . import node as nodemod
+    uid = nodemod.ensure_unique_uid(node)
+    if not uid:
+        return ""
+    try:
+        name = node.name()
+    except Exception:
+        name = PANEL_NAME
+    was = _pane_entries.get(uid)
+    if was == name:
+        return uid
+    if was is not None and was != name:
+        # THE NODE WAS RENAMED. Register again under the new name, but take
+        # the old entry out first - otherwise the Pane menu grows one item per
+        # rename and only the newest of them means anything.
         try:
-            if _floating.isVisible():
-                _floating.raise_()
-                _floating.activateWindow()
-                return _floating
-        except RuntimeError:
-            _floating = None        # Qt threw the window away, build a new one
+            nuke.menu("Pane").removeItem(was)
+        except Exception:
+            pass
+    _expose_in_main()
+    # The widget is named as an expression evaluated later in __main__, so the
+    # uid has to survive as TEXT - hence the repr rather than a reference.
+    expr = "jkplayer.panel.bound(%r)" % uid
+    try:
+        nukescripts.registerWidgetAsPanel(expr, name, panel_id_for(uid))
+        _pane_entries[uid] = name
+    except Exception as exc:
+        nuke.tprint("JKplayer: cannot register a panel for %s (%s)" % (name, exc))
+        return ""
+    return uid
+
+
+def forget_node(uid):
+    """Take the panel away when its node is gone - entry, registration, window."""
+    if not uid:
+        return
+    name = _pane_entries.pop(uid, None)
+    try:
+        import nukescripts
+        nukescripts.panels.unregisterPanel(panel_id_for(uid), None)
+    except Exception:
+        pass                                  # never registered, or gone already
+    if name:
+        try:
+            nuke.menu("Pane").removeItem(name)
+        except Exception:
+            pass
+    panel = _panels.pop(uid, None)
+    if _alive(panel):
+        try:
+            panel.close()
+        except Exception:
+            pass
+
+
+def _on_script_load():
+    """Every node in the freshly opened script gets its Pane entry."""
+    try:
+        made = register_existing()
+        if made:
+            nuke.tprint("JKplayer: %d node panel(s) registered" % made)
+    except Exception as exc:
+        nuke.tprint("JKplayer: cannot register the panels (%s)" % exc)
+
+
+def register_existing():
+    """A panel entry for every node already in the script.
+
+    Called after a script is loaded: the nodes come with their ids already in
+    them, and without this their Pane entries would only appear for whatever
+    was created by hand afterwards.
+    """
+    from . import node as nodemod
+    made = 0
+    for node in nodemod.find_all():
+        if register_for_node(node):
+            made += 1
+    return made
+
+
+def _alive(panel):
+    """Is that panel still a live Qt object? Qt deletes them behind our back."""
+    if panel is None:
+        return False
+    try:
+        panel.isVisible()                     # touches the C++ side
+        return True
+    except Exception:
+        return False
+
+
+def _target_node():
+    """Which node a newly opened panel should belong to.
+
+    The selected one, or - when nothing is selected - the first in the script.
+    A panel with no node has nothing to show, so it is better to guess than to
+    open an empty one; which node it took is written in its status line.
+    """
+    from . import node as nodemod
+    try:
+        sel = [n for n in nuke.selectedNodes() if nodemod.is_player_node(n)]
+    except Exception:
+        sel = []
+    if sel:
+        return sel[0]
+    found = nodemod.find_all()
+    return found[0] if found else None
+
+
+def open_panel(force=False, node=None):
+    """Opens a panel for one node, docked beside the Viewer where there is one.
+
+    `node` names the one it is for; without it the selection decides. A node
+    that already has a panel gets that one raised instead of a second - see
+    _panels.
+
+    `force` opens another panel even so. It exists for the case where the
+    first one was closed in a way we could not see, and for a second view of
+    the same node when somebody really wants it.
+    """
+    target = node if node is not None else _target_node()
+    uid = ""
+    if target is not None:
+        try:
+            uid = register_for_node(target)
+        except Exception as exc:
+            nuke.tprint("JKplayer: cannot identify the node (%s)" % exc)
+
+    if not force and uid:
+        got = _panels.get(uid)
+        if _alive(got):
+            try:                              # a floating window can be raised
+                got.raise_()
+                got.activateWindow()
+            except Exception:
+                pass                          # a docked one is where it is
+            return got
+        _panels.pop(uid, None)
+
+    # PENDING_UID is the belt to the braces: a docked panel gets its uid from
+    # the expression it was registered with, but a floating one is built here
+    # and the two paths should not disagree about which node it is.
+    _panel_module.PENDING_UID = uid or None
+    try:
+        opened = _build_panel(target, uid)
+    finally:
+        _panel_module.PENDING_UID = None
+    if uid and opened is not None:
+        _panels[uid] = opened
+    return opened
+
+
+def _build_panel(target, uid):
+    """Docked beside the Viewer, floating when there is no Viewer to dock to."""
+    name = PANEL_NAME
+    if target is not None:
+        try:
+            name = target.name()
+        except Exception:
+            pass
 
     pane = _viewer_pane()
     if pane is not None:
         try:
-            _docked = _new_pane_panel()
-            _docked.addToPane(pane)
-            return _docked
+            docked = _new_pane_panel(name, uid)
+            docked.addToPane(pane)
+            return docked
         except Exception as exc:
-            _docked = None
             nuke.tprint("JKplayer: could not dock beside the Viewer (%s), "
                         "opening a window instead" % exc)
 
-    _floating = _panel_module.PlayerPanel()
-    _floating.setWindowTitle(PANEL_NAME)
-    _floating.resize(1280, 820)
-    _floating.show()
-    _floating.raise_()
-    return _floating
+    window = _panel_module.PlayerPanel(node_uid=uid or None)
+    window.setWindowTitle(name)
+    window.resize(1280, 820)
+    window.show()
+    window.raise_()
+    return window
 
 
 def create_node():
@@ -106,7 +278,7 @@ def create_node():
     from . import node as nodemod
     node = nodemod.create()
     try:
-        open_panel()
+        open_panel(node=node)                 # the panel for THIS node
     except Exception as exc:
         # a panel that will not open must not lose you the node
         nuke.tprint("JKplayer: node created, panel did not open: %s" % exc)
@@ -226,8 +398,14 @@ def register():
         # Puts JKplayer in the Pane menu and makes the layout able to restore
         # it. Opening one ourselves goes through _new_pane_panel instead - see
         # there for why.
+        # THE FALLBACK ENTRY, and note the name. Every node registers a Pane
+        # entry called after itself, and the first node in a script is called
+        # "JKplayer" - so a generic entry by that name would be a second item
+        # with the same label sitting next to it. This one is for opening a
+        # panel when there is no node to name, and for layouts saved before
+        # panels were per node.
         nukescripts.registerWidgetAsPanel(
-            "jkplayer.panel.PlayerPanel", PANEL_NAME, PANEL_ID)
+            "jkplayer.panel.PlayerPanel", PANEL_NAME + " (any node)", PANEL_ID)
     except Exception as exc:
         nuke.tprint("JKplayer: panel registration failed: %s" % exc)
 
@@ -235,8 +413,12 @@ def register():
         m = nuke.menu("Nuke").addMenu("JKplayer")
         m.addCommand("Create JKplayer Node",
                      "import jkplayer.register as r; r.create_node()")
+        # NOT force. It used to be, back when there was one panel for the whole
+        # script and the entry had to be able to open a second after the first
+        # was closed. Now the entry means "show me the panel for the node I
+        # have selected", and a node that already has one gets that one raised.
         m.addCommand("Open JKplayer Panel",
-                     "import jkplayer.register as r; r.open_panel(force=True)")
+                     "import jkplayer.register as r; r.open_panel()")
     except Exception as exc:
         nuke.tprint("JKplayer: menu failed: %s" % exc)
 
@@ -246,3 +428,11 @@ def register():
             "import jkplayer.register as r; r.create_node()")
     except Exception:
         pass
+
+    # A SCRIPT THAT IS OPENED brings its nodes with it, and each of them wants
+    # its own Pane entry. Without this only nodes made by hand afterwards would
+    # have one, and opening yesterday's script would offer nothing to open.
+    try:
+        nuke.addOnScriptLoad(_on_script_load)
+    except Exception as exc:
+        nuke.tprint("JKplayer: cannot watch for script loads (%s)" % exc)

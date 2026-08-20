@@ -524,15 +524,50 @@ def _size_text(info):
     return text
 
 
+# HOW A PANEL LEARNS WHICH NODE IS ITS OWN.
+#
+# Nuke builds a docked panel by EVALUATING a text expression (see
+# register._WIDGET_EXPR), so there is no constructor argument to pass a node
+# in. register.open_panel puts the id here first and the panel takes it in
+# __init__ - the two happen one after the other on the same thread, with no
+# chance for anything else to run in between.
+PENDING_UID = None
+
+
+def bound(uid):
+    """A zero-argument maker of a panel tied to that node.
+
+    This is what a registered panel names in its own definition - see
+    register.register_for_node. nukescripts.WidgetKnob calls whatever it is
+    given with no arguments, so a factory works where a class would, and the
+    node id then lives INSIDE the panel's definition rather than in a variable
+    somebody has to set first. A layout Nuke saves keeps the expression, so a
+    restored panel comes back on the node it belonged to.
+    """
+    def make():
+        return PlayerPanel(node_uid=uid)
+    return make
+
+
 class PlayerPanel(QtWidgets.QWidget):
 
     _frame_ready = QtCore.Signal(int)          # from a worker -> the GUI thread
 
-    def __init__(self, parent=None):
+    def __init__(self, node_uid=None, parent=None):
         super(PlayerPanel, self).__init__(parent)
+        self._born_uid = node_uid
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
 
         self._node_name = None
+        # ONE PANEL, ONE NODE, for as long as the panel lives. It used to
+        # follow the SELECTION, which was fine with one node and wrong with
+        # two: every open panel chased the same selected node, so they wrote
+        # each other's settings over and each filled a cache of its own for
+        # the same frames.
+        global PENDING_UID
+        self._node_uid = self._born_uid or PENDING_UID
+        self._orphaned = False       # its node was deleted, cleaned up once
+        PENDING_UID = None
         self.frame = 1
         self.mark_in = 1
         self.mark_out = 1
@@ -1993,8 +2028,11 @@ class PlayerPanel(QtWidgets.QWidget):
         except Exception as exc:
             self._hint = "error reading the selection: %s" % exc
             return
-        if sel:
-            self._node_name = sel[0].fullName()
+        if sel and not self._node_uid:
+            # Only ever ONCE, and only for a panel that opened without being
+            # told which node is its own - a layout Nuke restored on startup,
+            # say. From then on the selection is somebody else's business.
+            self._bind(sel[0])
         node = self._get_node()
         if node is None:
             self._hint = ("there is no JKplayer node "
@@ -2077,15 +2115,50 @@ class PlayerPanel(QtWidgets.QWidget):
         """
         return self._slots if self._double() else [self._slots[0]]
 
+    def _bind(self, node):
+        """Tie this panel to that node, for good."""
+        if node is None:
+            return None
+        self._orphaned = False
+        self._node_uid = exrnode.uid_of(node)
+        self._node_name = node.fullName()
+        return node
+
     def _get_node(self):
-        if self._node_name:
+        """The node this panel belongs to.
+
+        BY ID FIRST. The name is only a shortcut for the common case where
+        nothing moved; a rename, or the node being cut and pasted, changes the
+        name and not the id, and following the name there would have the panel
+        showing a different plate without a word.
+        """
+        if self._node_uid:
+            found = exrnode.find_by_uid(self._node_uid)
+            if found is not None:
+                self._node_name = found.fullName()
+                return self._upgrade(found)
+            # ITS NODE IS GONE. Not a reason to adopt another one - this
+            # panel was that node's. Say so, and let go of the Pane entry and
+            # the registration that were made for it, or the menu would fill
+            # up with entries for nodes nobody can point at any more.
+            self._hint = ("the node this panel belongs to is gone "
+                          "(it was %s)" % (self._node_name or "?"))
+            if not self._orphaned:
+                self._orphaned = True
+                try:
+                    from . import register
+                    register.forget_node(self._node_uid)
+                except Exception:
+                    pass
+            return None
+
+        if self._node_name:                   # not bound yet, but we had a name
             n = nuke.toNode(self._node_name)
             if exrnode.is_player_node(n):
-                return self._upgrade(n)
+                return self._upgrade(self._bind(n))
         found = exrnode.find_all()
         if found:
-            self._node_name = found[0].fullName()
-            return self._upgrade(found[0])
+            return self._upgrade(self._bind(found[0]))
         return None
 
     def _upgrade(self, node):
@@ -3344,6 +3417,8 @@ class PlayerPanel(QtWidgets.QWidget):
         # the node the panel is following - when there are several in the graph
         # it is immediately clear which one is being written to
         if self._node_name:
+            # With one panel per node this is not a detail any more - it is
+            # how you tell two panels apart.
             txt += "  | node %s" % self._node_name
         # ordered by severity: what failed, then what is missing, then labels.
         # The confirmation of the last toggle disappears on its own, so it does

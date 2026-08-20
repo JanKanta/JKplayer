@@ -20,6 +20,8 @@ Inputs named A and B give exactly what we need, and the innards stay hidden
 are recognised by their tag, so they keep working - just with a single input.
 """
 
+import uuid
+
 import nuke
 
 from . import annotate
@@ -31,6 +33,7 @@ from . import sequence
 from .paths import total_ram_mb
 
 NODE_TAG = "cv_is_jkplayer"          # hidden knob, this is how we recognise the node
+UID_KNOB = "cv_uid"                  # this node's own id - see uid_of()
 # The tags used before each rename. A node saved by an older version still
 # carries one of them, so it is recognised too and keeps every setting - which
 # is the whole reason a hidden tag exists rather than matching on the node name.
@@ -203,6 +206,12 @@ def _add_knobs(node):
     tag.setValue(True)
     tag.setFlag(nuke.INVISIBLE)
     add(tag)
+
+    # A NAME THAT DOES NOT CHANGE. A panel is tied to one node for its whole
+    # life, and it cannot be tied by node name: renaming happens, and so does
+    # a node ending up inside a group. So each node carries an id of its own,
+    # written once and never read by anything but the panel binding.
+    add_hidden(nuke.String_Knob(UID_KNOB, "", ""))
 
     # ---- double view ----
     # The view mode comes first: it decides what else on the node makes sense
@@ -766,7 +775,11 @@ def create():
     _build_inputs(node)
     _add_knobs(node)
     node["tile_color"].setValue(0x7A3FBFFF)   # purple, so it stands out
-    node["label"].setValue("[value cv_channels]")
+    # NO LABEL. It used to carry "[value cv_channels]", so the node in the
+    # graph read "RGB" under its name and changed as the channel was switched.
+    # The label belongs to whoever is looking at the graph - it is where a shot
+    # name or a note goes - and taking it for a setting that is switched from
+    # the keyboard was borrowing something that was not ours.
     return node
 
 
@@ -947,6 +960,21 @@ def ensure_order(node):
         return False
 
 
+# What older versions wrote into the node's label. Cleared on upgrade, but
+# ONLY when it is still exactly this - a label somebody typed themselves is
+# theirs, and silently wiping it would be the worse bug of the two.
+OLD_LABEL = "[value cv_channels]"
+
+
+def _drop_old_label(node):
+    try:
+        knob = node["label"]
+        if (knob.value() or "").strip() == OLD_LABEL:
+            knob.setValue("")
+    except Exception:
+        pass
+
+
 def ensure_knobs(node):
     """Adds knobs from a newer version onto an already existing node.
 
@@ -955,7 +983,9 @@ def ensure_knobs(node):
     watcher then reads nothing and puts the choice back to its default - so,
     for instance, the OCIO input space could not be switched away from linear.
     """
+
     try:
+        _drop_old_label(node)
         before = set(node.knobs())
         _add_knobs(node)
         added = set(node.knobs()) - before
@@ -990,6 +1020,76 @@ def find_all():
     for cls in NODE_CLASSES:
         out.extend(n for n in nuke.allNodes(cls) if is_player_node(n))
     return out
+
+
+# ------------------------------------------------------------- node identity
+def uid_of(node, mint=True):
+    """This node's own id, made on first ask. "" when it cannot be stored.
+
+    A panel binds to this rather than to the node's name, so renaming the node
+    - or copying the panel's layout into another script - cannot make a panel
+    quietly start showing somebody else's plate.
+    """
+    if node is None:
+        return ""
+    try:
+        knob = node[UID_KNOB]
+    except Exception:
+        if not mint:
+            return ""
+        try:                                  # a node from before this existed
+            ensure_knobs(node)
+            knob = node[UID_KNOB]
+        except Exception:
+            return ""
+    try:
+        got = (knob.value() or "").strip()
+    except Exception:
+        return ""
+    if got or not mint:
+        return got
+    got = uuid.uuid4().hex[:12]
+    try:
+        knob.setValue(got)
+    except Exception:
+        return ""
+    return got
+
+
+def find_by_uid(uid):
+    """The node carrying that id, or None."""
+    if not uid:
+        return None
+    for node in find_all():
+        if uid_of(node, mint=False) == uid:
+            return node
+    return None
+
+
+def ensure_unique_uid(node):
+    """Give the node a new id when another one already answers to its.
+
+    COPY AND PASTE is the case. A pasted node arrives with the original's id,
+    and two nodes with one id means two panels both think they own the same
+    thing. Whichever node is asked second is the one that gets a new id, which
+    is the pasted one in every ordinary sequence of events.
+    """
+    uid = uid_of(node)
+    if not uid:
+        return ""
+    for other in find_all():
+        if other is node or other.fullName() == node.fullName():
+            continue
+        if uid_of(other, mint=False) == uid:
+            fresh = uuid.uuid4().hex[:12]
+            try:
+                node[UID_KNOB].setValue(fresh)
+                nuke.tprint("JKplayer: %s had the same id as %s, gave it a new "
+                            "one" % (node.name(), other.name()))
+                return fresh
+            except Exception:
+                return uid
+    return uid
 
 
 def input_count(node):
