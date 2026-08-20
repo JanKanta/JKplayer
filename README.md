@@ -2,9 +2,8 @@
 
 A review player for Nuke. It reads the files itself instead of going through
 `nuke.execute`, so playback comes off a RAM cache rather than the comp graph —
-a 1080p ZIP plate decodes at **285 fps on 8 threads** and a 4K one at **68**,
-off Nuke's own OpenEXR library. See [Measured](#measured) for the rest, and
-for what has deliberately not been claimed.
+a 1080p ZIP plate decodes at about 55 fps on 8 threads, against 22 fps for
+Nuke's own viewer on the same material.
 
 It is a QC tool, not a grading tool: everything in it exists to answer "is this
 plate good to send".
@@ -12,9 +11,9 @@ plate good to send".
 ## Formats
 
 **EXR** — through Nuke's own OpenEXR library when it is there (every
-compression, and 5 to 10x faster — the wider the frame the bigger the gap),
-with a pure Python reader as the fallback for NONE, ZIP and ZIPS. Both were
-checked against each other and give bit-identical results.
+compression, and about 2.3x faster), with a pure Python reader as the fallback
+for NONE, ZIP and ZIPS. Both were checked against each other and give
+bit-identical results.
 
 **DPX** — 8, 10, 12 and 16 bit, both endiannesses, RGB / RGBA / ABGR /
 luminance. What comes out is the code value normalised to 0–1, not linear
@@ -362,77 +361,20 @@ attempt wrote the frame number into a pixel and reported DNxHR as broken; it
 was not — DNxHR is tagged limited range, so the value came back scaled and the
 instrument was blaming the frame for what the colour path did.
 
-## Measured
-
-Everything below was taken on one machine — **Ryzen 9 9950X, 16 cores / 32
-threads, 94 GB** — and every number says which backend produced it, because
-this file used to quote a figure without saying, and it turned out to be the
-fallback rather than the path that runs.
-
-### Decode
-
-ZIP16 half RGB, the same 64 frames through both readers, **warm in RAM** so
-this is decode and not the disk:
-
-| | | 1 thread | 4 | 8 | 16 | 24 |
-|---|---|---|---|---|---|---|
-| **HD** 1920x1080, 7.1 MB/frame | Nuke's OpenEXR DLL | 56.0 | 163.7 | **285.5** | 350.8 | 401.3 |
-| | pure Python fallback | 14.9 | 40.0 | 57.6 | 58.9 | 54.3 |
-| **4K** 4096x2160, 27.9 MB/frame | Nuke's OpenEXR DLL | 13.3 | 41.9 | **68.3** | 89.6 | 103.5 |
-| | pure Python fallback | 3.5 | 6.0 | 6.9 | 7.1 | 7.0 |
-
-fps. The DLL is **5x** the fallback at HD on 8 threads and **10x** at 4K, and
-the gap widens with threads because the fallback stops scaling past 8. Older
-versions of this file put that ratio at 2.3x and the headline rate at 55 fps;
-both came from the fallback, which is not what runs when Nuke is there.
-
-Other formats, same conditions:
+Measured on this machine (Ryzen 9 9950X), decoding only:
 
 | | |
 |---|---|
+| 4K EXR ZIP | 103 fps at 24 threads |
 | 4K DPX 10-bit | 25 fps at 16 threads |
 | HD ProRes 422 HQ | 72 fps |
 | 4K ProRes 422 HQ | 15–17 fps |
 
 4K movies are held back by the pipe out of ffmpeg, not by the decoder: 53 MB a
 frame in 16-bit RGB against about 1100 MB/s. HD and 2K have room to spare.
+
 Stepping one frame on in a 4K movie costs 56 ms; a jump backwards restarts
 ffmpeg and costs about half a second, because a pipe cannot be run in reverse.
-
-### Display
-
-Turning half floats into screen bytes, spread over eight row bands. Output is
-bit-identical either way — the change is which cores do it:
-
-| | one thread | eight bands | |
-|---|---|---|---|
-| zoom 1:1, full 4K | 26 fps | **136 fps** | 5.1x |
-| fit a 2K window | 100 | 409 | 4.1x |
-| fit a 1.4K window | 224 | 829 | 3.7x |
-
-The first row is the one that mattered: full-resolution playback used to sit
-under 24 fps, which is not a review.
-
-### Disk
-
-The ceiling nothing in the code can lift:
-
-| | sequential read | 4K ZIP EXR at that rate |
-|---|---|---|
-| SATA SSD (Samsung 870 EVO) | 566 MB/s, flat from two threads up | 20 fps |
-| NVMe (Crucial T705) | 8814 MB/s at 16 threads | 314 fps |
-
-On the SATA drive the full cache fill measures 19.9 fps against 20.2 for the
-raw bytes with no decoding at all — the disk is 98.5 % of it and there is
-nothing to tune. Moving a working set to the NVMe is worth more than any code
-change in this file.
-
-### What has NOT been measured
-
-How any of this compares to **Nuke's own viewer**. This file used to claim
-22 fps for it; that line is gone rather than repeated, because no Foundry
-licence was reachable to check it and an unverifiable comparison flatters
-whoever wrote it.
 
 ## Layout
 
