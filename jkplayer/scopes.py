@@ -124,15 +124,10 @@ def apply_cc(v, gain=1.0, gamma=1.0, black=0.0):
     direction and size of the shift are right, and the scope axis is
     deliberately fixed anyway, independent of the view.
     """
-    v = np.asarray(v, dtype=np.float32)
-    if black:
-        v = v - float(black)          # the black point, before the white one
-    v = v * float(gain)
-    if abs(float(gamma) - 1.0) <= 1e-6:
-        return v                          # no round trip, keep it bit for bit
-    low = _srgb_decode(np.power(_srgb_encode(np.clip(v, 0.0, 1.0)),
-                                1.0 / max(float(gamma), 1e-3)))
-    return np.where(v > 1.0, v, low).astype(np.float32)
+    # exactly the picture's grade - lift and gain, then gamma on the linear
+    # value (see nukelut.grade) - so a scope reads what the window shows
+    from .nukelut import grade
+    return grade(v, gain, gamma, black)
 
 
 _LUT_CACHE = {}

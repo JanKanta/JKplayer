@@ -10,17 +10,24 @@ Everything in one strip (no separate slider plus a bar below it):
 Click / drag = scrub. Dragging a triangle moves IN/OUT.
 """
 
+import math
+
 from .qtcompat import QtCore, QtGui, QtWidgets, event_pos
 
 # heights of the individual bands (from the bottom) - kept low so the timeline
 # does not eat space
 TIMELINE_H = 30      # total height of the strip
 CACHE_H = 4          # cache strip, one input
-CACHE_H2 = 7         # ...and with two, so each line is still 3 px
+CACHE_H2 = 9         # ...and with two (Comp over Plate), 4 px a line
 MARK_H = 6           # band with the IN/OUT triangles
 ALT_H = 11           # second number row: input B in ITS OWN numbering
 LABEL_H = 12         # bubble with the frame number
 HANDLE_GRAB = 7      # how close to a marker the mouse grabs it
+
+
+def min_last(first, last):
+    """`last`, or `first` when there is no sensible last."""
+    return first if last is None or int(last) < int(first) else last
 
 
 class Timeline(QtWidgets.QWidget):
@@ -42,19 +49,27 @@ class Timeline(QtWidgets.QWidget):
             "  wheel           = zoom in / out\n"
             "  Ctrl+wheel      = step one frame\n"
             "  middle drag     = pan a zoomed timeline\n"
-            "  middle click    = back to the whole range\n"
-            "  double click    = zoom out to the whole range\n"
-            "  triangles       = mark IN / OUT (drag them)")
+            "  middle click    = back to the whole range (both clips)\n"
+            "  double click    = zoom out to the whole range (both clips)\n"
+            "  triangles       = mark IN / OUT (drag them - also past the "
+            "shot)\n"
+            "Cache lines at the bottom: yellow = Comp in RAM, orange = Plate\n"
+            "(both shown whenever both inputs are wired, in every view mode).")
 
         self._first = 1                # the whole sequence range
         self._last = 100
         self._vfirst = 1               # what is VISIBLE right now (timeline zoom)
+        # ...and how far into that first frame the strip starts (0..1). A zoom
+        # lands between frames; rounding the start to a whole one every notch
+        # walked the view away from the cursor, the more so zoomed in.
+        self._vsub = 0.0
         self._vlast = 100
         self._in = 1
         self._out = 100
         self._frame = 1
         self._cache_runs = []          # [(from, to), ...] - input A
         self._cache_runs_b = []        # the same for input B, its own line
+        self._two = False              # B is wired: its line has its place
         self._annot_runs = []          # frames carrying a drawn note
         # Input B's own numbering, for the second row under the cache lanes.
         # (shift, first, last) on the TIMELINE; shift is what has to come off a
@@ -64,6 +79,12 @@ class Timeline(QtWidgets.QWidget):
         self._pan_x = 0.0
         self._pan_view = None
         self.MIN_SPAN = 4              # most zoomed in = 4 frames across
+        # The OTHER input's frames (first, last), or None. The fitted view
+        # takes them in too, so both clips are always on the strip.
+        self._extent = None
+        # True while the view is the fitted one (nobody zoomed or panned):
+        # then it re-fits whenever what it has to show changes
+        self._fitted = True
 
         # colours (dark Nuke look)
         self.c_bg = QtGui.QColor(38, 38, 38)
@@ -96,17 +117,56 @@ class Timeline(QtWidgets.QWidget):
         first, last = int(first), int(last)
         if last < first:
             last = first
-        keep_in = self._in if first <= self._in <= last else first
-        keep_out = self._out if first <= self._out <= last else last
+        keep_in, keep_out = first, last        # set_in_out follows from the panel
+        # THE VIEW STAYS WHERE IT WAS PUT. A fitted timeline re-fits; a zoomed
+        # or panned one keeps its zoom and its place, so a change of range
+        # moves the numbers under it instead of throwing the view away.
         self._first, self._last = first, last
         self._in, self._out = keep_in, keep_out
-        self._vfirst, self._vlast = first, last      # zoom back to the whole range
+        if self._fitted:
+            self._fit_view()
+        else:
+            span = self._vlast - self._vfirst + 1
+            span = max(min(self.MIN_SPAN, last - first + 1),
+                       min(self._max_span(), span))
+            vf = self._clamp_view(self._vfirst, span)
+            self._vfirst, self._vlast = vf, vf + span - 1
+            self._vsub = 0.0
         self.update()
 
     def view_all(self):
-        """Zoom the timeline out to the whole range (double click)."""
-        self._vfirst, self._vlast = self._first, self._last
+        """Fit the timeline (double click, middle click).
+
+        Everything that has frames goes on the strip: the Comp's range, the
+        Plate's (see set_extent) and IN / OUT when they were pulled out past
+        both - so both clips and what is cached of them are always in view.
+        """
+        self._fitted = True
+        self._fit_view()
         self.update()
+
+    def fit_range(self):
+        """(first, last) the fitted view shows - see view_all."""
+        lo = min(self._first, self._in)
+        hi = max(self._last, self._out)
+        if self._extent is not None:
+            lo, hi = min(lo, self._extent[0]), max(hi, self._extent[1])
+        return lo, hi
+
+    def _fit_view(self):
+        self._vfirst, self._vlast = self.fit_range()
+        self._vsub = 0.0
+
+    def set_extent(self, first=None, last=None):
+        """The other input's frames on the timeline, or None without one."""
+        extent = None if first is None else (int(first), int(min_last(first,
+                                                                      last)))
+        if extent == self._extent:
+            return
+        self._extent = extent
+        if self._fitted:
+            self._fit_view()
+            self.update()
 
     # ZOOMING OUT PAST THE RANGE, as Nuke's own timeline does. Stopping at the
     # range meant the wheel did nothing at all on a timeline that starts out
@@ -122,14 +182,16 @@ class Timeline(QtWidgets.QWidget):
     def _clamp_view(self, vf, span):
         """Where a view of `span` frames may start.
 
-        Zoomed IN it stays inside the range, as it always did. Zoomed OUT past
-        the range, the whole range stays inside the view: panning it so far
-        that the shot leaves the strip would leave a timeline of nothing.
+        Loose enough that a zoom stays under the cursor, tight enough that the
+        strip never becomes a timeline of nothing: at least HALF of what has
+        frames (both clips and IN / OUT, see fit_range) - or half the view,
+        when the view is the smaller - stays on it. The old rule pulled a
+        zoomed-in view back inside the Comp, and a zoom near its edge, or over
+        a Plate or marks lying outside it, jumped away from the cursor.
         """
-        range_span = self._last - self._first + 1
-        if span <= range_span:
-            return max(self._first, min(self._last - span + 1, vf))
-        return max(self._last - span + 1, min(self._first, vf))
+        lo, hi = self.fit_range()
+        need = max(1, min(int(span), hi - lo + 1) // 2)
+        return max(lo + need - int(span), min(hi - need + 1, int(vf)))
 
     def zoom_view(self, factor, at_frame=None):
         """Zooms the timeline in/out around the given frame (mouse wheel)."""
@@ -137,15 +199,23 @@ class Timeline(QtWidgets.QWidget):
         new_span = int(round(span * factor))
         if factor > 1.0 and new_span == span:
             new_span = span + 1               # a short view must still grow
-        new_span = max(self.MIN_SPAN, min(self._max_span(), new_span))
+        new_span = max(self.MIN_SPAN, min(max(self._max_span(), span),
+                                          new_span))
         if new_span == span:
             return
-        anchor = self._frame if at_frame is None else at_frame
-        # the anchor keeps its relative position in the window -> zoom "under
-        # the cursor"
-        frac = (anchor - self._vfirst) / float(max(1, span - 1)) if span > 1 else 0.5
-        vf = int(round(anchor - frac * (new_span - 1)))
-        vf = self._clamp_view(vf, new_span)
+        self._fitted = False
+        anchor = (self._frame + 0.5) if at_frame is None else at_frame
+        # UNDER THE CURSOR: the frame position under it is the same fraction
+        # of the strip before and after. A frame at x is vfirst + x*span/width
+        # (see _frame_at_exact), so the fraction is over `span` - dividing by
+        # span - 1 put the anchor a little off, more so zoomed in, and the view
+        # crept away from the pointer notch by notch.
+        frac = (anchor - self._vfirst - self._vsub) / float(span)
+        exact = anchor - frac * new_span
+        vf = int(math.floor(exact))
+        clamped = self._clamp_view(vf, new_span)
+        self._vsub = (exact - vf) if clamped == vf else 0.0
+        vf = clamped
         self._vfirst, self._vlast = vf, vf + new_span - 1
         self.update()
 
@@ -153,22 +223,17 @@ class Timeline(QtWidgets.QWidget):
         span = self._vlast - self._vfirst + 1
         vf = self._clamp_view(int(round(self._vfirst + delta_frames)), span)
         if vf != self._vfirst:
+            self._fitted = False
             self._vfirst, self._vlast = vf, vf + span - 1
+            self._vsub = 0.0
             self.update()
 
-    def ensure_visible(self, frame):
-        """When the playhead leaves the zoomed part, move the window after it."""
-        if self._vfirst <= frame <= self._vlast:
-            return
-        span = self._vlast - self._vfirst + 1
-        vf = max(self._first, min(self._last - span + 1, int(frame) - span // 2))
-        self._vfirst, self._vlast = vf, vf + span - 1
-
     def set_frame(self, frame):
+        # THE VIEW DOES NOT CHASE THE PLAYHEAD. A zoomed view is where somebody
+        # put it; playback running out of it leaves it there.
         frame = self._clamp(frame)
         if frame != self._frame:
             self._frame = frame
-            self.ensure_visible(frame)     # when zoomed in, follow the playhead
             self.update()
 
     def set_cache_runs(self, runs, second=None):
@@ -179,12 +244,18 @@ class Timeline(QtWidgets.QWidget):
         loading at all, and there was no way to tell which of the two was
         holding playback back.
         """
+        # None = there is no second input; [] = there is, nothing cached yet.
+        # The difference is the point: an empty Plate line says "not in RAM",
+        # a missing one said nothing at all.
+        two = second is not None
         runs = runs or []
         second = second or []
-        if runs == self._cache_runs and second == self._cache_runs_b:
+        if (runs == self._cache_runs and second == self._cache_runs_b
+                and two == self._two):
             return
         self._cache_runs = runs
         self._cache_runs_b = second
+        self._two = two
         self.update()
 
     def set_alt_numbering(self, shift=None, first=None, last=None):
@@ -216,10 +287,12 @@ class Timeline(QtWidgets.QWidget):
         self.update()
 
     def set_in_out(self, mark_in, mark_out):
-        self._in = self._clamp(mark_in)
-        self._out = self._clamp(mark_out)
+        self._in = self._clamp_reach(mark_in)
+        self._out = self._clamp_reach(mark_out)
         if self._out < self._in:
             self._in, self._out = self._out, self._in
+        if self._fitted:
+            self._fit_view()          # marks typed out past the clips stay in view
         self.update()
         self.rangeChanged.emit(self._in, self._out)
 
@@ -236,8 +309,24 @@ class Timeline(QtWidgets.QWidget):
         return self._out
 
     # ------------------------------------------------------------- geometry
+    def reach(self):
+        """(lo, hi): how far IN / OUT may go - past the shot, as far as the
+        most zoomed-out timeline shows. Frames out there have no picture; the
+        player shows them empty rather than holding the last one."""
+        span = self._last - self._first + 1
+        extra = max(0, self._max_span() - span)
+        return self._first - extra, self._last + extra
+
+    def _clamp_reach(self, f):
+        lo, hi = self.reach()
+        return max(lo, min(hi, int(f)))
+
     def _clamp(self, f):
-        return max(self._first, min(self._last, int(f)))
+        """A frame the PLAYHEAD may be on: the shot, widened by IN / OUT when
+        they have been pulled out past it."""
+        lo = min(self._first, self._in)
+        hi = max(self._last, self._out)
+        return max(lo, min(hi, int(f)))
 
     def _count(self):
         """How many frames are VISIBLE right now (the timeline may be zoomed)."""
@@ -245,15 +334,17 @@ class Timeline(QtWidgets.QWidget):
 
     def _x(self, frame):
         """Left edge of that frame's cell (within the displayed range)."""
-        return (frame - self._vfirst) * self.width() / float(self._count())
+        return ((frame - self._vfirst - self._vsub) * self.width()
+                / float(self._count()))
 
     def _frame_at(self, x):
-        f = self._vfirst + int(x * self._count() / max(1.0, float(self.width())))
+        f = int(math.floor(self._frame_at_exact(x)))
         return self._clamp(f)
 
     def _frame_at_exact(self, x):
         """Without clamping to the range - for anchoring the zoom."""
-        return self._vfirst + x * self._count() / max(1.0, float(self.width()))
+        return (self._vfirst + self._vsub
+                + x * self._count() / max(1.0, float(self.width())))
 
     def _cell_w(self):
         return self.width() / float(self._count())
@@ -294,7 +385,7 @@ class Timeline(QtWidgets.QWidget):
         #      not loading at all. With a single input there is one line, the
         #      full height it always was.
         p.setPen(QtCore.Qt.NoPen)
-        two = bool(self._cache_runs_b)
+        two = self._two
         if two:
             # Taller when it has to carry two: splitting the single-input
             # height would leave 1.5 px a line, which is not a readout.
@@ -303,6 +394,8 @@ class Timeline(QtWidgets.QWidget):
                       self.c_cache),
                      (self._cache_runs_b, track_h - line_h, line_h,
                       self.c_cache_b)]
+            # Only what is IN RAM lights up - nothing is drawn under an empty
+            # stretch, so an uncached Plate is simply no orange yet.
         else:
             lanes = [(self._cache_runs, track_h - CACHE_H, CACHE_H,
                       self.c_cache)]
@@ -468,6 +561,10 @@ class Timeline(QtWidgets.QWidget):
 
     def _apply_drag(self, x):
         f = self._frame_at(x)
+        if self._drag in ("in", "out"):
+            # the marks may go OUT past the shot, into the empty time a
+            # zoomed-out timeline shows - see reach()
+            f = self._clamp_reach(self._frame_at_exact(x))
         if self._drag == "in":
             self._in = min(f, self._out)
             self.update()

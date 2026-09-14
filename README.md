@@ -23,36 +23,46 @@ plate good to send".
 * **Crop before export.** Export opens a crop dialog over every annotated
   frame: zoom in, crop, same crop for all, and the crop is scaled back up to the
   frame size in the JPEGs and the PDF.
-* **A proper PDF report** — composition name on top, `frame N · check` per page,
+* **A proper PDF report** — composition name on top with the export date and
+  time beside it, `frame N · check` per page,
   every note numbered in its own colour, with the text size set on the node.
 * **Stabilise** on the Input tab: paste a 2D tracker's x/y and the picture holds
-  still on the reference frame.
+  still on the first frame of the range.
 * **Bounding box vs format.** An EXR whose data window is not its display
   window is placed by its format; the picture outside can be shown or cut, the
   format and the bbox outlined on demand, and the window's control strip turns
   red with *BBox is different then Canvas*.
-* **Canvas check** has a cross where the edges meet — drag it to move the join.
+* **Canvas check** has a cross where the edges meet — drag it to move the join —
+  and works on the canvas (the format) only, overscan cut away.
 * **Log view with camera logs.** Nuke's 16 log curves on the built-in
   transforms; under OCIO the log spaces of the config in use (ACES 1.3 and 2.0
   each have their own list), converted exactly. A log plate is linearised first,
   so it is never log of log.
-* **CC like a Grade** — WhitePoint, BlackPoint and Gamma with the ranges and
-  straight sliders of Nuke's Grade, followed by the scopes, the readout and
-  the export.
+* **CC like a Grade** — Lift, Gain (to 16) and Gamma, computed as Nuke's Grade
+  (gamma on the linear value, before the display), followed by the scopes, the
+  readout and the export.
 * **Ctrl+J** in the Node Graph creates a JKplayer node, and a selected Read goes
   straight into Comp.
 * **Comp/Plate swap on `;`** — the key left of 1 — taken from Nuke, which binds
-  it itself, whenever the panel has the keyboard.
+  it itself, whenever the panel has the keyboard; a click on `C` / `P` swaps too.
 * **Custom OCIO config** on the node, copied over from Project Settings when the
   script uses one.
-* **Timeline zooms out** past the shot on the wheel; a middle click fits it back.
+* **Timeline** — zooms out past the shot and stays under the cursor; a middle
+  click or double click fits both clips; one cache line per input (Comp yellow
+  over Plate orange) in every view mode; IN / OUT can be pulled past the comp,
+  and where an input has no frames the window is empty, not held; playback no
+  longer drags a zoomed view along; Plate frame numbers follow its Offset.
 * **Metadata follows playback** frame by frame, in step with the picture.
 * **Input timing fixed:** Offset nudges an input against a timeline that stays
   put, instead of dragging the timeline along with the Comp.
 * **Vectorscope** measures the plate, not the monitor LUT — like the histogram
   and the waveform.
-* **Settings tab** on the node; the status line is hidden unless switched on
-  there, and the RAM in use sits next to *Clear cache*.
+* **Settings tab** on the node: background (black / dark grey / grey), bounding
+  box display, the status line (hidden unless switched on) and the scopes'
+  opacity and cursor markers; the RAM in use sits next to *Clear cache*.
+* **Input tab tidied** — per input its name, a line, then Start at, Offset and
+  Anamorphic as a plain number; the per-input colorspace comes from the Read and
+  the panel instead.
 * The Read's Frame tab (start at, offset, expression) no longer breaks the
   player — only the Read's path and file numbering are taken from it.
 
@@ -97,7 +107,9 @@ the comp.
 **Playback** — RAM cache with a byte budget (a quarter of the machine's memory
 by default), look-ahead in the direction you are playing, a rolling cache
 window so a long shot does not thrash, and a timeline that shows what is
-cached. Realtime mode holds the target FPS and skips uncached frames; turn it
+cached — one line per input, **Comp (yellow) over Plate (orange)**, both in
+every view mode whenever both are wired, lit only where frames are in RAM. A
+zoomed or panned timeline keeps its view when the range changes. Realtime mode holds the target FPS and skips uncached frames; turn it
 off and every frame is shown. The RAM this player's cache holds, against its
 budget, is shown next to **Clear cache** (the tooltip adds every open player
 together and the machine's total).
@@ -110,13 +122,16 @@ up, and each picks its own input and its own EXR layer — so you can put rgba
 against depth of the same plate.
 
 The inputs are **Comp** and **Plate** (tagged `C` and `P` on the buttons inside
-the image). `;` swaps the window between them, which is the quickest A/B there
-is: same frame, same zoom, same place on the eye.
+the image). A click on that button, or `;`, swaps the window between them —
+no menu — which is the quickest A/B there is: same frame, same zoom, same place
+on the eye.
 
 ### Input tab
 
-Each input has its own block on the node's **Input** tab.
+The timeline always takes its range from **Comp**. Each input has its own
+block — its name, a line under it, and under the line:
 
+* **Input** — what is attached: size, and the range it covers on the timeline.
 * **Start at** places the input's first frame on a timeline frame — it
   renumbers. Start the Comp at 1001 and the timeline reads 1001 onwards.
 * **Offset** nudges the input against the timeline, which stays where it is.
@@ -124,26 +139,35 @@ Each input has its own block on the node's **Input** tab.
   put; the timeline widens just enough that no nudged frame is cut off.
 
 They put a 1-100 render under a 1001-1100 plate without a TimeOffset node. The
-two inputs do not have to be the same length — the timeline follows Comp and
-the shorter side holds its end frame. When the two were *delivered* on
-different numbering, the plate's own numbers are written under the cache bars
-so they can be lined up by eye.
+two inputs do not have to be the same length — the timeline follows Comp, and
+wherever an input has no frames it shows an **empty frame**, not a held one.
+
+**IN / OUT can be pulled past the comp** — drag the triangles out into the empty
+time of a zoomed-out timeline, or type the numbers. Playback runs over the
+whole IN..OUT, and past the end of an input's data its window is empty. When the plate has an **Offset**, a row of
+**Plate frame numbers** runs under the cache lines and moves with it. The
+numbers are the plate as placed — Start at applied, so files 1-147 started at
+1001 count from 1001 — and a plate with Offset +2 reads 1001 under timeline
+1003. With no Offset they would only repeat the timeline, and the row is not
+drawn.
 
 From the Read only **the path and how the files are numbered** (its Original
 Range) are taken. Its Frame tab — start at, offset, expression — and its Frame
 Range do not move the player: that is what Start at and Offset here are for.
 
-**Anamorphic** is there too, per input: `from file` trusts the pixel aspect in
-the header, and the fixed ratios are for when it lies — a scan off 2x negative
-is written square by plenty of scanners. It stretches the *drawing* only. The
-pixels, the probe, the scopes and the notes all stay in stored coordinates.
+**Anamorphic** is there too, per input — just the number, always applied: 1 for
+square pixels, 2 for a 2x lens, anything in between. It stretches the *drawing*
+only. The
+pixels, the probe, the scopes and the notes all stay in stored coordinates. An
+older node's Anamorphic menu is turned into the number (its *from file* into 1).
 
-**Colorspace** is per input as well — see Colour below.
+The input's **colorspace** is still per input, but not on this tab: it comes
+from the Read and from the input menu in the panel — see Colour below.
 
 **Stabilise** sits at the bottom of the tab, under a line. Paste the x/y
-animation of a 2D tracker into **Track**, pick the **Reference frame**, switch
-**Stabilise** on, and the picture is shifted so the tracked feature holds still
-where it was on the reference frame. Only for looking at the result — nothing
+animation of a 2D tracker into **Track**, switch **Stabilise** on, and the
+picture is shifted so the tracked feature holds still where it was on the first
+frame of the range. Only for looking at the result — nothing
 is rendered, and the notes stay on the pixels they were drawn on.
 
 ### Bounding box
@@ -156,9 +180,9 @@ rest:
 
 | Setting | Default | What it does |
 |---|---|---|
-| Show outside format | on | the picture outside the format is shown; off cuts it to the format |
+| Show outside format | off | on shows the picture outside the format; off cuts it to the format |
 | Format line | off | the format outlined with a faint solid line (25 % white) |
-| Bbox line | off | the bounding box outlined dashed, as the Nuke Viewer does |
+| Bbox line | on | the bounding box outlined dashed, as the Nuke Viewer does |
 | Warn when bbox differs | on | the window's control strip turns **red** and says *BBox is different then Canvas* |
 
 Nothing is drawn and nothing turns red when the bbox *is* the format. Inside the
@@ -202,7 +226,8 @@ It then writes, into a subfolder named after the clip:
 * `annotation_####.jpg` per annotated frame and view, optionally with a frame
   stamp
 * a **CSV** of every note
-* a **PDF** report (switchable on the node) — the composition name on top,
+* a **PDF** report (switchable on the node) — the composition name on top, the
+  date and time of the export at the top right,
   `frame N · check` per page, the cropped picture, and every note numbered
   `1.` `2.` `3.` in its own colour. Its text size is a knob on the node.
 
@@ -225,16 +250,19 @@ their own list (ACEScct, ARRI LogC3/LogC4, S-Log3, V-Log...), converted exactly
 through OCIO, gamut included. A log plate is taken to linear first, so it is
 never shown as log of log.
 
-**CC** — **WhitePoint** and **BlackPoint** as in a Grade, (in − black) /
-(white − black) in scene-linear, plus **Gamma** and **Saturation**. The ranges
-and straight sliders are Nuke's Grade: white like its gain (0–4), black like its
-lift (−1 to 1), gamma 0.2–5; the number fields take anything in between exactly. The histogram, waveform and vectorscope, the
+**CC** — Nuke's Grade: **Lift** (−1 to 1), **Gain** (0 to 16) and **Gamma**
+(0.2 to 5), with its straight sliders, plus **Saturation**. The maths is the
+Grade's — in·(gain − lift) + lift, then gamma as a power on the linear value
+(above 1 too, negatives left alone) — before the display transform, in the
+built-in path and under OCIO alike. The histogram, waveform and vectorscope, the
 clipping line, the pixel readout and the exported notes all follow it.
 
 **Canvas check** swaps the image so the original edges meet in the middle. A
 cross marks the point where they meet: **drag it** to move the join anywhere,
 and the Shift X / Shift Y sliders follow. Anywhere else the left button still
-pans.
+pans. It works on the **canvas** (the format) only: overscan outside it is cut
+away rather than rolled into the middle, and a data window smaller than the
+format is padded out black.
 
 **Scopes** — histogram and waveform on a scene-linear axis from 0 to 55 with
 the clipping line at 1.0, so you can see how far over an exposure goes, not
@@ -304,11 +332,14 @@ Both sides are filled in for you, and neither takes the choice away:
 
 | Setting | Default | |
 |---|---|---|
-| Show outside format | on | see *Bounding box* |
+| Background | Black | around the picture: Black, Dark grey or Grey (the grey the player used to have) |
+| Show outside format | off | see *Bounding box* |
 | Format line | off | |
-| Bbox line | off | |
+| Bbox line | on | |
 | Warn when bbox differs | on | |
 | Show status line | off | the line at the very bottom: render and decode speed, resolution, cache fill, queue, zoom, OCIO, node name |
+| **Scopes** — Backdrop opacity | 0.75 | behind the histogram, vectorscope and waveform (used to be a tab of its own) |
+| **Scopes** — Cursor in scopes | on | mark the pixel under the cursor in the scopes as the mouse moves |
 
 With the status line off it still **appears by itself when there is an error**
 to report — a display error, a file that cannot be loaded, a disconnected
@@ -487,7 +518,7 @@ J / K / L          play backwards / stop-play / play forwards
 Left / Right       step one frame
 R  G  B  A         show that channel (a second press returns to RGB)
 Y                  luminance (a second press returns to RGB)
-C                  CC panel (WhitePoint, BlackPoint, gamma, saturation)
+C                  CC panel (lift, gain, gamma, saturation - as a Grade)
 Q                  QC panel
 H                  histogram
 V                  vectorscope
@@ -528,9 +559,9 @@ click / drag       scrub
 wheel              zoom in / out (out past the shot, darker outside it)
 Ctrl + wheel       step one frame
 middle drag        pan a zoomed timeline
-middle click       back to the whole range
-double click       back to the whole range
-triangles          drag to move IN / OUT
+middle click       fit: both clips (Comp and Plate), and IN / OUT
+double click       the same fit
+triangles          drag to move IN / OUT (also out past the comp)
 ```
 
 ### Sliders and number fields

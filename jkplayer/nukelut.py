@@ -454,17 +454,31 @@ def display_lut(display=DEFAULT_DISPLAY, input_space=DEFAULT_INPUT,
                 gain=1.0, gamma=1.0, black=0.0):
     """65536 -> uint8. The whole file -> monitor path in one table.
 
-    Everything is baked in: the input transform, the black and white point
-    (as `black` and `gain` = 1 / (white - black), a Grade's
-    (in - black) / (white - black)), the display and the gamma from CC. At
-    runtime it is then a single lookup.
+    Everything is baked in: the input transform, CC as Nuke's Grade -
+    (in - black) * gain for lift and gain, then gamma ON THE LINEAR VALUE, as
+    the Grade does it - and the display. At runtime it is a single lookup.
     """
     v = decode(input_space, _HALF_SAFE.copy()).astype(np.float32)
-    v = np.clip((v - float(black)) * float(gain), 0.0, None)
+    v = grade(v, gain, gamma, black)
+    v = np.clip(v, 0.0, None)
     v = np.asarray(encode(display, v), dtype=np.float32)
-    if abs(float(gamma) - 1.0) > 1e-6:
-        v = np.power(np.clip(v, 0.0, None), 1.0 / max(float(gamma), 1e-3))
     return (np.clip(v, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
+def grade(v, gain=1.0, gamma=1.0, black=0.0):
+    """CC on scene-linear values the way Nuke's Grade does it.
+
+    (v - black) * gain carries lift and gain (see overlay.cc_gain); gamma is
+    then pow(v, 1 / gamma) on what is above zero - above 1 too, as the Grade
+    does - and left alone below it. One function for the picture, the OCIO
+    shaper and the scopes, so the three can never grade differently.
+    """
+    v = (np.asarray(v, dtype=np.float32) - float(black)) * float(gain)
+    g = max(float(gamma), 1e-3)
+    if abs(g - 1.0) > 1e-6:
+        with np.errstate(invalid="ignore", over="ignore"):
+            v = np.where(v > 0.0, np.power(np.maximum(v, 0.0), 1.0 / g), v)
+    return v.astype(np.float32)
 
 
 def linear_table(input_space):

@@ -68,31 +68,34 @@ QComboBox {
 # CC: (key, label, min, max, default, decimals, curve)
 # A curve > 1 packs the short end of the range towards the left of the slider.
 #
-# THE RANGES AND SLIDERS OF NUKE'S GRADE, so a hand used to Nuke lands on the
-# same number at the same place: WhitePoint runs like Grade's gain (0-4),
-# BlackPoint like its lift (-1 to 1), Gamma like its gamma (0.2-5), all on
-# straight sliders as Nuke draws them.
+# NUKE'S GRADE: Lift, Gain and Gamma, with the Grade's lift and gamma ranges on
+# straight sliders, so a hand used to Nuke lands on the same number there -
+# Lift -1 to 1, Gain 0 to 16, Gamma 0.2 to 5.
 CC_PARAMS = [
-    # A Grade's two points, in scene-linear: whatever sits at the white point
-    # is shown as 1.0, at the black point as 0.
-    ("white", "WhitePoint", 0.0, 4.0, 1.0, 3, 1.0),
-    ("black", "BlackPoint", -1.0, 1.0, 0.0, 3, 1.0),
+    ("lift", "Lift", -1.0, 1.0, 0.0, 3, 1.0),
+    # Gain reaches 16 - past the Grade slider's 4 - and its slider is curved,
+    # so 1.0 still sits at about two fifths of the way and stays fine to set
+    ("gain", "Gain", 0.0, 16.0, 1.0, 3, 3.0),
     ("gamma", "Gamma", 0.2, 5.0, 1.0, 2, 1.0),
     ("sat", "Saturation", 0.0, 4.0, 1.0, 2, 1.0),
 ]
 
 
 def cc_gain(values):
-    """(gain, black) from the CC panel's white and black point.
+    """(gain, black) for the colour path, from the panel's Lift and Gain.
 
-    (in - black) / (white - black), so gain = 1 / (white - black). The two
-    points are kept at least a hair apart, so crossing them over flattens the
-    picture rather than dividing by zero or turning it into a negative.
+    Nuke's Grade: out = in * (gain - lift) + lift - black stays at `lift`,
+    white lands on `gain`. The colour path takes it as (in - black) * g, so
+    g = gain - lift and black = -lift / g. With Gain on Lift the picture is
+    flat at that value; g is kept a hair off zero so that is what it shows.
     """
     values = values or {}
-    black = float(values.get("black", 0.0))
-    white = float(values.get("white", 1.0))
-    return 1.0 / max(white - black, 1e-4), black
+    lift = float(values.get("lift", 0.0))
+    gain = float(values.get("gain", 1.0))
+    g = gain - lift
+    if abs(g) < 1e-6:
+        g = 1e-6
+    return g, -lift / g
 
 
 # Slider steps. Longer ranges (gain up to 16) need a finer step, otherwise one
@@ -820,7 +823,7 @@ class _Panel(QtWidgets.QFrame):
 
 
 class CCPanel(_Panel):
-    """WhitePoint / BlackPoint / gamma / saturation.
+    """Lift / gain / gamma / saturation, as a Grade.
 
     It does not collapse: on/off is handled by the CC toggle in the window bar.
     A collapsed panel would show only a strip with the title once switched on
@@ -884,7 +887,7 @@ SCOPE_KEYS = ("hist", "vscope", "wave")
 # Panel toggles in the image: (key, label on the button, tooltip).
 # The key is used for the node knobs too - cv_<key>_<window>.
 PANEL_BUTTONS = (
-    ("cc", "CC", "Colour: white point, black point, gamma, saturation."),
+    ("cc", "CC", "Colour: lift, gain, gamma, saturation - as Nuke's Grade."),
     ("qc", "QC", "Check mode (grain, high-pass, saturation, value map...)."),
     ("hist", "H", "Histogram: axis 0 to 55, the line at 1.0 marks clipping."),
     ("vscope", "V", "Vectorscope: the colour of the plate, through the input "
@@ -2093,13 +2096,11 @@ class SlotBar(QtWidgets.QFrame):
         self.button = QtWidgets.QToolButton(self)
         self.button.setObjectName("cvSlot")
         self.button.setFixedSize(24, 20)
-        self.button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.button.setFocusPolicy(QtCore.Qt.NoFocus)
-        menu = QtWidgets.QMenu(self.button)
-        for i, name in enumerate(self._labels):
-            act = menu.addAction("Input %s" % name)
-            act.triggered.connect(lambda _c=False, idx=i: self._pick(idx))
-        self.button.setMenu(menu)
+        # A CLICK SWAPS, no menu. With two inputs a menu is two clicks and a
+        # look for what one click can say - the same as the ';' key.
+        self.button.clicked.connect(
+            lambda *_a: self._pick((self._source + 1) % len(self._labels)))
         lay.addWidget(self.button)
 
         self.layer = _Combo(self)
@@ -2258,7 +2259,8 @@ class SlotBar(QtWidgets.QFrame):
         self._source = max(0, min(len(self._labels) - 1, int(index)))
         self.button.setText(self._labels[self._source])
         self.button.setToolTip(
-            "The window shows input %s. Click to pick another one.\n"
+            "The window shows input %s. Click to swap Comp and Plate "
+            "(also the ';' key).\n"
             "Both windows may show the same input - then it is handy to give\n"
             "each of them a different layer." % self._labels[self._source])
 

@@ -260,6 +260,26 @@ def _make_qimage(rgb):
 # the check should change, not what the check measures. CC is therefore applied
 # ON TOP of the result (see _apply_cc).
 NEUTRAL_LUT = build_lut()
+
+# Around the picture - chosen on the node's Settings tab. Black by default, as
+# a viewer's is: a grey surround lifts how dark the shadows read against it.
+# Enumeration knobs are saved by their TEXT, so the names are permanent.
+BACKGROUND_NAMES = ("Black", "Dark grey", "Grey")
+# Grey is the surround the player always had (28); Dark grey sits half way
+# between it and black.
+BACKGROUND_RGB = ((0, 0, 0), (14, 14, 14), (28, 28, 28))
+BACKGROUND = QtGui.QColor(*BACKGROUND_RGB[0])
+
+
+def background_color(index):
+    """QColor for a Background choice (an index into BACKGROUND_NAMES)."""
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        index = 0
+    if not 0 <= index < len(BACKGROUND_RGB):
+        index = 0
+    return QtGui.QColor(*BACKGROUND_RGB[index])
 NEUTRAL_LUT_F = build_lut_f()    # the same, unclipped, for the band checks
 
 
@@ -329,6 +349,7 @@ class ImageView(QtWidgets.QWidget):
         self.probe_frozen = False             # the P key freezes the readout
 
         self._frame = None           # (h,w,4) float16 scene-linear
+        self._blank = False          # no data on this frame: draw it empty
         self._prev = None            # the previous frame (for the temporal check)
         self._other = None           # the same frame from the other input (difference)
         self._matte = None           # the DiMatte input frame (mattes in RGBA)
@@ -391,9 +412,10 @@ class ImageView(QtWidgets.QWidget):
         self._note_drag = None       # the note being dragged, while it is held
         self._canvas_drag = False    # the canvas check's centre is held
         self._windows = None         # (data window, display window) - set_windows
-        self.show_bbox = True        # False: the picture is cut to the format
+        self.show_bbox = False       # True: the picture outside the format shows
+        self.background = QtGui.QColor(BACKGROUND)   # around the picture
         self.line_format = False     # outline the format, solid
-        self.line_bbox = False       # outline the bounding box, dashed
+        self.line_bbox = True        # outline the bounding box, dashed
         self._canvas_hover = False   # the pointer is over it
         # What the last redraw cost, for the status line. Covers the WHOLE
         # display path - crop, colour transform and the QC check when one is on
@@ -450,10 +472,21 @@ class ImageView(QtWidgets.QWidget):
         self._extremes_for = None    # frame AND colour space they were taken in            # e.g. "previous frame missing"
 
     # ------------------------------------------------------------- content
+    def set_blank(self):
+        """No picture on this frame: the input has no data here. Drawn as the
+        bare background - an empty frame, not a held one, and not the
+        '(no frame)' of a window with nothing attached."""
+        self._blank = True
+        self._frame = None
+        self._prev = self._other = self._matte = None
+        self._dirty = True
+        self.update()
+
     def set_frame(self, arr, prev=None, other=None, matte=None):
         """`prev` = the previous frame (temporal check),
         `other` = the same frame from the other input (difference),
         `matte` = the DiMatte input frame (mattes in the RGBA channels)."""
+        self._blank = False
         self._frame = arr
         self._prev = prev
         self._other = other
@@ -501,7 +534,9 @@ class ImageView(QtWidgets.QWidget):
     def _rebuild_luts(self):
         self._lut = nukelut.display_lut(self.nuke_display, self.nuke_input,
                                         self.gain, self.gamma, self.black)
-        self._gamma_lut = build_gamma_lut(self.gamma)
+        # gamma is inside the grade now (nukelut.grade), on the linear value,
+        # for OCIO as well - nothing is laid over the finished bytes any more
+        self._gamma_lut = None
         self._cc_lut = build_cc_lut(self.gain, self.gamma, self.black)
 
     def set_ocio(self, transform):
@@ -653,7 +688,7 @@ class ImageView(QtWidgets.QWidget):
             return 1
         return max(1, min(8, int(round(1.0 / z))))
 
-    def _visible_box(self, z, margin=None):
+    def _visible_box(self, z, margin=None, bounds=None):
         """The area of the image (x0,y0,x1,y1) that is visible, plus a margin.
 
         Thanks to the margin, a small pan needs no recomputation at all - the
@@ -684,10 +719,13 @@ class ImageView(QtWidgets.QWidget):
                 margin = EFFECT_MARGIN if self.effect != fx.NONE else self.margin
         half_w = vw / (2.0 * self._zoom_x(z)) * (1.0 + margin)
         half_h = vh / (2.0 * z) * (1.0 + margin)
-        x0 = int(max(0, cx - half_w))
-        y0 = int(max(0, cy - half_h))
-        x1 = int(min(w, cx + half_w + 1))
-        y1 = int(min(h, cy + half_h + 1))
+        # `bounds` (x0, y0, x1, y1) instead of the frame - the canvas check
+        # asks for its format, which a small data window does not fill
+        lx0, ly0, lx1, ly1 = bounds if bounds is not None else (0, 0, w, h)
+        x0 = int(max(lx0, cx - half_w))
+        y0 = int(max(ly0, cy - half_h))
+        x1 = int(min(lx1, cx + half_w + 1))
+        y1 = int(min(ly1, cy + half_h + 1))
         return x0, y0, max(x0 + 1, x1), max(y0 + 1, y1)
 
     def _covers(self, box, step):
@@ -966,7 +1004,7 @@ class ImageView(QtWidgets.QWidget):
             src = (np.repeat(one, 3, axis=2) if one.shape[2] == 1
                    else one[:, :, :3])
         try:
-            rgb = self.ocio.apply(src, self.gain, self.black)
+            rgb = self.ocio.apply(src, self.gain, self.black, self.gamma)
         except Exception as exc:
             self.last_error = "OCIO: %s" % exc
             return None
@@ -1098,7 +1136,20 @@ class ImageView(QtWidgets.QWidget):
             # shifting the coordinates with wraparound -> the crop is already
             # "swapped". Assembled from contiguous blocks rather than gathered
             # per pixel - see effects.canvas_crop, it is 3x the difference.
-            arr = fx.canvas_crop(arr, x0, y0, x1, y1, step, self.effect_params)
+            #
+            # ON THE CANVAS ONLY. With a bounding box that is not the format
+            # the check wraps the FORMAT: overscan is cut away rather than
+            # rolled into the middle, where it would be mistaken for the edge
+            # of the shot, and a smaller data window is padded out black.
+            src, offx, offy = self._canvas_source()
+            fh, fw = src.shape[0], src.shape[1]
+            bx0, by0 = max(0, x0 - offx), max(0, y0 - offy)
+            bx1, by1 = min(fw, x1 - offx), min(fh, y1 - offy)
+            if bx1 <= bx0 or by1 <= by0:
+                return
+            arr = fx.canvas_crop(src, bx0, by0, bx1, by1, step,
+                                 self.effect_params)
+            box = (bx0 + offx, by0 + offy, bx1 + offx, by1 + offy)
         else:
             arr = arr[y0:y1:es, x0:x1:es]
         if arr.size == 0:
@@ -1358,6 +1409,12 @@ class ImageView(QtWidgets.QWidget):
             return
         self._windows = windows
         self.update()
+
+    def set_background(self, color):
+        color = QtGui.QColor(color)
+        if color != self.background:
+            self.background = color
+            self.update()
 
     def set_show_bbox(self, on, line_format=None, line_bbox=None):
         """Picture outside the format shown or cut, and the two outlines."""
@@ -1836,7 +1893,7 @@ class ImageView(QtWidgets.QWidget):
         if self.ocio_active():
             try:
                 shown = self.ocio.apply(px[:, :, :3], self.gain,
-                                        self.black).reshape(3)
+                                        self.black, self.gamma).reshape(3)
             except Exception:
                 shown = self._lut[px[:, :, :3].view(np.uint16)].reshape(3)
         else:
@@ -1871,11 +1928,13 @@ class ImageView(QtWidgets.QWidget):
     def paintEvent(self, _event):
         painter = QtGui.QPainter(self)
         if self._opacity >= 0.999:
-            painter.fillRect(self.rect(), QtGui.QColor(28, 28, 28))
+            painter.fillRect(self.rect(), self.background)
         else:
             # the background is not drawn, so the other input shows through
             painter.setOpacity(self._opacity)
         if self._frame is None:
+            if getattr(self, "_blank", False):
+                return                  # an empty frame: background only
             painter.setPen(QtGui.QColor(150, 150, 150))
             painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "(no frame)")
             return
@@ -1887,6 +1946,13 @@ class ImageView(QtWidgets.QWidget):
             box = (0, 0, w, h)              # it needs the whole image, not a crop
         else:
             box = self._visible_box(z)
+        fmt_box = self.format_box()
+        if self.effect == fx.CANVAS and fmt_box is not None:
+            # only the canvas is computed (see _render), so only the canvas is
+            # asked for - otherwise the overscan would never count as covered
+            # and every repaint would render again
+            fx0, fy0, fw, fh = fmt_box
+            box = self._visible_box(z, bounds=(fx0, fy0, fx0 + fw, fy0 + fh))
         if self.effect not in (fx.NONE, fx.CANVAS):
             # a pixel ceiling only for the computed effects; canvas is just
             # different addressing and costs the same as ordinary display ->
@@ -1941,12 +2007,13 @@ class ImageView(QtWidgets.QWidget):
             # inside the format but outside the data window is BLACK, as in
             # Nuke - not the grey of the window around the frame
             painter.fillRect(fmt_rect, QtGui.QColor(0, 0, 0))
-            if not self.show_bbox:
+            cut = not self.show_bbox or self.effect == fx.CANVAS
+            if cut:
                 painter.save()
                 painter.setClipRect(fmt_rect)
         painter.drawImage(target, self._qimage)
         if fmt_rect is not None:
-            if not self.show_bbox:
+            if cut:
                 painter.restore()
             if self.line_format or self.line_bbox:
                 self._draw_format_lines(painter, fmt_rect, QtCore.QRectF(
@@ -2070,10 +2137,50 @@ class ImageView(QtWidgets.QWidget):
         (x + dx) % w, so source column 0 - the plate's left edge - lands on
         (w - dx) % w. With the default half shift that is the middle.
         """
-        w, h = self.image_size
+        offx, offy, w, h = self._canvas_rect()
         dx = int(w * fx.param(self.effect_params, "shift_x", 50.0) / 100.0)
         dy = int(h * fx.param(self.effect_params, "shift_y", 50.0) / 100.0)
-        return (w - dx) % w, (h - dy) % h
+        return (w - dx) % w + offx, (h - dy) % h + offy
+
+    def _canvas_rect(self):
+        """(x, y, w, h) of what the canvas check wraps, in frame pixels: the
+        format when the frame has one that differs, else the frame itself."""
+        box = self.format_box()
+        if box is not None:
+            return box
+        w, h = self.image_size
+        return 0, 0, w, h
+
+    def _canvas_source(self):
+        """(array the size of the canvas, its x, its y) - see _render.
+
+        The frame cut to its format (overscan) or padded out to it (a smaller
+        data window), kept for as long as the frame and its format stay the
+        same, so a pan or a slider costs no copy.
+        """
+        arr = self._frame
+        box = self.format_box()
+        if box is None:
+            return arr, 0, 0
+        key = (id(arr), box)
+        cached = getattr(self, "_canvas_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1], box[0], box[1]
+        fx0, fy0, fw, fh = box
+        h, w = arr.shape[0], arr.shape[1]
+        if fx0 >= 0 and fy0 >= 0 and fx0 + fw <= w and fy0 + fh <= h:
+            src = arr[fy0:fy0 + fh, fx0:fx0 + fw]
+        else:
+            src = np.zeros((fh, fw) + arr.shape[2:], dtype=arr.dtype)
+            if arr.shape[2] >= 4:
+                src[:, :, 3] = 1.0
+            sx0, sy0 = max(0, fx0), max(0, fy0)
+            sx1, sy1 = min(w, fx0 + fw), min(h, fy0 + fh)
+            if sx1 > sx0 and sy1 > sy0:
+                src[sy0 - fy0:sy1 - fy0, sx0 - fx0:sx1 - fx0] = \
+                    arr[sy0:sy1, sx0:sx1]
+        self._canvas_cache = (key, src)
+        return src, fx0, fy0
 
     def _image_origin(self):
         """(ox, oy, zx, z): the image's top left on screen and the scales."""
@@ -2098,10 +2205,10 @@ class ImageView(QtWidgets.QWidget):
 
     def _canvas_drag_to(self, pos):
         """Puts the seam crossing under the pointer -> new shift_x / shift_y."""
-        w, h = self.image_size
+        offx, offy, w, h = self._canvas_rect()
         ox, oy, zx, z = self._image_origin()
-        ix = max(0.0, min(float(w), (pos.x() - ox) / zx))
-        iy = max(0.0, min(float(h), (pos.y() - oy) / z))
+        ix = max(0.0, min(float(w), (pos.x() - ox) / zx - offx))
+        iy = max(0.0, min(float(h), (pos.y() - oy) / z - offy))
         params = dict(self.effect_params)
         params["shift_x"] = round((w - ix) / float(w) * 100.0, 2) % 100.0
         params["shift_y"] = round((h - iy) / float(h) * 100.0, 2) % 100.0

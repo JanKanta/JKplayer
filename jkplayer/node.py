@@ -9,7 +9,7 @@ Rules (the v2 brief):
   * two inputs A and B, and ONLY Read nodes with a format we decode ourselves
     (see sequence.READABLE - anything else is disconnected)
   * the inputs may cover different frame ranges - it is only reported, and
-    the shorter one holds its end frame
+    the shorter one shows an empty frame outside its own range
   * a Viewer node cannot be attached
   * no nuke.execute - the node renders nothing
 
@@ -62,8 +62,34 @@ NODE_CLASSES = ("Group", "NoOp")
 #
 # Enumeration knobs are saved by their TEXT, so these strings are now permanent.
 SQUEEZE_CHOICES = ("from file", "1", "1.3", "1.33", "1.5", "1.8", "2", "custom")
+
+# The Background menu on the Settings tab - the same names, in the same order,
+# as imageview.BACKGROUND_NAMES (that module draws them; this one has no Qt).
+BACKGROUND_NAMES = ("Black", "Dark grey", "Grey")
 SQUEEZE_FROM_FILE = 0
 SQUEEZE_CUSTOM = len(SQUEEZE_CHOICES) - 1
+
+
+def _ratio(value):
+    """The Anamorphic number, kept sane: 1.0 for anything unusable."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return value if 0.1 <= value <= 10.0 else 1.0
+
+
+def range_of_comp(seq):
+    """(first, last) of the timeline for a Comp sequence, or None.
+
+    Start at moves the timeline WITH the comp (it renumbers it), the Offset
+    nudge does not: the timeline stays where the comp was placed, widened just
+    enough that no nudged frame is cut off.
+    """
+    if seq is None:
+        return None
+    base_first, base_last = seq.first - seq.nudge, seq.last - seq.nudge
+    return min(seq.first, base_first), max(seq.last, base_last)
 
 
 def squeeze_value(index, custom):
@@ -527,25 +553,20 @@ def _add_knobs(node):
     # scroll to the bottom of somebody else's.
     add(nuke.Tab_Knob("cv_input_tab", "Input"))
 
-    k = nuke.Boolean_Knob("cv_desqueeze", "Desqueeze")
-    k.setValue(True)
-    k.setFlag(nuke.STARTLINE)
-    k.setTooltip("Draw anamorphic material at the SHAPE it was shot at - the "
-                 "picture is stretched sideways by the squeeze set below.\n"
-                 "Off shows the stored pixels as they are, narrow.\n"
-                 "Display only: the pixels, the probe, the scopes and the "
-                 "notes stay in stored coordinates, and so does the export.")
-    add(k)
-
     # One block per input, because the two are almost never delivered on the
     # same numbering: a plate comes 1001-1100 and the render of it comes 1-100.
     # They used to have to be lined up with a TimeOffset node outside the
     # player. This replaces it: one place, saved with the settings, and shown
     # next to the range it produces.
+    #
+    # Each block reads: the input's NAME with its line, and everything about
+    # that input below. ONE knob for both - a Text_Knob with a label and no
+    # text is drawn by Nuke as the label followed by a rule, so a separate
+    # divider under it was a second line.
     for key, label in zip(INPUT_KEYS, INPUT_LABELS):
-        add(nuke.Text_Knob("cv_in_div_%s" % key, ""))
+        add(nuke.Text_Knob("cv_in_head_%s" % key, "<b>%s</b>" % label, ""))
 
-        k = nuke.Text_Knob("cv_in_info_%s" % key, label, "-")
+        k = nuke.Text_Knob("cv_in_info_%s" % key, "Input", "-")
         k.setTooltip("What is attached to input %s: its size, and the range it "
                      "covers ON THE TIMELINE once everything below has been\n"
                      "applied. Read-only - it is what the player ended up "
@@ -572,23 +593,18 @@ def _add_knobs(node):
                      "where it is and this says by how much." % label)
         add(k)
 
-        k = nuke.Enumeration_Knob("cv_in_squeeze_%s" % key, "Anamorphic",
-                                  list(SQUEEZE_CHOICES))
-        k.setTooltip("The anamorphic squeeze of input %s.\n"
-                     "'from file' trusts the pixel aspect written in the file "
-                     "- right for an EXR out of a comp, and often wrong for a\n"
-                     "scan, which is why the fixed ratios are here. It is set "
-                     "per input because a 2x plate and a square-rendered comp\n"
-                     "of it are exactly the pair you need to compare.\n"
-                     "Only does anything while 'Desqueeze' is on." % label)
-        add(k)
-
-        k = nuke.Double_Knob("cv_in_squeeze_num_%s" % key, "ratio")
-        k.setValue(2.0)
+        # JUST THE NUMBER. A menu of fixed ratios in front of it was one more
+        # thing to set for the same answer the number gives on its own.
+        k = nuke.Double_Knob("cv_in_squeeze_num_%s" % key, "Anamorphic")
+        k.setValue(1.0)
         k.setRange(0.1, 4.0)
-        k.clearFlag(nuke.STARTLINE)
-        k.setTooltip("The squeeze used when 'Anamorphic' is set to 'custom'. "
-                     "Ignored on any other setting.")
+        k.setFlag(nuke.STARTLINE)
+        k.setTooltip("The anamorphic squeeze of input %s: 1 = square pixels, "
+                     "2 = a 2x lens.\n"
+                     "Set per input, because a 2x plate and a square-rendered "
+                     "comp of it are exactly the pair you need to compare.\n"
+                     "Display only: the pixels, the probe, the scopes, the "
+                     "notes and the export stay in stored coordinates." % label)
         add(k)
 
         # PER INPUT, because the two are routinely not in the same space: a
@@ -596,13 +612,10 @@ def _add_knobs(node):
         # exception. Filled in from the Read on that input; empty falls back to
         # the one on the Color management tab, which is what a node from before
         # this existed will do.
-        k = nuke.String_Knob("cv_in_space_%s" % key, "Colorspace", "")
-        k.setTooltip("What input %s is encoded in.\n"
-                     "Taken from the Read wired into it - Nuke's own "
-                     "'Input Transform' - and you can type over it.\n"
-                     "Empty means: use the input space on the Color management "
-                     "tab." % label)
-        add(k)
+        # NOT SHOWN on the Input tab: it is set from the Read and from the
+        # input menu in the panel, and a second place to type it only raised
+        # the question of which one is in charge. Still stored per input.
+        add_hidden(nuke.String_Knob("cv_in_space_%s" % key, "Colorspace", ""))
 
     # ---- stabilisation, at the bottom and behind a line ----
     #
@@ -616,7 +629,7 @@ def _add_knobs(node):
     k.setValue(False)
     k.setFlag(nuke.STARTLINE)
     k.setTooltip("Hold the picture still using the track below.\n"
-                 "DISPLAY ONLY, like Desqueeze: the pixels, the probe, the "
+                 "DISPLAY ONLY, like Anamorphic: the pixels, the probe, the "
                  "scopes and anything exported are unchanged - this\n"
                  "moves the window over the plate, it does not resample it.")
     add(k)
@@ -627,42 +640,8 @@ def _add_knobs(node):
                  "Read per frame, so it follows the playhead. Both channels "
                  "are taken as the POSITION of the feature being\n"
                  "followed: the picture is moved by however far that has "
-                 "travelled since the reference frame below.\n"
+                 "travelled since the first frame of the range.\n"
                  "With nothing animated on it, nothing moves.")
-    add(k)
-
-    k = nuke.Int_Knob("cv_stab_ref", "Reference frame")
-    k.setValue(0)
-    k.setRange(0, 1000000)
-    k.setTooltip("The frame the picture is held still AT - where the track is "
-                 "taken to be zero movement.\n"
-                 "0 means the first frame of the range.\n"
-                 "Move it and the whole shot re-centres on that frame; it "
-                 "changes where the picture sits, not how it moves.")
-    add(k)
-
-    # ---- Scopes ----
-    # The histogram, the vectorscope and the waveform are one family and are
-    # read as one, so what belongs to all three lives together - rather than
-    # tucked under window 1 of the Viewer tab, which is where the opacity was
-    # and where nobody would look for it.
-    #
-    # WHICH scopes are on is still not here, and deliberately: that is
-    # switched by H, V and W over the picture, and a second place to set the
-    # same state only ever raises the question of which one is in charge.
-    add(nuke.Tab_Knob("cv_scope_tab", "Scopes"))
-
-    add(nuke.Text_Knob(
-        "cv_scope_head", "",
-        "Switched on over the picture, with H, V and W."))
-
-    k = nuke.Double_Knob("cv_scope_opacity", "Backdrop opacity")
-    k.setValue(DEFAULT_SCOPE_OPACITY)
-    k.setRange(0.0, 1.0)
-    k.setTooltip("Opacity of the backdrop behind the histogram, the "
-                 "vectorscope and the waveform. "
-                 "1 = opaque, 0 = just the graticule and the trace over "
-                 "the image.")
     add(k)
 
     # ---- Metadata ----
@@ -837,8 +816,15 @@ def _add_knobs(node):
 
     # ---- settings ----
     add(nuke.Tab_Knob("cv_settings_tab", "Settings"))
+    k = nuke.Enumeration_Knob("cv_background", "Background",
+                              list(BACKGROUND_NAMES))
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("What is around the picture: black, dark grey or mid grey.\n"
+                 "Black is how a viewer is usually set - a lighter surround "
+                 "makes the shadows of the shot look darker than they are.")
+    add(k)
     k = nuke.Boolean_Knob("cv_show_bbox", "Show outside format")
-    k.setValue(True)
+    k.setValue(False)
     k.setFlag(nuke.STARTLINE)
     k.setTooltip("An EXR whose data window is bigger than its format "
                  "(overscan) carries picture outside the frame.\n"
@@ -853,7 +839,7 @@ def _add_knobs(node):
     k.setTooltip("Outline the format (the display window) with a solid line.")
     add(k)
     k = nuke.Boolean_Knob("cv_line_bbox", "Bbox line")
-    k.setValue(False)
+    k.setValue(True)
     k.clearFlag(nuke.STARTLINE)
     k.setTooltip("Outline the bounding box (the data window) with a dashed "
                  "line, as the Nuke Viewer does.")
@@ -875,6 +861,35 @@ def _add_knobs(node):
                  "zoom, OCIO, the node name.\n"
                  "Off, it still appears on its own when there is an error to "
                  "report.")
+    add(k)
+
+    # ---- Scopes: moved here from a tab of their own ----
+    # The histogram, the vectorscope and the waveform are one family and are
+    # read as one, so what belongs to all three lives together. WHICH scopes
+    # are on is not here, and deliberately: that is switched by H, V and W over
+    # the picture, and a second place to set the same state only ever raises
+    # the question of which one is in charge.
+    k = nuke.Text_Knob("cv_scope_head", "<b>Scopes</b>", "")
+    k.setTooltip("Switched on over the picture, with H, V and W.")
+    add(k)
+
+    k = nuke.Double_Knob("cv_scope_opacity", "Backdrop opacity")
+    k.setValue(DEFAULT_SCOPE_OPACITY)
+    k.setRange(0.0, 1.0)
+    k.setTooltip("Opacity of the backdrop behind the histogram, the "
+                 "vectorscope and the waveform. "
+                 "1 = opaque, 0 = just the graticule and the trace over "
+                 "the image.")
+    add(k)
+
+    k = nuke.Boolean_Knob("cv_scope_probe", "Cursor in scopes")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Mark the pixel under the cursor in the scopes as the mouse "
+                 "moves over the picture:\n"
+                 "a line on the histogram, a ring on the vectorscope, a cross "
+                 "on the waveform.\n"
+                 "Off, the scopes show only the picture's trace.")
     add(k)
     apply_color_visibility(node)
     apply_view_visibility(node)
@@ -1407,6 +1422,31 @@ def _drop_old_label(node):
         pass
 
 
+def _migrate_squeeze_menu(node):
+    """The Anamorphic MENU is gone - its choice becomes the number.
+
+    'from file' and anything unreadable become 1 (square): the number is all
+    there is now, and an old default of 2 on the hidden ratio must not quietly
+    stretch a plate that was never set to anything.
+    """
+    for key in INPUT_KEYS:
+        name = "cv_in_squeeze_%s" % key
+        try:
+            if name not in node.knobs():
+                continue
+            chosen = squeeze_value(int(node[name].getValue()),
+                                   node["cv_in_squeeze_num_%s" % key].value()
+                                   if "cv_in_squeeze_num_%s" % key
+                                   in node.knobs() else 1.0)
+            num = "cv_in_squeeze_num_%s" % key
+            if num in node.knobs():
+                node[num].setValue(chosen or 1.0)
+            node.removeKnob(node[name])
+        except Exception as exc:
+            nuke.tprint("JKplayer: cannot convert the Anamorphic menu (%s)"
+                        % exc)
+
+
 def ensure_knobs(node):
     """Adds knobs from a newer version onto an already existing node.
 
@@ -1418,6 +1458,7 @@ def ensure_knobs(node):
 
     try:
         _drop_old_label(node)
+        _migrate_squeeze_menu(node)
         before = set(node.knobs())
         _add_knobs(node)
         _refresh_config_menu(node)
@@ -1564,8 +1605,8 @@ def stabilise_at(node, frame, first=None):
         return (0.0, 0.0)
     try:
         knob = node["cv_stab_xy"]
-        ref = int(node["cv_stab_ref"].value()) or int(
-            first if first is not None else frame)
+        # held still where the track is on the FIRST frame of the range
+        ref = int(first if first is not None else frame)
         now = knob.valueAt(float(frame))
         base = knob.valueAt(float(ref))
     except Exception:
@@ -1633,11 +1674,12 @@ def settings(node):
         "workers": int(val("cv_workers", 8)),
         "qc_threads": int(val("cv_qc_threads", 4)),
         "qc_full_play": bool(val("cv_qc_full_play", True)),
-        "show_bbox": bool(val("cv_show_bbox", True)),
+        "show_bbox": bool(val("cv_show_bbox", False)),
         "line_format": bool(val("cv_line_format", False)),
-        "line_bbox": bool(val("cv_line_bbox", False)),
+        "line_bbox": bool(val("cv_line_bbox", True)),
         "bbox_warn": bool(val("cv_bbox_warn", True)),
         "status_line": bool(val("cv_status_line", False)),
+        "background": enum("cv_background", 0),
         "auto_cache": bool(val("cv_auto_cache", True)),
         "fps": fps,
         "loop": enum("cv_loop", 0),              # 0 loop, 1 ping-pong, 2 stop
@@ -1646,16 +1688,14 @@ def settings(node):
             (int(val("cv_in_start_%s" % key, 0)),
              int(val("cv_in_offset_%s" % key, 0)))
             for key in INPUT_KEYS),
-        # the squeeze per input as a NUMBER, or None for "take it from the
-        # file" - only the panel ever sees what the file actually said
+        # the squeeze per input as a NUMBER (1 = square)
         # per-input colorspace; "" = fall back to the shared one below
         "in_space": tuple(str(val("cv_in_space_%s" % key, "") or "")
                           for key in INPUT_KEYS),
-        "desqueeze": bool(val("cv_desqueeze", True)),
         "in_squeeze": tuple(
-            squeeze_value(enum("cv_in_squeeze_%s" % key, SQUEEZE_FROM_FILE),
-                          val("cv_in_squeeze_num_%s" % key, 2.0))
+            _ratio(val("cv_in_squeeze_num_%s" % key, 1.0))
             for key in INPUT_KEYS),
+
         "realtime": bool(val("cv_realtime", True)),
         "cached_only": bool(val("cv_play_cached_only", False)),
         # the layer and source of each window (see SLOT_LABELS)
@@ -1677,6 +1717,7 @@ def settings(node):
         "nuke_display": str(val("cv_nuke_display", nukelut.DEFAULT_DISPLAY)),
         "nuke_input": str(val("cv_nuke_input", nukelut.DEFAULT_INPUT)),
         "scope_opacity": float(val("cv_scope_opacity", DEFAULT_SCOPE_OPACITY)),
+        "scope_probe": bool(val("cv_scope_probe", True)),
         "wipe_opacity": float(val("cv_wipe_opacity", 1.0)),
         "overlay_mix": float(val("cv_overlay_mix", 1.0)),
         "overlay_qc": enum("cv_overlay_qc", 0),
@@ -1834,17 +1875,16 @@ def enforce_input(node):
         return None
     # Different lengths are ALLOWED and only reported. They used to disconnect
     # B, which meant a plate against a shorter test render - a perfectly
-    # ordinary thing to want to look at - could not be wired up at all. The
-    # sequence clamps outside its own range (see ExrSequence.path_for), so the
-    # shorter side simply holds its first or last frame instead of failing.
+    # ordinary thing to want to look at - could not be wired up at all.
+    # Outside its own range the shorter side shows an EMPTY frame (see
+    # PlayerPanel._show_slot) rather than holding its first or last one.
     #
-    # Still said out loud: past the end of the shorter input the two sides no
-    # longer show the same moment, and a difference there is comparing a frame
-    # against a held still.
+    # Still said out loud: past the end of the shorter input there is nothing
+    # to compare against.
     if (ra[1] - ra[0]) == (rb[1] - rb[0]):
         return None
     return ("Inputs cover a different number of frames (A %d-%d is %d, "
-            "B %d-%d is %d). The shorter one holds its end frame outside its "
-            "own range, so a comparison there is against a held still."
+            "B %d-%d is %d). Outside its own range the shorter one shows an "
+            "empty frame, so there is nothing to compare against there."
             % (ra[0], ra[1], ra[1] - ra[0] + 1,
                rb[0], rb[1], rb[1] - rb[0] + 1))

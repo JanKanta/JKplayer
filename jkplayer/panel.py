@@ -49,6 +49,7 @@ from . import nukelut
 from . import ocio
 from . import reader
 from .cache import FrameCache
+from . import imageview as imageview_mod
 from .imageview import ImageView
 from .loader import FrameLoader
 from . import overlay as overlay_mod
@@ -429,6 +430,13 @@ class _Stage(QtWidgets.QWidget):
     def set_mode(self, mode, split):
         self.mode, self.split = mode, split
         self.relayout()
+
+    def paintEvent(self, _event):
+        # black under the windows too - a gap between them in Sync, or the
+        # moment before a window is laid out, must not show Nuke's grey
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), getattr(self, "background",
+                                              imageview_mod.BACKGROUND))
 
     # ------------------------------------------------------------- layout
     def resizeEvent(self, event):
@@ -942,13 +950,10 @@ class PlayerPanel(QtWidgets.QWidget):
     def _slot_par(self, slot):
         """How much wider than stored this window should draw its picture.
 
-        The node's Anamorphic setting wins over the file, because the file is
-        what is usually wrong; "from file" (None) falls back to what the header
-        said. With Desqueeze off it is 1 whatever anything says - that is the
-        setting for looking at the delivered pixels.
+        The node's Anamorphic number for that input - the only say there is
+        now (the header's own pixel aspect is not consulted; the number is
+        what is set). 1 draws the stored pixels as they are.
         """
-        if not self._settings.get("desqueeze", True):
-            return 1.0
         chosen = self._settings.get("in_squeeze", ())
         if slot.source < len(chosen) and chosen[slot.source] is not None:
             return float(chosen[slot.source])
@@ -1004,8 +1009,8 @@ class PlayerPanel(QtWidgets.QWidget):
         a plate delivered with handles must not add frames of comp that do not
         exist, and a short plate must not cut the comp off.
 
-        Outside its own range a sequence holds its end frame
-        (ExrSequence.path_for clamps), so the plate simply stops moving there.
+        Outside its own range an input shows an EMPTY frame (see _show_slot),
+        so a short plate simply has no picture past its end.
 
         The plate is only used when there is no comp at all, so a node with
         just a plate wired up still plays.
@@ -1015,11 +1020,8 @@ class PlayerPanel(QtWidgets.QWidget):
             # Start at moves the timeline WITH the comp (it renumbers it), but
             # the Offset nudge must not: with the timeline following the nudge
             # too, the comp sat still on screen and it was the plate that
-            # appeared to move. So the timeline stays where the comp was
-            # placed, widened just enough that no nudged frame is cut off.
-            base_first = comp.first - comp.nudge
-            base_last = comp.last - comp.nudge
-            return (min(comp.first, base_first), max(comp.last, base_last))
+            # appeared to move. See node.range_of_comp.
+            return exrnode.range_of_comp(comp)
         found = [s for s in self._sequences if s is not None]
         if not found:
             return None
@@ -2324,7 +2326,9 @@ class PlayerPanel(QtWidgets.QWidget):
             try:
                 annotate.write_pdf(
                     os.path.join(folder, annotate.REPORT_PDF), folder,
-                    pdf_rows, title=clip, subtitle=slot.source_label(),
+                    # top right: WHEN it was exported, not which input - a
+                    # report forwarded next week is read by its date
+                    pdf_rows, title=clip, subtitle=annotate.export_time(),
                     text_size=self._settings.get("annot_pdf_text"))
                 note += "  +  " + annotate.REPORT_PDF
             except Exception as exc:
@@ -2848,10 +2852,15 @@ class PlayerPanel(QtWidgets.QWidget):
         self._annot_opts.set_size("text", s.get("annot_text", annotate.TEXT_H))
         qc_threads = max(1, int(s.get("qc_threads", 4)))
         qc_full = bool(s.get("qc_full_play", True))
+        color = imageview_mod.background_color(s.get("background", 0))
+        if getattr(self._stage, "background", None) != color:
+            self._stage.background = color
+            self._stage.update()
         for view in self._each_view():
-            view.set_show_bbox(s.get("show_bbox", True),
+            view.set_background(color)
+            view.set_show_bbox(s.get("show_bbox", False),
                                s.get("line_format", False),
-                               s.get("line_bbox", False))
+                               s.get("line_bbox", True))
         for slot in self._slots:
             self._sync_bbox_warning(slot, s)
         # a redraw only when one of them really changed - otherwise every
@@ -2896,8 +2905,7 @@ class PlayerPanel(QtWidgets.QWidget):
             self._apply_color(s)
         # after the sources, since which input a window shows decides which
         # squeeze applies to it
-        if (s.get("desqueeze") != old.get("desqueeze")
-                or s.get("in_squeeze") != old.get("in_squeeze")
+        if (s.get("in_squeeze") != old.get("in_squeeze")
                 or s.get("sources") != old.get("sources")):
             self._apply_squeeze()
         for widget, key in ((self._chan, "channels"), (self._mode, "loop")):
@@ -2925,6 +2933,8 @@ class PlayerPanel(QtWidgets.QWidget):
                 self._apply_panel_flags(s, slot)
             if s.get("scope_opacity") != old.get("scope_opacity"):
                 slot.scopes.set_opacity(s.get("scope_opacity", 0.75))
+            if not s.get("scope_probe", True) and old.get("scope_probe", True):
+                slot.scopes.set_probe(None)      # switched off: clear it now
         if s.get("wipe_opacity") != old.get("wipe_opacity"):
             value = s.get("wipe_opacity", 1.0)
             self._stage.wipe_opacity = value
@@ -3032,11 +3042,14 @@ class PlayerPanel(QtWidgets.QWidget):
         # 8 either side stays 8 either side when the input changes, so it is
         # taken out of the way here and put back over the new range below
         held = self._handles.value()
+        self.timeline.set_range(first, last)
+        # IN / OUT, and so the frame, may go past the shot - as far as the
+        # timeline reaches when zoomed out (Timeline.reach)
+        lo, hi = self.timeline.reach()
         for w in (self._in_spin, self._out_spin, self._frame_spin):
             w.blockSignals(True)
-            w.setRange(first, last)
+            w.setRange(lo, hi)
             w.blockSignals(False)
-        self.timeline.set_range(first, last)
         self.timeline.set_in_out(first, last)
         self.mark_in, self.mark_out = first, last
         if held:
@@ -3136,6 +3149,14 @@ class PlayerPanel(QtWidgets.QWidget):
         seq = slot.sequence
         if seq is None:
             return False
+        if not seq.first <= self.frame <= seq.last:
+            # NO DATA HERE - the playhead is past this input's frames (IN / OUT
+            # pulled out beyond the comp, or a plate shorter than it). An
+            # empty frame, not the last one held: a still where there is no
+            # footage reads as footage.
+            slot.view.set_blank()
+            self._sync_bbox_warning(slot)
+            return True
         arr = self.cache.get(slot.loader.key_for(self.frame))
         if arr is None:
             return False
@@ -3156,7 +3177,8 @@ class PlayerPanel(QtWidgets.QWidget):
             mates = [m for m in self._slots
                      if m is not slot and m.sequence is not None]
             mates.sort(key=lambda m: m.source == slot.source)
-            if mates:
+            if mates and (mates[0].sequence.first <= self.frame
+                          <= mates[0].sequence.last):
                 other = self.cache.peek(mates[0].loader.key_for(self.frame))
         matte = (self.cache.peek(self._matte_loader.key_for(self.frame))
                  if self._matte_live() else None)
@@ -3272,12 +3294,20 @@ class PlayerPanel(QtWidgets.QWidget):
     def goto(self, frame):
         if self.sequence is None:
             return
-        self.frame = self.sequence.clamp(frame)
+        self.frame = self._clamp_frame(frame)
         self._sync_frame_widgets()
         self._show_current()
         self._request_around()
         self._maybe_reschedule_cache()   # a jump elsewhere -> move the cache window there
         self.timeline.update()
+
+    def _clamp_frame(self, frame):
+        """Where the playhead may go: the shot, and past it as far as IN / OUT
+        have been pulled."""
+        rng = self._tl_range or (self.sequence.first, self.sequence.last)
+        lo = min(rng[0], self.mark_in)
+        hi = max(rng[1], self.mark_out)
+        return max(lo, min(hi, int(frame)))
 
     def step(self, delta):
         self._direction = 1 if delta >= 0 else -1
@@ -3919,8 +3949,12 @@ class PlayerPanel(QtWidgets.QWidget):
         # the mouse is over and is cleared on every other one, so two windows
         # cannot both claim to be showing "the" pixel. Freezing the readout (P)
         # parks the marker with it - which is the point of freezing.
+        # ...unless the cursor markers are switched off (Settings > Cursor in
+        # scopes): then no scope is told about the cursor at all
+        show_on_scopes = bool(self._settings.get("scope_probe", True))
         for s in self._slots:
-            s.scopes.set_probe(info if s is slot else None)
+            s.scopes.set_probe(info if (s is slot and show_on_scopes)
+                               else None)
         if info is None:
             self._probe_lbl.setText("")
             return
@@ -4194,46 +4228,71 @@ class PlayerPanel(QtWidgets.QWidget):
         self._request_around()
 
     def _cache_lanes(self):
-        """One list of runs PER LIVE INPUT, for the timeline's cache lines.
+        """[Comp runs, Plate runs] for the timeline's cache lines, BY INPUT.
 
-        Not the intersection any more. It was honest about where playback can
-        go, but it hid which of the two inputs is behind - and that is the one
-        thing you want to know while a second input is still filling.
+        By input and not by window: in Base only one window is live, so the
+        timeline used to show one line - whichever input that window happened
+        to show - and the other input's cache was invisible. Now the top line
+        is always Comp and the bottom one always Plate, in every view mode,
+        whenever both are wired. None for an input that is not connected;
+        an empty list for one that is connected but has nothing in RAM.
+
+        Not the intersection. It was honest about where playback can go, but it
+        hid which of the two inputs is behind - and that is the one thing you
+        want to know while a second input is still filling.
         """
-        return [self._runs_of(s) for s in self._live_slots()]
+        lanes = []
+        for index in range(2):
+            seq = (self._sequences[index]
+                   if index < len(self._sequences) else None)
+            if seq is None:
+                lanes.append(None)
+                continue
+            # the layer a window showing this input reads - its key carries it;
+            # with no window on it, the plain rgba key
+            showing = [s for s in self._slots
+                       if s.source == index and s.sequence is seq]
+            if showing:
+                lanes.append(self._runs_of(showing[0]))
+            else:
+                lanes.append(self._runs_from(
+                    self.cache.cached_frames(seq)))
+        return lanes
 
     def _sync_alt_numbering(self):
-        """Puts input B's own numbers under the cache lanes, when they help.
+        """Puts the Plate's frame numbers under the cache lanes, when they differ.
 
-        This row exists for ONE case: the two inputs were delivered on
-        different numbering - a plate at 1001-1100 against a render of it at
-        1-100 - where working out which plate frame you are on means doing
-        arithmetic in your head at 8pm.
+        The numbers are the plate's AS PLACED on the node: Start at applied,
+        so a plate of files 1-147 started at 1001 counts 1001, 1002, ... - not
+        its file numbers, which were what the row used to show, and which say
+        nothing once the plate has been put where it belongs.
 
-        So the test is whether the two SOURCES are numbered differently, not
-        whether they sit at different places on the timeline. Those come apart
-        exactly when both inputs are the same camera numbering and one is
-        nudged a frame against the other: the placement differs, the numbering
-        does not, and the row then repeats the file's own count - seven digits
-        under every tick, saying nothing the row above does not.
+        What the row is for is the Offset: a plate nudged +2 has its 1001
+        under timeline 1003, and that is what the row reads. With no Offset
+        the plate's numbers ARE the timeline's, the row would only repeat the
+        line above it, and it is not drawn.
         """
         a, b = (self._sequences + [None, None])[:2]
-        if a is None or b is None or len(self._live_slots()) < 2:
+        # both WIRED is enough: the Plate cache line is under the Comp one in
+        # every view mode now, so its numbering belongs with it in every mode
+        if a is None or b is None:
             self.timeline.set_alt_numbering(None)
             return
-        # back out the placement to get what each was delivered as
-        a_src = (a.first - a.offset, a.last - a.offset)
-        b_src = (b.first - b.offset, b.last - b.offset)
-        if a_src == b_src:
+        shift = b.nudge                     # the Offset; Start at is applied
+        if not shift:
             self.timeline.set_alt_numbering(None)
             return
-        self.timeline.set_alt_numbering(b.offset, b.first, b.last)
+        self.timeline.set_alt_numbering(shift, b.first, b.last)
 
     def _runs_of(self, slot):
-        frames = sorted(self.cache.cached_frames(slot.sequence,
-                                                 slot.loader.key_fn()))
+        return self._runs_from(self.cache.cached_frames(slot.sequence,
+                                                        slot.loader.key_fn()))
+
+    @staticmethod
+    def _runs_from(frames):
+        """Sorted frame numbers -> [[from, to], ...] of unbroken stretches."""
         runs = []
-        for f in frames:
+        for f in sorted(frames):
             if runs and f == runs[-1][1] + 1:
                 runs[-1][1] = f
             else:
@@ -4284,9 +4343,19 @@ class PlayerPanel(QtWidgets.QWidget):
         # at all)
         # One line per input. Where playback may actually go is a different
         # question and is asked of the cache directly (see _frame_cached).
-        lanes = self._cache_lanes()
-        self.timeline.set_cache_runs(lanes[0] if lanes else [],
-                                     lanes[1] if len(lanes) > 1 else None)
+        # the Plate's frames, so a fitted timeline always has both clips on it
+        b = self._sequences[1] if len(self._sequences) > 1 else None
+        if b is not None and self._sequences[0] is not None:
+            self.timeline.set_extent(b.first, b.last)
+        else:
+            self.timeline.set_extent(None)
+        comp, plate = (self._cache_lanes() + [None, None])[:2]
+        if comp is None:
+            # only a plate wired (or nothing): one line, the full height
+            self.timeline.set_cache_runs(plate or [], None)
+        else:
+            # both wired: two lines, even when the plate's is still empty
+            self.timeline.set_cache_runs(comp, plate)
         self._sync_alt_numbering()
         self._refresh_ram_label()
         for slot in self._slots:

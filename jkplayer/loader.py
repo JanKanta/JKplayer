@@ -145,7 +145,11 @@ class FrameLoader(object):
                     return False
                 if hi is not None and f > hi:
                     return False
-                return True
+                # outside the input's own frames there is nothing to fetch -
+                # the player shows an empty frame there, not the edge one
+                return seq_first <= f <= seq_last
+
+            seq_first, seq_last = self._seq.first, self._seq.last
 
             if want(frame):
                 self._enqueue_locked(frame, 0)
@@ -182,6 +186,11 @@ class FrameLoader(object):
             b = seq.last if last is None else int(last)
             if b < a:
                 a, b = b, a
+            # IN / OUT may reach past the input's frames; only its own count
+            a, b = max(a, seq.first), min(b, seq.last)
+            if b < a:
+                self._background.clear()
+                return
             span = b - a + 1
             start = a if anchor is None else max(a, min(b, int(anchor)))
             step = 1 if direction >= 0 else -1

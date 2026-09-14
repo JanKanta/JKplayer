@@ -494,7 +494,7 @@ class DisplayTransform(object):
         t.start()
         return t
 
-    def _rebuild(self, gain, black=0.0):
+    def _rebuild(self, gain, black=0.0, gamma=1.0):
         """The processor for one exposure: shaper (gain inside) then cube.
 
         EXPOSURE IS BAKED IN, not left as a dynamic property, and that is the
@@ -510,16 +510,16 @@ class DisplayTransform(object):
         if live is None or live.cube is None:
             return
         group = _OCIO.GroupTransform()
-        group.appendTransform(self._shaper_transform(gain, black))
+        group.appendTransform(self._shaper_transform(gain, black, gamma))
         group.appendTransform(live.cube)
         cpu = self._config.getProcessor(group).getOptimizedCPUProcessor(
             _OCIO.BIT_DEPTH_F16, _OCIO.BIT_DEPTH_UINT8,
             _OCIO.OPTIMIZATION_DEFAULT)
-        self._live = _Live(cube=live.cube, cpu=cpu, gain=(gain, black))
+        self._live = _Live(cube=live.cube, cpu=cpu, gain=(gain, black, gamma))
 
-    def _shaper_transform(self, gain=1.0, black=0.0):
+    def _shaper_transform(self, gain=1.0, black=0.0, gamma=1.0):
         """Our shaper table as a half-domain 1D LUT OCIO can apply itself."""
-        table = self._shaper_table(gain, black).astype(np.float32)
+        table = self._shaper_table(gain, black, gamma).astype(np.float32)
         one = _OCIO.Lut1DTransform(length=table.size, inputHalfDomain=True)
         one.setData(np.ascontiguousarray(
             np.repeat(table.reshape(-1, 1), 3, axis=1).ravel()))
@@ -551,7 +551,7 @@ class DisplayTransform(object):
         out[1:] = 2.0 ** (LOG_MIN + t * (LOG_MAX - LOG_MIN))
         return out
 
-    def _shaper_table(self, gain, black=0.0):
+    def _shaper_table(self, gain, black=0.0, gamma=1.0):
         """65536 -> position in the cube. Input conversion and exposure live here.
 
         The order matters: linearise the input first, only then multiply by
@@ -565,9 +565,10 @@ class DisplayTransform(object):
             table = self.linear_table()
             if table is not None:
                 v = table.astype(np.float32)
-        # the black point first, then the white one: (v - black) * gain,
-        # with gain = 1 / (white - black) - a Grade's two points
-        v = (v - float(black)) * float(gain)
+        # CC as Nuke's Grade, on the linear value, before the display - the
+        # same function the built-in path and the scopes use
+        from .nukelut import grade
+        v = grade(v, gain, gamma, black)
         lo = 2.0 ** LOG_MIN
         first = 1.0 / (CUBE_SIZE - 1)          # width of the first cell in positions
         log_pos = first + (1.0 - first) * (
@@ -581,13 +582,13 @@ class DisplayTransform(object):
         live = self._live
         return live is not None and live.cpu is not None
 
-    def apply(self, half_rgb, gain=1.0, black=0.0):
+    def apply(self, half_rgb, gain=1.0, black=0.0, gamma=1.0):
         """(h,w,3) half scene-linear -> (h,w,3) uint8 ready for display.
 
         One OCIO pass over row bands. Everything the transform does lives in
         the processor built by bake(); nothing here touches a pixel.
         """
-        self._set_gain(gain, black)
+        self._set_gain(gain, black, gamma)
         live = self._live              # read ONCE - a bake may land mid-frame
         if live is None or live.cpu is None:
             raise OcioError("nothing is baked, call bake()")
@@ -625,13 +626,14 @@ class DisplayTransform(object):
         list(_pool().map(lambda i: band(edges[i], edges[i + 1]), range(bands)))
         return out
 
-    def _set_gain(self, gain, black=0.0):
-        """A new white/black point means a new processor - see _rebuild."""
-        gain = float(gain) if gain and gain > 0 else 1.0
+    def _set_gain(self, gain, black=0.0, gamma=1.0):
+        """A new lift / gain / gamma means a new processor - see _rebuild."""
+        gain = float(gain) if gain else 1e-6
         black = float(black or 0.0)
+        gamma = float(gamma or 1.0)
         live = self._live
-        if live is None or live.gain != (gain, black):
-            self._rebuild(gain, black)
+        if live is None or live.gain != (gain, black, gamma):
+            self._rebuild(gain, black, gamma)
 
     def is_linear_input(self):
         """Is the input space already scene-linear? Then there is nothing to convert."""

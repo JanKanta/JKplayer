@@ -12,6 +12,7 @@ viewer and the export: the viewer passes the pan and zoom it is drawing at, the
 export passes none.
 """
 
+import datetime
 import os
 import re
 
@@ -701,6 +702,16 @@ PDF_GAP = 18            # between the heading, the picture and the notes
 
 
 REPORT_PDF = "annotations.pdf"
+
+# How the export time is written at the top right of every PDF page:
+# day.month.year hours:minutes, local time.
+EXPORT_TIME_FORMAT = "%d.%m.%Y  %H:%M"
+
+
+def export_time(when=None):
+    """The date and time of an export, as the PDF shows it."""
+    when = when or datetime.datetime.now()
+    return when.strftime(EXPORT_TIME_FORMAT)
 
 # What an exported picture is called. In the code rather than on the node: it
 # is not a choice anybody needs to make per shot - the clip already has its own
