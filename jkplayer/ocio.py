@@ -114,6 +114,53 @@ def find_configs():
     return found
 
 
+# The menu entry for a config the user points at themselves. The same word
+# Nuke uses for it in Project Settings, which is what lets a project's own
+# custom config be taken over name for name.
+CUSTOM_LABEL = "custom"
+
+
+def config_menu(configs=None):
+    """The names the Config menu offers: every config found, then custom."""
+    configs = configs if configs is not None else find_configs()
+    return [c[0] for c in configs] + [CUSTOM_LABEL]
+
+
+def resolve_config(name, custom_path="", configs=None):
+    """(path, problem) for a config chosen by NAME.
+
+    By name, not by position in the list. The list is whatever this machine
+    has installed - another Nuke version, another $OCIO - so the third entry
+    here is not the third entry there, and a script saved with an index would
+    open on somebody else's pipeline without a word.
+
+    custom: the file the user pointed at, which has to exist. A name this
+    machine does not have falls back to nuke-default AND says so; a silent
+    fallback would show a different picture with nothing to explain it.
+    """
+    configs = configs if configs is not None else find_configs()
+    if name == CUSTOM_LABEL:
+        path = os.path.expandvars(os.path.expanduser((custom_path or "").strip()))
+        if path:
+            path = os.path.normpath(path)       # one kind of slash, not a mix
+        if not path:
+            return None, "OCIO: custom is chosen but no config file is set"
+        if not os.path.isfile(path):
+            return None, "OCIO: custom config not found: %s" % path
+        return path, None
+    for label, path in configs:
+        if label == name:
+            return path, None
+    if not configs:
+        return None, "OCIO: no config found"
+    fallback = configs[default_config_index(configs)]
+    problem = None
+    if name:
+        problem = ("OCIO: config '%s' is not on this machine - showing %s"
+                   % (name, fallback[0]))
+    return fallback[1], problem
+
+
 def default_config_index(configs=None):
     """Index of the nuke-default config (or 0 when it is not there)."""
     configs = configs if configs is not None else find_configs()

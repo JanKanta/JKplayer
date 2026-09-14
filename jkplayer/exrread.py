@@ -95,6 +95,8 @@ class ExrFile(object):
         self.compression = None
         self.x0 = self.y0 = 0
         self.width = self.height = 0
+        self.data_window = None     # (x0, y0, x1, y1), inclusive, as in the file
+        self.display_window = None  # the FORMAT - see ImageView.set_windows
         # 1.0 unless the file says otherwise. Anamorphic and 2K/HD-squeezed
         # plates carry it, and without it a 2:1 squeeze reads as "the two
         # inputs are different shapes" when they are the same picture.
@@ -116,6 +118,9 @@ class ExrFile(object):
                 x0, y0, x1, y1 = struct.unpack("<iiii", body)
                 self.x0, self.y0 = x0, y0
                 self.width, self.height = x1 - x0 + 1, y1 - y0 + 1
+                self.data_window = (x0, y0, x1, y1)
+            elif name == "displayWindow" and size >= 16:
+                self.display_window = struct.unpack("<iiii", body[:16])
             elif name == "channels":
                 self.channels = _parse_channels(body)
             elif name == "pixelAspectRatio" and size >= 4:
@@ -318,6 +323,8 @@ def probe(path):
         e = ExrFile(path)
         return {"width": e.width, "height": e.height,
                 "pixel_aspect": e.pixel_aspect,
+                "data_window": e.data_window,
+                "display_window": e.display_window,
                 "compression": COMPRESSION_NAMES.get(e.compression, e.compression),
                 "channels": [c[0] for c in e.channels],
                 "supported": True}
@@ -493,3 +500,26 @@ def metadata(path):
             text = "<%s, %d bytes>" % (atype, len(body))
         out.append((name, text))
     return out
+
+
+def windows(path):
+    """(data window, display window) from the header, or None.
+
+    Header only - read per frame while playing, because a render with an
+    animated bounding box has a different data window on every frame.
+    """
+    try:
+        attrs = header_attributes(path)
+    except (OSError, ValueError):
+        return None
+    data = display = None
+    for name, _atype, body in attrs:
+        if len(body) < 16:
+            continue
+        if name == "dataWindow":
+            data = struct.unpack("<iiii", body[:16])
+        elif name == "displayWindow":
+            display = struct.unpack("<iiii", body[:16])
+    if data is None or display is None:
+        return None
+    return data, display

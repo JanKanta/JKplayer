@@ -43,13 +43,8 @@ def _expose_in_main():
 PANEL_ID = "com.honza.JKplayerPanel"
 PANEL_NAME = "JKplayer"
 
-# The widget is named as an EXPRESSION, evaluated later in __main__ - which is
-# what _expose_in_main is for.
-_WIDGET_EXPR = ("__import__('nukescripts').panels.WidgetKnob("
-                "jkplayer.panel.PlayerPanel)")
 
-
-def _new_pane_panel(name=None, uid=""):
+def _new_pane_panel(name, uid):
     """A Nuke pane wrapping our widget.
 
     The same thing nukescripts.registerWidgetAsPanel builds, made here so it
@@ -60,8 +55,10 @@ def _new_pane_panel(name=None, uid=""):
     """
     import nukescripts
     title = name or PANEL_NAME
-    ident = panel_id_for(uid) if uid else PANEL_ID
-    expr = ("jkplayer.panel.bound(%r)" % uid) if uid else _WIDGET_EXPR
+    ident = panel_id_for(uid)
+    # the widget is named as an EXPRESSION, evaluated later in __main__ -
+    # which is what _expose_in_main is for - so the uid travels as text
+    expr = "jkplayer.panel.bound(%r)" % uid
     panel = nukescripts.PythonPanel(title, ident)
     panel.addKnob(nuke.PyCustom_Knob(
         title, "",
@@ -69,11 +66,26 @@ def _new_pane_panel(name=None, uid=""):
     return panel
 
 
-def _viewer_pane():
-    """The pane the Viewer lives in, or None when there is no Viewer."""
-    for name in ("Viewer.1", "Viewer1"):
+# Where a player can be docked when none is open yet, in the order tried.
+# The Viewer first because that is where a picture is expected; the Node
+# Graph and the Properties because one of them is on screen in any layout
+# anybody actually works in.
+DOCK_BESIDE = ("Viewer.1", "Viewer1", "DAG.1", "Properties.1")
+
+
+def _dock_pane(uid=""):
+    """The pane a player panel goes into, or None if Nuke has none to offer.
+
+    NEXT TO ANOTHER PLAYER FIRST. Several nodes means several players, and
+    they belong together as tabs of one pane rather than scattered one into
+    each pane the layout happens to have.
+    """
+    ids = [panel_id_for(other) for other in list(_pane_entries)
+           if other != uid]
+    ids.extend(DOCK_BESIDE)
+    for ident in ids:
         try:
-            pane = nuke.getPaneFor(name)
+            pane = nuke.getPaneFor(ident)
         except Exception:
             pane = None
         if pane is not None:
@@ -202,6 +214,67 @@ def _target_node():
     return found[0] if found else None
 
 
+def _live_widget(uid):
+    """The PlayerPanel on screen for this node, or None.
+
+    Looked for among the widgets Qt actually has, rather than trusted from
+    _panels. What _panels holds for a DOCKED panel is Nuke's PythonPanel
+    wrapper, which is not a Qt widget and cannot be asked whether it is still
+    there - asking it always failed, so every open looked like the first and
+    another panel was stacked on top of the one already open.
+    """
+    if not uid:
+        return None
+    try:
+        from .qtcompat import QtWidgets
+        app = QtWidgets.QApplication.instance()
+        widgets = app.allWidgets() if app is not None else ()
+    except Exception:
+        return None
+    for w in widgets:
+        try:
+            if isinstance(w, _panel_module.PlayerPanel) \
+                    and getattr(w, "_node_uid", None) == uid:
+                w.isVisible()                 # still alive on the C++ side?
+                return w
+        except Exception:
+            continue
+    return None
+
+
+def _bring_forward(widget):
+    """Makes a panel the one you are looking at, docked or floating.
+
+    Docked, it is a page in one of Nuke's tabbed panes, and raising the widget
+    does nothing for a page behind another tab - so every tabbed pane it sits
+    in is switched to the page it is on, from the inside out.
+    """
+    from .qtcompat import QtWidgets
+    try:
+        chain = []
+        w = widget
+        while w is not None:
+            chain.append(w)
+            w = w.parentWidget()
+        for holder in chain:
+            if isinstance(holder, QtWidgets.QTabWidget):
+                for page in chain:
+                    i = holder.indexOf(page)
+                    if i >= 0:
+                        holder.setCurrentIndex(i)
+                        break
+            elif isinstance(holder, QtWidgets.QStackedWidget):
+                for page in chain:
+                    if holder.indexOf(page) >= 0:
+                        holder.setCurrentWidget(page)
+                        break
+        top = widget.window()
+        top.raise_()
+        top.activateWindow()
+    except Exception:
+        pass
+
+
 def open_panel(force=False, node=None):
     """Opens a panel for one node, docked beside the Viewer where there is one.
 
@@ -214,62 +287,68 @@ def open_panel(force=False, node=None):
     the same node when somebody really wants it.
     """
     target = node if node is not None else _target_node()
+    if target is None:
+        # A PANEL BELONGS TO A NODE, always. One with no node behind it has
+        # nothing to show and nowhere to keep its settings, and it was the
+        # anonymous "any node" panel that kept turning up as the odd one out.
+        nuke.message("There is no JKplayer node to open.\n\n"
+                     "Create one first: JKplayer > Create JKplayer Node.")
+        return None
     uid = ""
-    if target is not None:
-        try:
-            uid = register_for_node(target)
-        except Exception as exc:
-            nuke.tprint("JKplayer: cannot identify the node (%s)" % exc)
+    try:
+        uid = register_for_node(target)
+    except Exception as exc:
+        nuke.tprint("JKplayer: cannot identify the node (%s)" % exc)
+    if not uid:
+        return None
 
-    if not force and uid:
-        got = _panels.get(uid)
-        if _alive(got):
-            try:                              # a floating window can be raised
-                got.raise_()
-                got.activateWindow()
-            except Exception:
-                pass                          # a docked one is where it is
-            return got
+    if not force:
+        live = _live_widget(uid)
+        if live is not None:
+            _bring_forward(live)
+            return _panels.get(uid) or live
         _panels.pop(uid, None)
 
     # PENDING_UID is the belt to the braces: a docked panel gets its uid from
     # the expression it was registered with, but a floating one is built here
     # and the two paths should not disagree about which node it is.
-    _panel_module.PENDING_UID = uid or None
+    _panel_module.PENDING_UID = uid
     try:
         opened = _build_panel(target, uid)
     finally:
         _panel_module.PENDING_UID = None
-    if uid and opened is not None:
+    if opened is not None:
         _panels[uid] = opened
     return opened
 
 
 def _build_panel(target, uid):
-    """Docked beside the Viewer, floating when there is no Viewer to dock to."""
-    name = PANEL_NAME
-    if target is not None:
-        try:
-            name = target.name()
-        except Exception:
-            pass
+    """Docks the node's player into a pane. NEVER a floating window.
 
-    pane = _viewer_pane()
-    if pane is not None:
-        try:
-            docked = _new_pane_panel(name, uid)
-            docked.addToPane(pane)
-            return docked
-        except Exception as exc:
-            nuke.tprint("JKplayer: could not dock beside the Viewer (%s), "
-                        "opening a window instead" % exc)
+    There used to be a floating fallback for when no Viewer could be found.
+    It is gone on purpose: a window that is not part of the layout does not
+    come back with it, sits over the work, and is the one thing people kept
+    asking to be rid of. If there is nowhere at all to dock, nothing opens and
+    the Script Editor says why - that is a layout to fix, not a reason to
+    float.
+    """
+    try:
+        name = target.name()
+    except Exception:
+        name = PANEL_NAME
 
-    window = _panel_module.PlayerPanel(node_uid=uid or None)
-    window.setWindowTitle(name)
-    window.resize(1280, 820)
-    window.show()
-    window.raise_()
-    return window
+    pane = _dock_pane(uid)
+    if pane is None:
+        nuke.tprint("JKplayer: no pane to dock the %s panel into - open a "
+                    "Viewer or the Node Graph and try again." % name)
+        return None
+    try:
+        docked = _new_pane_panel(name, uid)
+        docked.addToPane(pane)
+        return docked
+    except Exception as exc:
+        nuke.tprint("JKplayer: could not dock the %s panel (%s)" % (name, exc))
+        return None
 
 
 def create_node():
@@ -321,6 +400,71 @@ def _viewer_guard():
         _guard_busy = False
 
 
+_viewer_keys_blocked = False
+
+
+def _selected_for_viewer():
+    """The node Nuke's number keys would put into a Viewer.
+
+    The same choice nukescripts.connect_selected_to_viewer makes for itself -
+    the first selected node that is not a Viewer - so what is blocked is
+    exactly what would have been connected, and nothing else.
+    """
+    try:
+        for node in nuke.selectedNodes(recursive=True):
+            if node.Class() != "Viewer":
+                return node
+    except Exception:
+        pass
+    return None
+
+
+def _install_viewer_key_block():
+    """Number keys on a JKplayer node do nothing - no Viewer, made or wired.
+
+    The Viewer guard already DISCONNECTS a Viewer from our node, but by then
+    pressing 1 has created one: a Viewer node appears in the graph for no
+    reason, and in a script with no Viewer it is a whole new one. Better that
+    the key does nothing at all on this node.
+
+    The keys run the text "nukescripts.connect_selected_to_viewer(N)", looked
+    up when pressed, so wrapping that one function catches every one of them,
+    number row and keypad alike. For any other node it is Nuke's own function,
+    untouched.
+    """
+    global _viewer_keys_blocked
+    if _viewer_keys_blocked:
+        return
+    try:
+        import nukescripts
+        original = nukescripts.connect_selected_to_viewer
+    except Exception as exc:
+        nuke.tprint("JKplayer: cannot guard the Viewer keys (%s)" % exc)
+        return
+    if getattr(original, "_jkplayer_guard", False):
+        _viewer_keys_blocked = True
+        return
+
+    def connect_selected_to_viewer(inputIndex):
+        from . import node as nodemod
+        chosen = _selected_for_viewer()
+        if chosen is not None and nodemod.is_player_node(chosen):
+            nuke.tprint("JKplayer: %s is shown in its own panel - no Viewer "
+                        "is made for it." % chosen.name())
+            return None
+        return original(inputIndex)
+
+    connect_selected_to_viewer._jkplayer_guard = True
+    connect_selected_to_viewer.__doc__ = original.__doc__
+    nukescripts.connect_selected_to_viewer = connect_selected_to_viewer
+    try:
+        import nukescripts.misc as misc
+        misc.connect_selected_to_viewer = connect_selected_to_viewer
+    except Exception:
+        pass
+    _viewer_keys_blocked = True
+
+
 def _install_viewer_guard():
     global _guard_installed
     if _guard_installed:
@@ -341,21 +485,99 @@ def _on_knob_changed():
     try:
         name = nuke.thisKnob().name()
         from . import node as nodemod
+        if name == "showPanel":
+            _on_node_opened(nuke.thisNode())
+            return
+        if name == "name":
+            _on_node_renamed(nuke.thisNode())
+            return
         # what is visible on the node depends on the view mode and on which
         # panels are on - hence QC as well (it hides the QC mode selector)
         watched = ("cv_view_mode",) + tuple("cv_qc_%s" % s
                                             for s in nodemod.SLOT_LABELS)
-        if name != "cv_color_mgmt" and name not in watched:
+        colour = ("cv_color_mgmt", "cv_ocio_config")
+        if name not in colour and name not in watched:
             return
         n = nuke.thisNode()
         if not nodemod.is_player_node(n):
             return
-        if name == "cv_color_mgmt":
+        if name in colour:     # picking 'custom' shows the file field
             nodemod.apply_color_visibility(n)
         else:
             nodemod.apply_view_visibility(n)
     except Exception:
         pass
+
+
+def _on_node_opened(node):
+    """The node's Properties were opened - bring its player up with them.
+
+    `showPanel` is what Nuke sends when a node is double-clicked open, so this
+    is the same gesture that opens any node, and the player for THAT node is
+    the one that comes up - raised if it is already open, made if it is not.
+
+    Deferred to the next turn of the event loop: this runs inside Nuke's knob
+    callback, which is no place to build a docked panel, and doing it there
+    would open the player before the Properties it came with had finished
+    opening.
+    """
+    from . import node as nodemod
+    if not nodemod.is_player_node(node):
+        return
+    try:
+        from .qtcompat import QtCore
+        QtCore.QTimer.singleShot(0, lambda n=node: _open_for(n))
+    except Exception:
+        _open_for(node)
+
+
+def _on_node_renamed(node):
+    """The node got a new name - so do its Pane entry and its tab.
+
+    JKplayer2's panel has to say JKplayer2. A tab still reading the old name
+    after a rename is how two players get confused for each other, which is
+    exactly what naming them after their nodes is meant to prevent.
+    """
+    from . import node as nodemod
+    if not nodemod.is_player_node(node):
+        return
+    try:
+        uid = register_for_node(node)          # swaps the Pane entry
+        new = node.name()
+    except Exception:
+        return
+    if uid:
+        _retitle(_live_widget(uid), new)
+
+
+def _retitle(widget, name):
+    """Puts a new name on the tab a docked player sits in."""
+    if widget is None:
+        return
+    from .qtcompat import QtWidgets
+    try:
+        chain = []
+        w = widget
+        while w is not None:
+            chain.append(w)
+            w = w.parentWidget()
+        for holder in chain:
+            if isinstance(holder, QtWidgets.QTabWidget):
+                for page in chain:
+                    i = holder.indexOf(page)
+                    if i >= 0:
+                        holder.setTabText(i, name)
+                        break
+    except Exception:
+        pass
+
+
+def _open_for(node):
+    try:
+        open_panel(node=node)
+    except Exception as exc:
+        nuke.tprint("JKplayer: cannot open the panel for %s (%s)"
+                    % (getattr(node, "name", lambda: "?")(), exc))
 
 
 def _install_knob_watch():
@@ -391,23 +613,14 @@ def register():
 
     _expose_in_main()
     _install_viewer_guard()
+    _install_viewer_key_block()
     _install_knob_watch()
 
-    try:
-        import nukescripts
-        # Puts JKplayer in the Pane menu and makes the layout able to restore
-        # it. Opening one ourselves goes through _new_pane_panel instead - see
-        # there for why.
-        # THE FALLBACK ENTRY, and note the name. Every node registers a Pane
-        # entry called after itself, and the first node in a script is called
-        # "JKplayer" - so a generic entry by that name would be a second item
-        # with the same label sitting next to it. This one is for opening a
-        # panel when there is no node to name, and for layouts saved before
-        # panels were per node.
-        nukescripts.registerWidgetAsPanel(
-            "jkplayer.panel.PlayerPanel", PANEL_NAME + " (any node)", PANEL_ID)
-    except Exception as exc:
-        nuke.tprint("JKplayer: panel registration failed: %s" % exc)
+    # NO GENERIC PANEL. There used to be a "JKplayer (any node)" entry among
+    # the Custom panels, for opening a player with no node behind it. Every
+    # player now belongs to a node and is listed under that node's name -
+    # JKplayer, JKplayer1, JKplayer2 - so the anonymous one was only ever the
+    # odd one out.
 
     try:
         m = nuke.menu("Nuke").addMenu("JKplayer")

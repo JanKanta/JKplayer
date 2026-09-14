@@ -178,8 +178,8 @@ PARAMS = {
         ("level", "Background level", 40.0, 200.0, 128.0, 0),
     ],
     CANVAS: [
-        ("shift_x", "Shift X (%)", 0.0, 100.0, 50.0, 0),
-        ("shift_y", "Shift Y (%)", 0.0, 100.0, 50.0, 0),
+        ("shift_x", "Shift X (%)", 0.0, 100.0, 50.0, 1),
+        ("shift_y", "Shift Y (%)", 0.0, 100.0, 50.0, 1),
     ],
     VALUEMAP: [
         # Three band boundaries on ONE multi-handle slider (seventh element
@@ -247,6 +247,7 @@ DESCRIPTION = {
           "Look for: colour casts where neutral is expected, a colour that\n"
           "does not match between elements, exaggerated saturation."),
     CANVAS: ("Swaps parts of the image, so the original edges meet in the middle.\n"
+             "Drag the cross where the edges meet to move the join.\n"
              "Look for: light/dark fringes at the edges, joins that do not\n"
              "match, a badly cleaned plate edge."),
     VALUEMAP: ("False colours from the scene-linear values.\n"

@@ -159,3 +159,13 @@ def metadata(path):
     if dpxread.is_dpx(path):
         return dpxread.metadata(path)
     return exrread.metadata(path)
+
+
+def windows(path):
+    """(data window, display window) of an EXR, or None for anything else."""
+    if movread.is_mov(path) or dpxread.is_dpx(path):
+        return None
+    try:
+        return exrread.windows(path)
+    except Exception:
+        return None

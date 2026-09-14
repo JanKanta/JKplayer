@@ -40,6 +40,7 @@ import nuke
 from .qtcompat import QtCore, QtGui, QtWidgets, QShortcut, event_pos
 
 from . import annotate
+from . import cropper
 from . import effects as fx
 from . import exrcore
 from . import meta as meta_mod
@@ -652,7 +653,7 @@ def _size_text(info, par=None):
 # HOW A PANEL LEARNS WHICH NODE IS ITS OWN.
 #
 # Nuke builds a docked panel by EVALUATING a text expression (see
-# register._WIDGET_EXPR), so there is no constructor argument to pass a node
+# register._new_pane_panel), so there is no constructor argument to pass a node
 # in. register.open_panel puts the id here first and the panel takes it in
 # __init__ - the two happen one after the other on the same thread, with no
 # chance for anything else to run in between.
@@ -672,6 +673,93 @@ def bound(uid):
     def make():
         return PlayerPanel(node_uid=uid)
     return make
+
+
+# Every player that is open, so each can say what ALL of them hold in RAM.
+# Weak: a panel Nuke closes is gone from here the moment Qt lets go of it,
+# with nothing to unregister and nothing that can be forgotten.
+import weakref                                  # noqa: E402
+_LIVE_PANELS = weakref.WeakSet()
+
+
+def _machine_ram_mb():
+    try:
+        from .paths import total_ram_mb
+        return float(total_ram_mb() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _release(cache, loaders):
+    """Frees everything one player holds: its decoders stop, its cache empties.
+
+    A plain function taking the pieces rather than a method on the panel,
+    because it runs from the panel's `destroyed` signal - by then the Qt side
+    of the panel is gone and nothing may be asked of it. The cache and the
+    loaders are plain Python and are still there to be let go of.
+    """
+    for loader in loaders:
+        try:
+            loader.on_ready = None      # nothing left to tell
+            loader.stop()
+        except Exception:
+            pass
+    try:
+        cache.close()
+    except Exception:
+        pass
+
+
+def close_docked(widget):
+    """Closes the tab a docked panel sits in; a stray window, if it is one.
+
+    Through the pane's own close request first, so Nuke tidies the tab up the
+    way it does when its X is clicked. If the tab is still there afterwards it
+    is taken out by hand and the page deleted - the RAM is already freed by
+    then, but a tab for a node that no longer exists must not be left behind.
+    """
+    try:
+        chain = []
+        w = widget
+        while w is not None:
+            chain.append(w)
+            w = w.parentWidget()
+        for holder in chain:
+            if not isinstance(holder, QtWidgets.QTabWidget):
+                continue
+            for page in chain:
+                i = holder.indexOf(page)
+                if i < 0:
+                    continue
+                holder.tabCloseRequested.emit(i)
+                if holder.indexOf(page) >= 0:
+                    holder.removeTab(holder.indexOf(page))
+                    page.deleteLater()
+                return True
+        top = widget.window()
+        if top is widget:
+            widget.close()
+            widget.deleteLater()
+            return True
+        widget.hide()
+        widget.deleteLater()
+        return True
+    except Exception:
+        return False
+
+
+def all_players_ram():
+    """(MB in use across every open player, how many players there are)."""
+    used, count = 0.0, 0
+    for panel in list(_LIVE_PANELS):
+        try:
+            if getattr(panel.cache, "closed", False):
+                continue                # closed; its wrapper just lingers
+            used += float(panel.cache.stats()["mb_used"])
+            count += 1
+        except Exception:
+            continue                  # half torn down; it is not holding RAM
+    return used, count
 
 
 class PlayerPanel(QtWidgets.QWidget):
@@ -729,6 +817,7 @@ class PlayerPanel(QtWidgets.QWidget):
         # do not overwrite each other and the RAM budget stays one number the
         # user sets in one place.
         self.cache = FrameCache(4096)
+        _LIVE_PANELS.add(self)
         # 4 threads is the measured optimum (more is held back by memory
         # bandwidth); it can be changed with the cv_workers knob and takes
         # effect after reopening
@@ -740,6 +829,16 @@ class PlayerPanel(QtWidgets.QWidget):
         # its own loader but no window
         self._matte_loader = FrameLoader(self.cache, workers=2,
                                          on_ready=self._frame_ready.emit)
+        # CLOSING THE PANEL LETS GO OF THE SHOT. When Nuke closes the tab, Qt
+        # deletes the panel - and without this its cache stayed in RAM and its
+        # decoding threads kept waiting, for as long as Nuke was open. On the
+        # destroyed signal, not on hide: a panel is hidden every time another
+        # tab in its pane is brought to the front, and that must not throw
+        # away a cache that took minutes to fill.
+        _loaders = [s.loader for s in self._slots] + [self._matte_loader]
+        self.destroyed.connect(
+            lambda *_a, _c=self.cache, _l=_loaders: _release(_c, _l))
+        self._free_pending = False       # the node went; free once unbound
         self._tl_range = None            # the range already set on the timeline
         self._active = 0                 # which window the scopes and probe read
         self._placing = False            # currently placing the controls (see below)
@@ -927,7 +1026,14 @@ class PlayerPanel(QtWidgets.QWidget):
         """
         comp = self._sequences[0] if self._sequences else None
         if comp is not None:
-            return (comp.first, comp.last)
+            # Start at moves the timeline WITH the comp (it renumbers it), but
+            # the Offset nudge must not: with the timeline following the nudge
+            # too, the comp sat still on screen and it was the plate that
+            # appeared to move. So the timeline stays where the comp was
+            # placed, widened just enough that no nudged frame is cut off.
+            base_first = comp.first - comp.nudge
+            base_last = comp.last - comp.nudge
+            return (min(comp.first, base_first), max(comp.last, base_last))
         found = [s for s in self._sequences if s is not None]
         if not found:
             return None
@@ -1013,7 +1119,8 @@ class PlayerPanel(QtWidgets.QWidget):
             "in the image, does the same.\n"
             "70 % and 85 % are the last zooms that still read EVERY source\n"
             "pixel; below about 67 % the picture is computed from a quarter of\n"
-            "the data (watch 'render fps' in the status line).")
+            "the data (watch 'render fps' in the status line - Settings >\n"
+            "Show status line on the node).")
         self._zoom_combo.activated.connect(self._on_zoom_pick)
         self._zoom_combo.lineEdit().returnPressed.connect(
             lambda: self._on_zoom_text(self._zoom_combo.currentText()))
@@ -1036,6 +1143,16 @@ class PlayerPanel(QtWidgets.QWidget):
                              "Only needed to free memory for something else - "
                              "the range refills itself on its own.")
         clear_btn.clicked.connect(self._clear_cache)
+        # what the button would free, right in front of it: the cache in use
+        # against its budget. Up here rather than only in the status line,
+        # which is hidden unless switched on (Settings on the node).
+        self._ram_lbl = QtWidgets.QLabel("RAM -")
+        self._ram_lbl.setStyleSheet("color:#a8a8a8;")
+        self._ram_lbl.setMinimumWidth(
+            self._ram_lbl.fontMetrics().horizontalAdvance("RAM 999.9 / 999.9 GB")
+            + 6)
+        self._ram_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        bar.addWidget(self._ram_lbl)
         bar.addWidget(clear_btn)
 
         # same idea as the transport bar - the view mode is what stays
@@ -1044,7 +1161,7 @@ class PlayerPanel(QtWidgets.QWidget):
             [sep_top, self._chan],
             [self._zoom_combo],
             [self._ocio_view, self._ocio_in],
-            [clear_btn],
+            [self._ram_lbl, clear_btn],
         ]
 
         root.addWidget(bar_host)
@@ -1133,7 +1250,6 @@ class PlayerPanel(QtWidgets.QWidget):
         # Annotation mode: ONE set of notes for the shot, shared by the views -
         # a note belongs to the frame, not to whichever window drew it.
         self._annot = annotate.Annotations()
-        self._export_scopes = None   # built on the first export that wants them
         self._annot_bar = overlay_mod.AnnotBar(self._stage)
         self._annot_bar.toolChanged.connect(self._on_annot_tool)
         self._annot_bar.exportWanted.connect(self._export_annotations)
@@ -1149,6 +1265,13 @@ class PlayerPanel(QtWidgets.QWidget):
         for slot in self._slots:
             slot.view.annotations = self._annot
             slot.view.annotated.connect(self._on_annotated)
+            slot.view.sizeDragged.connect(self._on_size_dragged)
+            slot.view.sizeDragging.connect(self._on_size_dragging)
+            slot.view.canvasShifted.connect(
+                lambda sx, sy, s=slot: self._on_canvas_shifted(s, sx, sy))
+            slot.view.annot_ranges = dict(
+                (tool, rng[:2]) for tool, rng
+                in overlay_mod.AnnotOptions.RANGES.items())
             slot.view.textWanted.connect(
                 lambda x, y, s=slot: self._ask_note(s, x, y))
 
@@ -1219,7 +1342,7 @@ class PlayerPanel(QtWidgets.QWidget):
 
         reset = QtWidgets.QPushButton("Reset")
         reset.setFixedWidth(52)
-        reset.setToolTip("Clear IN/OUT (or the middle mouse button in the timeline)")
+        reset.setToolTip("Clear IN/OUT")
         reset.clicked.connect(self._reset_in_out)
         tl.addWidget(reset)
 
@@ -1350,6 +1473,8 @@ class PlayerPanel(QtWidgets.QWidget):
             "       M metadata (both EXR headers, bottom left)\n"
             "       X switch window (in Sync), - swap Comp/Plate")
         self._status.setContentsMargins(4, 0, 4, 2)
+        # hidden until switched on in Settings - see _show_status
+        self._status.setVisible(False)
         root.addWidget(self._status)
 
         shortcuts = [
@@ -1509,6 +1634,15 @@ class PlayerPanel(QtWidgets.QWidget):
         # and adds the tool strip under them.
         annot_on = self._view_mode == exrnode.VIEW_ANNOTATE
         self._annot_bar.setVisible(annot_on)
+        # THE NOTES THEMSELVES only in Annotation. A circle round a problem
+        # drawn over the picture in Sync or a QC mode is in the way of the
+        # very comparison those modes are for. They are not lost - the
+        # timeline still marks the frames, and the export does not care which
+        # mode is on screen.
+        for view in self._each_view():
+            if view.show_annotations != annot_on:
+                view.show_annotations = annot_on
+                view.update()
         if not annot_on:
             self._annot_bar.set_tool("")
             self._on_annot_tool("")       # hides the settings panel with it
@@ -1595,6 +1729,11 @@ class PlayerPanel(QtWidgets.QWidget):
                 top = (overlay_mod.EDGE if slot.index == 0
                        else self._slots[0].controls.bottom() + overlay_mod.EDGE)
             box = slot.view.geometry()
+            # BEFORE the anchor, not after: fitting changes how wide the strip
+            # is, and in Wipe the second window's controls hang off the first
+            # one's bottom edge - anchoring to a width that is about to change
+            # would put them in the wrong place for one repaint.
+            sb.fit(box.width())
             bar_at, scope_at = overlay_anchors(
                 (box.x(), box.y(), box.right()), stage_w, top)
             sb.set_anchor(*bar_at)
@@ -1887,24 +2026,36 @@ class PlayerPanel(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- Annotation
     def _on_annot_tool(self, tool):
-        """Arms the pencil or the text tool on every window."""
+        """Arms the pencil, the rubber or the text tool on every window."""
         for view in self._each_view():
             view.annot_tool = tool or None
             view.setCursor(QtCore.Qt.CrossCursor if tool
                            else QtCore.Qt.ArrowCursor)
-        # the settings belong to the armed tool, so they come and go with it
+        # The settings belong to the armed tool, so they come and go with it -
+        # and the rubber has none. Showing the panel for it would offer a
+        # colour and a width that change nothing about what it does.
         self._annot_opts.set_tool(tool)
         self._annot_opts.setVisible(
-            bool(tool) and self._view_mode == exrnode.VIEW_ANNOTATE)
+            tool in overlay_mod.AnnotOptions.RANGES
+            and self._view_mode == exrnode.VIEW_ANNOTATE)
         self._place_overlays()
 
-    def _on_annot_color(self, index):
-        """The swatch in the image -> the windows + the node (the node is truth)."""
-        index = int(index)
+    def _on_annot_color(self, color):
+        """The swatch in the image -> the windows + the node (the node is truth).
+
+        One of the six goes into the menu knob, as it always did. A palette
+        colour goes into cv_annot_rgb, and -1 there hands the choice back to
+        the menu - so the node always says which of the two is in charge.
+        """
+        color = int(color)
         for view in self._each_view():
-            view.annot_color = index
-        self._write_knob("cv_annot_color", index)
-        self._settings["annot_color"] = index
+            view.annot_color = color
+        if annotate.is_custom(color):
+            self._write_knob("cv_annot_rgb", color)
+        else:
+            self._write_knob("cv_annot_color", color)
+            self._write_knob("cv_annot_rgb", -1)
+        self._settings["annot_color"] = color
 
     def _on_annot_size(self, tool, value):
         """Pen width or text size, from the bar. Both live in IMAGE pixels."""
@@ -1915,6 +2066,29 @@ class PlayerPanel(QtWidgets.QWidget):
             setattr(view, key, value)
         self._write_knob(knob, value)
         self._settings[key] = value
+
+    def _on_size_dragging(self, tool, value):
+        """Width or Size on the tool panel follows a Shift-drag AS it moves.
+
+        Only the number on screen and the windows - the knob is written once,
+        on release (see _on_size_dragged). Writing it on every mouse move would
+        leave a trail of undo steps nobody wants to step back through.
+        """
+        value = float(value)
+        attr = "annot_pen" if tool == "draw" else "annot_text"
+        for view in self._each_view():
+            setattr(view, attr, value)
+        self._annot_opts.set_size(tool, value)
+
+    def _on_size_dragged(self, tool, value):
+        """Shift-drag on the image set a new pen width or text size.
+
+        Through the same door as the slider, so the knob, the other window and
+        the number on the tool panel all hear about it - and the slider is
+        moved to match, or it would go on showing the old value.
+        """
+        self._on_annot_size(tool, value)
+        self._annot_opts.set_size(tool, value)
 
     def _on_annotated(self):
         """A note was added, taken back or cleared."""
@@ -1935,25 +2109,31 @@ class PlayerPanel(QtWidgets.QWidget):
         index = self._annot.text_at(self.frame, x, y, look, width, height)
         if index is None:
             old, size, at = "", view.annot_text, x
-            color = view.annot_color
+            color, burn = view.annot_color, True
         else:
             old = self._annot.text_of(self.frame, index)
             size = self._annot.text_size(self.frame, index)
             at = self._annot.text_pos(self.frame, index)[0]
             color = self._annot.text_color(self.frame, index)
+            burn = self._annot.text_burned(self.frame, index)
+
         # the column the note will be broken into THERE - the lines shorten
-        # towards a side edge, so the box has to be told which it is
-        per_line = annotate.fits_per_line(size, at, width,
-                                          self._annot.line_max)
-        text, color, ok = overlay_mod.NoteDialog.ask(
-            self.frame, self, old, per_line, index is not None, color)
+        # towards a side edge, so the box has to be told which it is, and told
+        # again whenever the size is changed in it
+        def per_line_for(s, _at=at, _w=width):
+            return annotate.fits_per_line(s, _at, _w, self._annot.line_max)
+
+        text, color, size, burn, ok = overlay_mod.NoteDialog.ask(
+            self.frame, self, old, per_line_for(size), index is not None,
+            color, size, burn, per_line_for)
         if not ok:
             return
         if index is None:
             changed = self._annot.add_text(self.frame, x, y, text, color,
-                                           view.annot_text, look)
+                                           size, look, burn)
         else:
-            changed = self._annot.replace_text(self.frame, index, text, color)
+            changed = self._annot.replace_text(self.frame, index, text, color,
+                                               size, burn)
         if changed:
             self._on_annotated()
 
@@ -1974,12 +2154,16 @@ class PlayerPanel(QtWidgets.QWidget):
             self._note_once("nothing to clear here - the notes on frame %d "
                              "were made in another check" % self.frame)
 
-    def _annot_frame_image(self, slot, frame, look):
+    def _annot_frame_image(self, slot, frame, look, stamp=True):
         """One frame as it LOOKS, at full resolution, with its notes on it.
 
         Rendered from the cached scene-linear data through the window's own
         colour path, so the JPEG matches what was reviewed rather than some
         other interpretation of the same file.
+
+        `stamp=False` leaves the frame number off, for a picture that is still
+        to be cropped - the stamp sits in a corner, and a crop would cut it
+        away. It goes on afterwards, onto the cropped picture (_stamp_image).
         """
         arr = self.cache.peek(slot.loader.key_for(frame))
         if arr is None:
@@ -1993,19 +2177,25 @@ class PlayerPanel(QtWidgets.QWidget):
                              QtGui.QImage.Format_RGB888).copy()
         painter = QtGui.QPainter(image)
         try:
-            # The scopes go UNDER the notes: a note is the point of the file
-            # and must not end up behind a graph.
-            if self._settings.get("annot_scopes"):
-                if self._export_scopes is None:
-                    self._export_scopes = overlay_mod.ExportScopes()
-                self._export_scopes.draw(
-                    painter, slot.view.scope_source_for(arr, rgb, look), w, h)
             # only the notes belonging to THIS view, at image pixels 1:1
-            self._annot.draw(painter, frame, look=look, width=w, height=h)
-            if self._settings.get("annot_stamp", True):
-                effect = (look or {}).get("effect", fx.NONE)
-                label = fx.LABELS.get(effect, "") if effect != fx.NONE else ""
-                annotate.draw_frame_number(painter, frame, w, h, label)
+            self._annot.draw(painter, frame, look=look, width=w, height=h,
+                             export=True)
+        finally:
+            painter.end()
+        if stamp:
+            self._stamp_image(image, frame, look)
+        return image
+
+    def _stamp_image(self, image, frame, look):
+        """The frame number (and the check) in the corner, if the node wants it."""
+        if image is None or not self._settings.get("annot_stamp", True):
+            return image
+        effect = (look or {}).get("effect", fx.NONE)
+        label = fx.LABELS.get(effect, "") if effect != fx.NONE else ""
+        painter = QtGui.QPainter(image)
+        try:
+            annotate.draw_frame_number(painter, frame, image.width(),
+                                       image.height(), label)
         finally:
             painter.end()
         return image
@@ -2025,7 +2215,39 @@ class PlayerPanel(QtWidgets.QWidget):
         slot = self.active
         if slot.sequence is None:
             return
-        pattern = self._settings.get("annot_name") or "annotation_####.jpg"
+        pattern = annotate.EXPORT_NAME
+        # A SUBFOLDER PER CLIP, named after the sequence being exported.
+        # A review folder collects several shots, and a flat pile of
+        # annotation_0012.jpg from three of them is unreadable - and silently
+        # destructive, because the names collide the moment two clips are
+        # reviewed on the same frame numbers.
+        clip = annotate.clip_folder(slot.sequence.pattern)
+        folder = os.path.join(folder, clip)
+
+        # ONE PICTURE PER CHECK. A frame reviewed in the grain check and again
+        # without it is two different findings, and flattening them into one
+        # JPEG would put a note about grain over a plate that does not show
+        # any.
+        jobs = []
+        for frame in frames:
+            for look in self._annot.looks(frame):
+                effect = (look or {}).get("effect", fx.NONE)
+                label = fx.LABELS.get(effect, "") if effect != fx.NONE else ""
+                jobs.append((frame, look, label))
+
+        # LOOK THEM OVER FIRST, and crop what should be cropped. Before the
+        # folder is even made: a cancelled export leaves nothing behind.
+        def render_for(job):
+            return lambda: self._annot_frame_image(slot, job[0], job[1],
+                                                   stamp=False)
+        shown = [("%d%s" % (f, ("  \u00b7  " + lab) if lab else ""),
+                  render_for((f, lk, lab))) for f, lk, lab in jobs]
+        crops = cropper.CropDialog.ask(shown, self)
+        if crops is None:
+            self._toggle_note = "export cancelled - nothing was written"
+            self._toggle_note_t = time.monotonic()
+            return
+
         try:
             if not os.path.isdir(folder):
                 os.makedirs(folder)
@@ -2033,34 +2255,35 @@ class PlayerPanel(QtWidgets.QWidget):
             nuke.message("Cannot create %s\n\n%s" % (folder, exc))
             return
 
-        written, missing, rows = 0, [], []
-        for frame in frames:
-            # ONE PICTURE PER CHECK. A frame reviewed in the grain check and
-            # again without it is two different findings, and flattening them
-            # into one JPEG would put a note about grain over a plate that does
-            # not show any.
-            for look in self._annot.looks(frame):
-                image = self._annot_frame_image(slot, frame, look)
-                if image is None:
-                    missing.append(frame)     # not in the cache - cannot draw it
-                    continue
-                # The check goes IN THE NAME, so whoever opens the folder can
-                # tell the two apart without opening them. A plain frame gets
-                # no label - there is nothing to say.
-                effect = (look or {}).get("effect", fx.NONE)
-                label = fx.LABELS.get(effect, "") if effect != fx.NONE else ""
-                name = annotate.export_name(pattern, frame, label)
-                if image.save(os.path.join(folder, name), "JPG", 92):
-                    written += 1
-                    # One row per FILE, so the table and the folder line up.
-                    # Several notes on one frame become one cell, separated by
-                    # blank lines - they are all about that one picture.
-                    rows.append((
-                        frame, label, name,
-                        self._annot.strokes_count(frame, look),
-                        "\n\n".join(self._annot.notes(frame, look))))
-                else:
-                    missing.append(frame)
+        written, missing, rows, pdf_rows = 0, [], [], []
+        for (frame, look, label), crop in zip(jobs, crops):
+            image = self._annot_frame_image(slot, frame, look, stamp=False)
+            if image is None:
+                missing.append(frame)     # not in the cache - cannot draw it
+                continue
+            # the crop, back up to the size of the frame - and only THEN
+            # the stamp, so a crop cannot cut the frame number away
+            image = cropper.crop_and_fit(image, crop)
+            self._stamp_image(image, frame, look)
+            # The check goes IN THE NAME, so whoever opens the folder can
+            # tell the two apart without opening them. A plain frame gets
+            # no label - there is nothing to say.
+            name = annotate.export_name(pattern, frame, label)
+            if image.save(os.path.join(folder, name), "JPG", 92):
+                written += 1
+                # One row per FILE, so the table and the folder line up.
+                # Several notes on one frame become one cell, separated by
+                # blank lines - they are all about that one picture.
+                marks = self._annot.strokes_count(frame, look)
+                rows.append((
+                    frame, label, name, marks,
+                    "\n\n".join(self._annot.notes(frame, look))))
+                # the PDF keeps the notes APART and with their colours -
+                # the CSV has one cell per file, the page can do better
+                pdf_rows.append((frame, label, name, marks,
+                                 self._annot.note_items(frame, look)))
+            else:
+                missing.append(frame)
         note = "exported %d frame%s to %s" % (written,
                                               "" if written == 1 else "s",
                                               folder)
@@ -2073,6 +2296,15 @@ class PlayerPanel(QtWidgets.QWidget):
                 # The pictures are already written and they are the point -
                 # a failed list must not read as a failed export.
                 note += "  |  list NOT written: %s" % exc
+        if rows and self._settings.get("annot_pdf", True):
+            try:
+                annotate.write_pdf(
+                    os.path.join(folder, annotate.REPORT_PDF), folder,
+                    pdf_rows, title=clip, subtitle=slot.source_label(),
+                    text_size=self._settings.get("annot_pdf_text"))
+                note += "  +  " + annotate.REPORT_PDF
+            except Exception as exc:
+                note += "  |  PDF NOT written: %s" % exc
         if missing:
             # Named, not hidden: a silently short export is the worst outcome
             # here - you would hand over a review that is missing pages.
@@ -2336,6 +2568,8 @@ class PlayerPanel(QtWidgets.QWidget):
             for i, seq in enumerate(self._sequences):
                 if seq is not None:
                     self._set_input_sequence(i, None)
+            if self._free_pending:
+                self._close_for_deleted_node()
             return
         problem = exrnode.enforce_input(node)
         if problem != self._input_note:
@@ -2370,6 +2604,10 @@ class PlayerPanel(QtWidgets.QWidget):
             self._read_spaces = spaces
             self._follow_read_colorspace(spaces)
         self._describe_inputs(node)
+        # also on the watcher tick, not only when the frame moves: switching
+        # Stabilise on, or pasting a track, changes the picture on the frame
+        # already being shown, and nothing else would notice
+        self._sync_stabilise()
         self._hint = self._input_hint(node, count)
 
     def _follow_project_colour(self):
@@ -2498,8 +2736,14 @@ class PlayerPanel(QtWidgets.QWidget):
         showing a different plate without a word.
         """
         if self._node_uid:
+            if self.cache.closed:
+                return None        # closed for a deleted node - see above
             found = exrnode.find_by_uid(self._node_uid)
             if found is not None:
+                # back, after an undo of the delete: let the next delete free
+                # the RAM again - and the next tick rebinds the inputs, so the
+                # cache refills by itself
+                self._orphaned = False
                 self._node_name = found.fullName()
                 return self._upgrade(found)
             # ITS NODE IS GONE. Not a reason to adopt another one - this
@@ -2510,6 +2754,7 @@ class PlayerPanel(QtWidgets.QWidget):
                           "(it was %s)" % (self._node_name or "?"))
             if not self._orphaned:
                 self._orphaned = True
+                self._free_pending = True   # see _follow_tick_inner
                 try:
                     from . import register
                     register.forget_node(self._node_uid)
@@ -2579,6 +2824,12 @@ class PlayerPanel(QtWidgets.QWidget):
         self._annot_opts.set_size("text", s.get("annot_text", annotate.TEXT_H))
         qc_threads = max(1, int(s.get("qc_threads", 4)))
         qc_full = bool(s.get("qc_full_play", True))
+        for view in self._each_view():
+            view.set_show_bbox(s.get("show_bbox", True),
+                               s.get("line_format", False),
+                               s.get("line_bbox", False))
+        for slot in self._slots:
+            self._sync_bbox_warning(slot, s)
         # a redraw only when one of them really changed - otherwise every
         # unrelated knob would throw the rendered image away
         # The matte source and its layer are read by the matte loader, not by
@@ -2614,7 +2865,8 @@ class PlayerPanel(QtWidgets.QWidget):
             self._apply_view_mode(s.get("view_mode", exrnode.VIEW_BASE),
                                   s.get("split", exrnode.SPLIT_SIDE))
         if any(s.get(k) != old.get(k)
-               for k in ("color_mgmt", "ocio_config", "ocio_display",
+               for k in ("color_mgmt", "ocio_config", "ocio_config_name",
+                         "ocio_custom", "ocio_display",
                          "ocio_view", "ocio_input", "nuke_display",
                          "nuke_input")):
             self._apply_color(s)
@@ -2781,6 +3033,7 @@ class PlayerPanel(QtWidgets.QWidget):
         slot.layers = []
         if seq is None:
             slot.view.set_frame(None)
+            self._sync_bbox_warning(slot)
             slot.source_info = "-"
             slot.source_size = ""
             slot.fitted = False           # after a new connection, fit again
@@ -2883,10 +3136,42 @@ class PlayerPanel(QtWidgets.QWidget):
                 other = self.cache.peek(mates[0].loader.key_for(self.frame))
         matte = (self.cache.peek(self._matte_loader.key_for(self.frame))
                  if self._matte_live() else None)
+        # where this frame sits in its format - per frame, since a render
+        # with an animated bounding box has a new data window on every one
+        slot.view.set_windows(*(self._frame_windows(seq.path_for(self.frame))
+                                or (None, None)))
         slot.view.set_frame(arr, prev, other, matte)
+        self._sync_bbox_warning(slot)
         if slot.index == self._active:
             self._update_temporal_note(arr, prev)
         return True
+
+    def _sync_bbox_warning(self, slot, settings=None):
+        """The window's strip goes red when its frame's bbox is not
+        the format (bigger or smaller) - unless switched off on the node."""
+        if getattr(slot, "bar", None) is None:
+            return
+        s = self._settings if settings is None else settings
+        slot.bar.set_bbox_warning(bool(s.get("bbox_warn", True))
+                                  and slot.sequence is not None
+                                  and slot.view.bbox_differs())
+
+    _WINDOWS_MEMO = 4096
+
+    def _frame_windows(self, path):
+        """(data window, display window) of that file, remembered.
+
+        A header read is cheap but not free, and playback loops over the same
+        files again and again.
+        """
+        memo = self.__dict__.setdefault("_windows_memo", {})
+        if path in memo:
+            return memo[path]
+        if len(memo) >= self._WINDOWS_MEMO:
+            memo.clear()
+        found = reader.windows(path) if path else None
+        memo[path] = found
+        return found
 
     def _show_current(self):
         """Shows the current frame FROM THE CACHE. Never decodes on the GUI thread.
@@ -2907,7 +3192,17 @@ class PlayerPanel(QtWidgets.QWidget):
         if shown:
             self._refresh_scopes()
             self._shown += 1
+            # the headers go WITH the picture: during playback the UI timer
+            # (200 ms) skipped ~5 frames per read, so the timecode jumped
+            # 03 -> 08 -> 13. A frame not yet in the cache shows nothing new,
+            # and neither do the metadata.
+            if self._any_meta_visible():
+                self._sync_meta()
         return shown
+
+    def _any_meta_visible(self):
+        return any(sl.meta is not None and sl.meta.isVisible()
+                   for sl in self._slots)
 
     def _refresh_scopes(self, slot=None):
         """Histogram + vectorscope from the frame currently displayed.
@@ -2964,8 +3259,29 @@ class PlayerPanel(QtWidgets.QWidget):
         self._direction = 1 if delta >= 0 else -1
         self.goto(self.frame + delta)
 
+    def _sync_stabilise(self):
+        """Reads the track for THIS frame and hands it to both windows.
+
+        Off the knob every frame rather than out of settings(): settings() is a
+        snapshot of one moment and a track is a curve, so there is nothing in
+        there to read. A knob lookup is cheap next to decoding a 4K frame.
+
+        Both windows get the same shift. The track belongs to the SHOT, and the
+        point of stabilising here is to compare a comp against its plate with
+        both held still - moving one and not the other would be a difference
+        made by this tool rather than found by it.
+        """
+        node = self._get_node()
+        if node is None:
+            return
+        first = self._tl_range[0] if self._tl_range else None
+        dx, dy = exrnode.stabilise_at(node, self.frame, first)
+        for view in self._each_view():
+            view.set_stabilise(dx, dy)
+
     def _sync_frame_widgets(self):
         self.timeline.set_frame(self.frame)
+        self._sync_stabilise()
         # THE ONE PLACE the frame field is written, so it cannot drift from the
         # playhead whichever way the playhead moved. Signals off: setting it
         # here must not read back as the user asking to jump somewhere.
@@ -3285,12 +3601,13 @@ class PlayerPanel(QtWidgets.QWidget):
         Baking the cube takes ~46 ms, so it is done ONLY on a real change of
         config / display / view - not on every tick.
         """
-        configs = ocio.find_configs()
-        if not configs:
-            self._ocio_note = "OCIO: no config found"
+        path, problem = ocio.resolve_config(s.get("ocio_config_name", ""),
+                                            s.get("ocio_custom", ""))
+        if path is None:
+            self._ocio_note = problem
             return
-        idx = max(0, min(len(configs) - 1, int(s.get("ocio_config", 0))))
-        path = configs[idx][1]
+        # a fallback still draws - the note says what it fell back to
+        self._ocio_note = problem or ""
 
         if self._ocio is None or self._ocio.config_path != path:
             self._ocio_extra = {}          # a new config invalidates every one
@@ -3696,6 +4013,15 @@ class PlayerPanel(QtWidgets.QWidget):
         if effect == fx.TEMPORAL:
             self._show_current()          # a changed "offset" wants a different previous frame
 
+    def _on_canvas_shifted(self, slot, shift_x, shift_y):
+        """The canvas check's centre was dragged on the image - the sliders
+        follow, and the values are remembered like a slider move would be."""
+        params = dict(slot.view.effect_params)
+        slot.fx_params[fx.CANVAS] = params
+        panel = slot.controls.fx
+        panel.set_value("shift_x", shift_x)
+        panel.set_value("shift_y", shift_y)
+
     def _set_effect(self, index):
         """Keys 1-7: the QC mode of the active window (switched off by the QC toggle)."""
         combo = self.active.controls.fx.combo
@@ -3765,6 +4091,37 @@ class PlayerPanel(QtWidgets.QWidget):
         # re-anchor once we have travelled a third of the window (not every frame)
         if abs(self.frame - self._cache_anchor) >= max(8, cap // 3):
             self._schedule_cache()
+
+    def _close_for_deleted_node(self):
+        """The node is gone, so its player goes with it - tab, RAM and all.
+
+        A player belongs to one node, and one whose node has been deleted has
+        nothing left to show: a tab still sitting there says the opposite, and
+        it keeps its decoders and its frames for as long as it is left open.
+
+        AFTER the inputs are unbound, and that order matters: a decode still
+        running belongs to a sequence that no longer exists, so the loader
+        drops its result as stale instead of putting it into the cache that is
+        being emptied. An undo of the delete brings the node back but not this
+        tab - open the node again and a fresh player comes up for it.
+        """
+        self._free_pending = False
+        if self._playing:
+            self._play_btn.setChecked(False)
+        for timer in (self._play_timer, self._ui_timer, self._follow_timer,
+                      self._scope_timer):
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        _release(self.cache,
+                 [s.loader for s in self._slots] + [self._matte_loader])
+        self.timeline.set_cache_runs([])
+        nuke.tprint("JKplayer: node %s was deleted - its panel is closed and "
+                    "its cache freed." % (self._node_name or "?"))
+        # next turn of the event loop: this runs inside the panel's own timer,
+        # and a widget must not be taken apart from inside its own callback
+        QtCore.QTimer.singleShot(0, lambda w=self: close_docked(w))
 
     def _clear_cache(self):
         self.cache.clear()
@@ -3840,9 +4197,14 @@ class PlayerPanel(QtWidgets.QWidget):
         return "   ||   ".join(parts)
 
     def _meta_tick(self):
-        """Re-read the headers when the frame moved. Cheap; see _sync_meta."""
-        if any(sl.meta is not None and sl.meta.isVisible()
-               for sl in self._slots):
+        """Re-read the headers when the frame moved. Cheap; see _sync_meta.
+
+        Not while playing: there every shown frame refreshes them itself
+        (_show_current), and the timer would show a frame not on screen yet.
+        """
+        if self._playing:
+            return
+        if self._any_meta_visible():
             self._sync_meta()
 
     def _refresh_status(self):
@@ -3861,13 +4223,16 @@ class PlayerPanel(QtWidgets.QWidget):
         self.timeline.set_cache_runs(lanes[0] if lanes else [],
                                      lanes[1] if len(lanes) > 1 else None)
         self._sync_alt_numbering()
+        self._refresh_ram_label()
         for slot in self._slots:
             if slot.view.last_error:
                 self._status.setText("DISPLAY ERROR (window %s): %s"
                                      % (slot.label, slot.view.last_error))
+                self._show_status(True)
                 return
         if self.sequence is None:
             self._status.setText(self._hint or "no input")
+            self._show_status(False)
             return
         cs = self.cache.stats()
         # the fill rate and the queue are the sum of both inputs - together
@@ -3879,6 +4244,7 @@ class PlayerPanel(QtWidgets.QWidget):
             errs = [s.loader.last_error for s in self._slots
                     if s.loader.last_error]
             self._status.setText("CANNOT LOAD: %s" % (errs[0] if errs else "?"))
+            self._show_status(True)
             return
         # how many PAIRS of frames fit into the budget (on 6K this is crucial)
         capacity = ""
@@ -3893,11 +4259,23 @@ class PlayerPanel(QtWidgets.QWidget):
         # the loader, so it is stable enough to read while playing.
         decode = max((s.loader.avg_decode_ms for s in self._slots), default=0.0)
         decode_txt = " | decode %.0f ms" % decode if decode else ""
-        txt = ("%s | RAM %.0f/%.0f MB (%d f)%s | fill %.0f fps%s "
+        # EVERY PLAYER'S RAM, when there is more than one. Each has its own
+        # budget and each budget looks fine on its own - three players at a
+        # quarter of the machine each is already more than the machine has,
+        # and nothing in any single one of them would say so. Against the
+        # machine's memory, because that is the limit they all share.
+        together = ""
+        used_all, players = all_players_ram()
+        if players > 1:
+            machine = _machine_ram_mb()
+            together = " | %d players %.0f%s MB" % (
+                players, used_all, "/%.0f" % machine if machine else "")
+        txt = ("%s | RAM %.0f/%.0f MB (%d f)%s%s | fill %.0f fps%s "
                "| queue %d | zoom %.0f%%"
                % (self._source_label(),
-                  cs["mb_used"], cs["mb_budget"], cs["frames"], capacity,
-                  fill, decode_txt, pending, self.view.zoom_percent()))
+                  cs["mb_used"], cs["mb_budget"], cs["frames"], together,
+                  capacity, fill, decode_txt, pending,
+                  self.view.zoom_percent()))
         # How fast the PICTURE can be produced - the whole display path, QC
         # check included when one is on. Separate from the "N fps" playback
         # counter, which is what actually reached the screen: this one is the
@@ -3968,11 +4346,44 @@ class PlayerPanel(QtWidgets.QWidget):
         self._status.setText(txt)
         self._status.setToolTip(txt)    # nothing is lost when the line is cut off
         # errors, a duplicate and a disconnected input -> make them obvious
-        if (self._follow_note or self._knob_note or self._input_note
-                or self._temporal_note.startswith("!!")):
+        alarm = bool(self._follow_note or self._knob_note or self._input_note
+                     or self._temporal_note.startswith("!!"))
+        if alarm:
             self._status.setStyleSheet("color:#ff6060; font-weight:bold;")
         else:
             self._status.setStyleSheet("")
+        self._show_status(alarm)
+
+    def _show_status(self, alarm=False):
+        """The status line is shown when switched on in Settings - and, even
+        when it is not, whenever it has an error to report: a hidden line
+        must not be how a broken input goes unnoticed."""
+        want = bool(self._settings.get("status_line", False)) or bool(alarm)
+        if self._status.isVisible() != want:
+            self._status.setVisible(want)
+
+    def _refresh_ram_label(self):
+        """'RAM used / budget' of this player's cache, before Clear cache."""
+        try:
+            cs = self.cache.stats()
+        except Exception:
+            return
+        used, budget = cs["mb_used"] / 1024.0, cs["mb_budget"] / 1024.0
+        text = "RAM %.1f / %.1f GB" % (used, budget)
+        if text != self._ram_lbl.text():
+            self._ram_lbl.setText(text)
+        tip = ["This player's frame cache: %.0f MB in use of %.0f MB "
+               "(%d frames)." % (cs["mb_used"], cs["mb_budget"], cs["frames"])]
+        used_all, players = all_players_ram()
+        machine = _machine_ram_mb()
+        if players > 1:
+            tip.append("All %d players together: %.0f MB." % (players, used_all))
+        if machine:
+            tip.append("The machine has %.0f MB." % machine)
+        tip.append("The budget is set on the node: Cache tab.")
+        tip = "\n".join(tip)
+        if tip != self._ram_lbl.toolTip():
+            self._ram_lbl.setToolTip(tip)
 
     # CAREFUL: no closeEvent stopping the loaders! When docking, Nuke closes and
     # reopens the panel - stopped threads would never start again and the panel

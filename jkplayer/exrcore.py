@@ -647,7 +647,19 @@ def probe(path):
         lib.exr_get_compression(ctxt, 0, C.byref(comp))
         storage = C.c_int()
         lib.exr_get_storage(ctxt, 0, C.byref(storage))
+        display = None
+        try:
+            fn = lib.exr_get_display_window
+            fn.argtypes = [C.c_void_p, C.c_int, C.c_void_p]
+            fn.restype = C.c_int
+            box = (C.c_int32 * 4)()
+            if fn(ctxt, 0, C.byref(box)) == 0:
+                display = (box[0], box[1], box[2], box[3])
+        except Exception:
+            pass
         return {"supported": storage.value == 0,
+                "data_window": (dw[0], dw[1], dw[2], dw[3]),
+                "display_window": display,
                 "width": dw[2] - dw[0] + 1, "height": dw[3] - dw[1] + 1,
                 "compression_id": comp.value, "storage": storage.value,
                 "reason": "" if storage.value == 0 else "tiled/deep"}

@@ -852,6 +852,11 @@ QToolButton#cvToggle:checked {
 QToolButton#cvToggle:disabled {
     color: #4a4a4a; background: #212121; border-color: #3a3a3a;
 }
+QFrame#cvOverlay[cvBbox="true"] {
+    background-color: rgba(150, 20, 20, 210);
+    border: 2px solid rgba(0, 0, 0, 140);   /* half-see-through black frame */
+}
+QLabel#cvBboxWarn { color: #ffd0d0; font-weight: bold; padding: 0 2px; }
 """
 
 # The scopes take a lot of room in the image, so in Sync (where each window
@@ -865,7 +870,8 @@ PANEL_BUTTONS = (
     ("cc", "CC", "Colour: gain, gamma, saturation."),
     ("qc", "QC", "Check mode (grain, high-pass, saturation, value map...)."),
     ("hist", "H", "Histogram: axis 0 to 55, the line at 1.0 marks clipping."),
-    ("vscope", "V", "Vectorscope: pixel colour as it is on screen."),
+    ("vscope", "V", "Vectorscope: the colour of the plate, through the input "
+                    "transform and CC - not the monitor LUT."),
     ("wave", "W", "Waveform: values along the columns, line at 1.0, top 55."),
     ("meta", "META",
      "The EXR headers, bottom left of the image - both inputs at once, "
@@ -1154,95 +1160,206 @@ class OverlayPanel(_Panel):
         return self.y() + self.height()
 
 
-class ExportScopes(object):
-    """The scopes, drawn into an exported picture instead of onto the screen.
+def palette_grid():
+    """The palette, as rows of RGB - laid out the way Apple's Markup grid is.
 
-    Its own set of canvases, built once and never shown: the ones in the window
-    are measuring the frame you are looking at, while an export walks over many
-    frames, and borrowing them would both fight over the same widgets and put
-    the wrong numbers in the file.
+    A top row of greys from white to black, then twelve hues across and nine
+    shades of each down, darkest at the top. Laid out by HUE and by LIGHTNESS
+    rather than as a pile of swatches, so "a lighter one of that" is always
+    straight below it and "the same, but warmer" is next to it - which is the
+    whole reason that grid is quick to use.
+    """
+    cols = len(PALETTE_HUES)
+    rows = []
+    greys = []
+    for i in range(cols):
+        v = int(round(255 * (1.0 - i / float(cols - 1))))
+        greys.append((v, v, v))
+    rows.append(greys)
+    for lightness, saturation in PALETTE_SHADES:
+        row = []
+        for hue in PALETTE_HUES:
+            c = QtGui.QColor.fromHslF(hue / 360.0, saturation, lightness)
+            row.append((c.red(), c.green(), c.blue()))
+        rows.append(row)
+    return rows
 
-    Kept here rather than in annotate.py because these are the very canvases
-    the panels use - the same drawing code, so a scope in a JPEG looks like the
-    one that was on screen.
+
+# cyan, azure, blue, indigo, violet, magenta, rose, red, orange, amber,
+# yellow, green - the order the hues run in on Apple's grid
+PALETTE_HUES = (190, 205, 222, 250, 275, 300, 335, 0, 22, 38, 52, 110)
+# (lightness, saturation), dark at the top to light at the bottom
+PALETTE_SHADES = ((0.16, 0.95), (0.24, 0.95), (0.32, 0.95), (0.42, 0.95),
+                  (0.52, 0.95), (0.62, 0.95), (0.72, 0.90), (0.82, 0.85),
+                  (0.90, 0.80))
+
+
+class _ColorGrid(QtWidgets.QWidget):
+    """The palette that opens under the multicolour swatch.
+
+    A popup, so a click anywhere else closes it - the way a popover does - and
+    it floats over whatever is under it instead of pushing the tool panel
+    about. Painted rather than built from buttons: 120 widgets for one picker
+    would be slower to open than the pick takes.
     """
 
-    WIDTH_PART = 0.24        # share of the picture width the column takes
-    MIN_W, MAX_W = 220, 560
-    GAP = 10
+    picked = QtCore.Signal(tuple)             # (r, g, b)
 
-    def __init__(self):
-        self._hist = HistogramCanvas()
-        self._vscope = VectorscopeCanvas()
-        self._wave = WaveformCanvas()
-        for c in (self._hist, self._vscope, self._wave):
-            c.setAttribute(QtCore.Qt.WA_DontShowOnScreen, True)
-            c.opacity = 1.0
+    CELL = 20
+    PAD = 10
+    RADIUS = 10
 
-    def draw(self, painter, ctx, width, height):
-        """Histogram, vectorscope and waveform down the RIGHT edge, inside the
-        format - the picture keeps its size, the scopes sit on top of it."""
-        w = int(max(self.MIN_W, min(self.MAX_W, width * self.WIDTH_PART)))
-        if w * 2 > width:                       # a tiny plate has no room
+    def __init__(self, parent=None):
+        super(_ColorGrid, self).__init__(parent, QtCore.Qt.Popup
+                                         | QtCore.Qt.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self._rows = palette_grid()
+        self._current = None
+        self._hover = None
+        cols = len(self._rows[0])
+        self.setFixedSize(cols * self.CELL + 2 * self.PAD,
+                          len(self._rows) * self.CELL + 2 * self.PAD
+                          + self.GREY_GAP)
+
+    # a hairline of space between the greys and the colours, as on Apple's
+    GREY_GAP = 6
+
+    def set_current(self, rgb):
+        self._current = tuple(rgb) if rgb is not None else None
+        self.update()
+
+    def _cell_rect(self, row, col):
+        y = self.PAD + row * self.CELL + (self.GREY_GAP if row > 0 else 0)
+        return QtCore.QRectF(self.PAD + col * self.CELL, y,
+                             self.CELL, self.CELL)
+
+    def _cell_at(self, pos):
+        for r, row in enumerate(self._rows):
+            for c in range(len(row)):
+                if self._cell_rect(r, c).contains(pos):
+                    return r, c
+        return None
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(38, 38, 40, 245))
+        p.drawRoundedRect(QtCore.QRectF(self.rect()), self.RADIUS, self.RADIUS)
+
+        # the greys and the colours are each one rounded block, cut into cells
+        for block in ((0, 1), (1, len(self._rows))):
+            top = self._cell_rect(block[0], 0)
+            bottom = self._cell_rect(block[1] - 1, len(self._rows[0]) - 1)
+            outline = QtCore.QRectF(top.topLeft(), bottom.bottomRight())
+            path = QtGui.QPainterPath()
+            path.addRoundedRect(outline, 6, 6)
+            p.save()
+            p.setClipPath(path)
+            for r in range(*block):
+                for c, rgb in enumerate(self._rows[r]):
+                    p.fillRect(self._cell_rect(r, c), QtGui.QColor(*rgb))
+            p.restore()
+
+        # the colour in use, and the one under the cursor
+        for rc, width in ((self._find(self._current), 2.5), (self._hover, 1.5)):
+            if rc is None:
+                continue
+            rect = self._cell_rect(*rc).adjusted(1.5, 1.5, -1.5, -1.5)
+            rgb = self._rows[rc[0]][rc[1]]
+            light = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) > 150
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0) if light
+                                else QtGui.QColor(255, 255, 255), width))
+            p.drawRoundedRect(rect, 3, 3)
+        p.end()
+
+    def _find(self, rgb):
+        if rgb is None:
+            return None
+        for r, row in enumerate(self._rows):
+            for c, cell in enumerate(row):
+                if cell == rgb:
+                    return r, c
+        return None
+
+    def mouseMoveEvent(self, event):
+        cell = self._cell_at(event_pos(event))
+        if cell != self._hover:
+            self._hover = cell
+            self.update()
+
+    def leaveEvent(self, _event):
+        self._hover = None
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        cell = self._cell_at(event_pos(event))
+        if cell is None:
             return
-        channel = scopes.channel_key(ctx.get("channels", 0))
-        qc = bool(ctx.get("qc"))
-        display, linear = ctx.get("display"), ctx.get("linear")
+        rgb = self._rows[cell[0]][cell[1]]
+        self._current = rgb
+        self.picked.emit(rgb)
+        self.close()
 
-        gain, sat = ctx.get("gain", 1.0), ctx.get("sat_matrix")
-        gamma, lz = ctx.get("gamma", 1.0), ctx.get("linearize")
-        # Exactly the split ScopeStack.update_scopes uses: with a check on
-        # there is no scene-linear equivalent of what is on screen, so the
-        # histogram and the waveform measure the finished image; the
-        # vectorscope always does.
-        if qc:
-            self._hist.set_data(scopes.histogram_display(display, channel))
-            self._wave.set_data(scopes.waveform(display, channel),
-                                scopes.WF_AXIS_DISPLAY)
+
+class _PaletteButton(QtWidgets.QToolButton):
+    """The multicolour swatch at the end of the row - it opens the palette.
+
+    Painted as a colour wheel, so it reads as "more colours" rather than as a
+    colour of its own. When the pen is on a palette colour, that colour sits
+    in the middle of the wheel: the row then still shows what the pen is.
+    """
+
+    def __init__(self, parent=None, size=16):
+        super(_PaletteButton, self).__init__(parent)
+        self.setCheckable(True)
+        self.setFixedSize(size, size)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.setToolTip("More colours")
+        self._inner = None
+
+    def set_inner(self, rgb):
+        self._inner = tuple(rgb) if rgb is not None else None
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        r = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        wheel = QtGui.QConicalGradient(r.center(), 90.0)
+        for i, hue in enumerate((0, 60, 120, 180, 240, 300, 360)):
+            wheel.setColorAt(i / 6.0, QtGui.QColor.fromHsv(hue % 360, 230, 255))
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(r, 2, 2)
+        p.fillPath(path, QtGui.QBrush(wheel))
+        if self._inner is not None and self.isChecked():
+            d = r.width() * 0.46
+            dot = QtCore.QRectF(r.center().x() - d / 2, r.center().y() - d / 2,
+                                d, d)
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 1.2))
+            p.setBrush(QtGui.QColor(*self._inner))
+            p.drawEllipse(dot)
+        p.setBrush(QtCore.Qt.NoBrush)
+        if self.isChecked():
+            p.setPen(QtGui.QPen(QtGui.QColor(240, 240, 240), 2.0))
+            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 2, 2)
         else:
-            self._hist.set_data(scopes.histogram(linear, channel, gain, sat,
-                                                 linearize=lz, gamma=gamma))
-            self._wave.set_data(
-                scopes.waveform_linear(linear, channel, gain, sat,
-                                       linearize=lz, gamma=gamma),
-                scopes.WF_AXIS_LINEAR)
-        self._vscope.set_data(scopes.vectorscope(display, channel))
-
-        # All three SQUARE, at the column's width. On screen the histogram and
-        # the waveform are wide and short because they share a narrow panel
-        # with everything else; in an export there is room, and a column of
-        # three equal tiles reads as one block instead of two slivers beside a
-        # square. It also gives the waveform far more vertical room, which is
-        # the axis its levels are actually read on.
-        # Three squares have to FIT, so the column is also capped by the height.
-        # Without this a 2K plate silently lost the waveform off the bottom -
-        # and a scope that is quietly missing is worse than a smaller one.
-        w = int(min(w, (height - self.GAP * 4) / 3.0))
-        if w < 80:
-            return                              # no room worth drawing in
-        x = width - w - self.GAP
-        y = self.GAP
-        for canvas in (self._hist, self._vscope, self._wave):
-            canvas.resize(w, w)
-            painter.save()
-            painter.translate(x, y)
-            canvas.render(painter, QtCore.QPoint(0, 0),
-                          QtGui.QRegion(),
-                          QtWidgets.QWidget.RenderFlags(
-                              QtWidgets.QWidget.DrawChildren))
-            painter.restore()
-            y += w + self.GAP
+            p.setPen(QtGui.QPen(QtGui.QColor(32, 36, 44), 1.0))
+            p.drawRoundedRect(r, 2, 2)
+        p.end()
 
 
 class _Swatches(QtWidgets.QWidget):
-    """The annotation colours as a row of buttons.
+    """The annotation colours: a row of the usual ones, and the palette.
 
     One widget for both places that offer them - the tool settings, where it
     sets what the NEXT mark will be, and the note box, where it sets that one
     note. Painted rather than styled by the theme: the button IS the colour.
     """
 
-    colorChanged = QtCore.Signal(int)         # index into annotate.COLORS
+    colorChanged = QtCore.Signal(int)     # see annotate.color_rgb for the int
 
     def __init__(self, parent=None, size=16):
         super(_Swatches, self).__init__(parent)
@@ -1250,8 +1367,9 @@ class _Swatches(QtWidgets.QWidget):
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
-        self._buttons = []
-        for i, rgb in enumerate(annotate.COLORS):
+        self._buttons = {}
+        for i in annotate.QUICK_COLORS:
+            rgb = annotate.COLORS[i]
             b = QtWidgets.QToolButton(self)
             b.setCheckable(True)
             b.setFixedSize(size, size)
@@ -1263,23 +1381,66 @@ class _Swatches(QtWidgets.QWidget):
                 "QToolButton:checked { border: 2px solid #f0f0f0; }" % rgb)
             b.clicked.connect(lambda *_a, k=i: self._pick(k))
             lay.addWidget(b)
-            self._buttons.append(b)
+            self._buttons[i] = b
+        self._more = _PaletteButton(self, size)
+        self._more.clicked.connect(self._open_palette)
+        lay.addWidget(self._more)
+        self._grid = None
         self.set_color(0)
 
     def color(self):
         return self._color
 
-    def set_color(self, index):
-        """From outside. No signal is sent."""
-        self._color = int(index) % len(annotate.COLORS)
-        for i, b in enumerate(self._buttons):
+    def set_color(self, color):
+        """From outside. No signal is sent.
+
+        A palette colour - or white, which lives in the palette now - checks
+        the wheel and shows the colour in its middle; one of the row checks
+        its own swatch.
+        """
+        color = int(color)
+        in_row = (not annotate.is_custom(color)
+                  and color % len(annotate.COLORS) in self._buttons)
+        self._color = color % len(annotate.COLORS) if in_row else color
+        for i, b in self._buttons.items():
             b.blockSignals(True)
-            b.setChecked(i == self._color)
+            b.setChecked(in_row and i == self._color)
             b.blockSignals(False)
+        self._more.blockSignals(True)
+        self._more.setChecked(not in_row)
+        self._more.blockSignals(False)
+        self._more.set_inner(None if in_row else annotate.color_rgb(color))
 
     def _pick(self, index):
         self.set_color(index)
         self.colorChanged.emit(self._color)
+
+    def _open_palette(self):
+        # the wheel is a door, not a state: clicking it must not leave it
+        # checked when nothing was picked
+        self.set_color(self._color)
+        if self._grid is None:
+            self._grid = _ColorGrid(self)
+            self._grid.picked.connect(self._on_grid)
+        self._grid.set_current(annotate.color_rgb(self._color))
+        # UNDER the row, left edge lined up with it - kept on the screen
+        below = self.mapToGlobal(QtCore.QPoint(0, self.height() + 4))
+        screen = QtGui.QGuiApplication.screenAt(below)
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = min(below.x(), area.right() - self._grid.width())
+            y = below.y()
+            if y + self._grid.height() > area.bottom():
+                y = self.mapToGlobal(QtCore.QPoint(0, 0)).y() \
+                    - self._grid.height() - 4
+            below = QtCore.QPoint(max(area.left(), x), y)
+        self._grid.move(below)
+        self._grid.show()
+
+    def _on_grid(self, rgb):
+        color = annotate.custom_color(*rgb)
+        self.set_color(color)
+        self.colorChanged.emit(color)
 
 
 class NoteDialog(QtWidgets.QDialog):
@@ -1297,7 +1458,7 @@ class NoteDialog(QtWidgets.QDialog):
     _last_size = None            # shared by every note in this session
 
     def __init__(self, frame, parent=None, text="", per_line=0, edit=False,
-                 color=0):
+                 color=0, size=annotate.TEXT_H, burn=True, per_line_for=None):
         super(NoteDialog, self).__init__(parent)
         self.setWindowTitle("%s note - frame %d"
                             % ("Edit" if edit else "Annotation", int(frame)))
@@ -1309,6 +1470,10 @@ class NoteDialog(QtWidgets.QDialog):
         lay.setSpacing(8)
 
         self._per_line = per_line or annotate.LINE_MAX
+        # how many characters fit at a given SIZE, where the note sits - so the
+        # box re-wraps as the size is changed and never shows a line the
+        # picture will break differently
+        self._per_line_for = per_line_for
 
         # QTextEdit and not QPlainTextEdit: only this one can be told to break
         # its lines at a COLUMN, which is what makes the box show the same 50
@@ -1347,8 +1512,34 @@ class NoteDialog(QtWidgets.QDialog):
         self._swatches = _Swatches(self, 18)
         self._swatches.set_color(color)
         row.addWidget(self._swatches)
+        row.addSpacing(14)
+
+        # SIZE, per note. The tool panel sets how big the NEXT note is; it
+        # cannot reach one already written, so this is the only way to make a
+        # note that turned out too small readable without typing it again.
+        row.addWidget(QtWidgets.QLabel("Size", self))
+        lo, hi, _default = AnnotOptions.RANGES["text"]
+        self._size = QtWidgets.QDoubleSpinBox(self)
+        self._size.setRange(lo, hi)
+        self._size.setDecimals(0)
+        self._size.setSingleStep(2.0)
+        self._size.setValue(float(size))
+        self._size.setToolTip("Height of the note, in pixels of the plate.")
+        self._size.valueChanged.connect(self._on_size)
+        row.addWidget(self._size)
         row.addStretch(1)
         lay.addLayout(row)
+
+        # In the picture, or only in the report. A long note written over the
+        # frame covers the problem it is about; in the CSV and the PDF it can
+        # be read without hiding anything. On screen it is always shown - a
+        # note you cannot see is one you cannot click to edit.
+        self._burn = QtWidgets.QCheckBox("Show in the exported picture", self)
+        self._burn.setChecked(bool(burn))
+        self._burn.setToolTip(
+            "Off: the note is still in the CSV and on the PDF page, but the\n"
+            "JPEG shows the frame clean. On screen here it stays visible.")
+        lay.addWidget(self._burn)
         self._on_changed()
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -1358,7 +1549,9 @@ class NoteDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
-        self.resize(NoteDialog._last_size or QtCore.QSize(460, 240))
+        last = NoteDialog._last_size
+        self.resize(last if isinstance(last, QtCore.QSize)
+                    else QtCore.QSize(460, 240))
         self.edit.setFocus()
 
     def _on_changed(self):
@@ -1384,6 +1577,23 @@ class NoteDialog(QtWidgets.QDialog):
             note += "  Empty the box to delete it."
         self._hint.setText(note)
 
+    def _on_size(self, value):
+        """Re-wraps the box at the column the new size will get in the picture."""
+        if self._per_line_for is None:
+            return
+        self._per_line = max(1, int(self._per_line_for(float(value))))
+        self.edit.setLineWrapColumnOrWidth(self._per_line)
+        self._on_changed()
+
+    def note_size(self):
+        # NOT size(): every Qt widget already has one, returning the WINDOW's
+        # size, and done() below relies on it. Shadowing it put the text height
+        # where the window size is remembered, and the next box could not open.
+        return float(self._size.value())
+
+    def burn(self):
+        return self._burn.isChecked()
+
     def text(self):
         return self.edit.toPlainText().strip()
 
@@ -1395,22 +1605,90 @@ class NoteDialog(QtWidgets.QDialog):
         super(NoteDialog, self).done(result)
 
     @classmethod
-    def ask(cls, frame, parent=None, text="", per_line=0, edit=False, color=0):
-        """(text, colour, accepted)."""
-        dlg = cls(frame, parent, text, per_line, edit, color)
+    def ask(cls, frame, parent=None, text="", per_line=0, edit=False, color=0,
+            size=annotate.TEXT_H, burn=True, per_line_for=None):
+        """(text, colour, size, burn, accepted)."""
+        dlg = cls(frame, parent, text, per_line, edit, color, size, burn,
+                  per_line_for)
         ok = dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec()
-        return dlg.text(), dlg.color(), bool(ok)
+        return dlg.text(), dlg.color(), dlg.note_size(), dlg.burn(), bool(ok)
+
+
+def rubber_icon(size=32):
+    """A pencil eraser in outline - the same light grey as the other tools.
+
+    No colour of its own. The pen, the text tool and this sit side by side as
+    one set, and a pink block among two plain glyphs looked like a colour to
+    pick rather than a tool.
+
+    Painted at twice the size it is shown at, so it stays crisp on a HiDPI
+    screen. Built once and kept: a QPixmap needs the GUI running, so it cannot
+    be made at import time, and there is no reason to paint it more than once.
+    """
+    global _RUBBER_ICON
+    if _RUBBER_ICON is not None:
+        return _RUBBER_ICON
+    pix = QtGui.QPixmap(size, size)
+    pix.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pix)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    p.translate(size / 2.0, size / 2.0)
+    p.rotate(-45.0)
+    s = size / 32.0
+    ink = QtGui.QColor(214, 214, 214)
+    p.setPen(QtGui.QPen(ink, 2.0 * s))
+    p.setBrush(QtCore.Qt.NoBrush)
+    p.drawRoundedRect(QtCore.QRectF(-13 * s, -6 * s, 26 * s, 12 * s),
+                      2.5 * s, 2.5 * s)
+    # the line where the rubber meets the sleeve
+    p.drawLine(QtCore.QPointF(-2 * s, -6 * s), QtCore.QPointF(-2 * s, 6 * s))
+    # the working end filled in, so the shape reads at 16 px
+    p.setPen(QtCore.Qt.NoPen)
+    p.setBrush(ink)
+    p.drawRoundedRect(QtCore.QRectF(-13 * s, -6 * s, 11 * s, 12 * s),
+                      2.5 * s, 2.5 * s)
+    p.end()
+    _RUBBER_ICON = QtGui.QIcon(pix)
+    return _RUBBER_ICON
+
+
+_RUBBER_ICON = None
+
+
+class _BarDivider(QtWidgets.QWidget):
+    """A hairline between groups of buttons on a strip.
+
+    Fading out at both ends rather than a hard rule: the strip floats over the
+    picture, and a solid line reads as a crack in the panel where this only has
+    to say "the next buttons are a different kind".
+    """
+
+    def __init__(self, parent=None, height=20):
+        super(_BarDivider, self).__init__(parent)
+        self.setFixedSize(9, height)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        x = self.width() / 2.0
+        line = QtGui.QLinearGradient(0, 1, 0, self.height() - 1)
+        line.setColorAt(0.0, QtGui.QColor(255, 255, 255, 0))
+        line.setColorAt(0.5, QtGui.QColor(255, 255, 255, 70))
+        line.setColorAt(1.0, QtGui.QColor(255, 255, 255, 0))
+        p.fillRect(QtCore.QRectF(x - 0.5, 1, 1.0, self.height() - 2),
+                   QtGui.QBrush(line))
+        p.end()
 
 
 class AnnotBar(QtWidgets.QFrame):
-    """Pencil, text and export - the tools of Annotation mode.
+    """Export, then the pencil, rubber and text, then undo and clear.
 
     A strip of its own under the window controls rather than more buttons on
     them: the notes belong to the SHOT, not to a window, and in this mode there
     is only one window anyway.
     """
 
-    toolChanged = QtCore.Signal(str)      # "" | "draw" | "text"
+    toolChanged = QtCore.Signal(str)      # "" | "draw" | "erase" | "text"
     exportWanted = QtCore.Signal()
     undoWanted = QtCore.Signal()
     clearWanted = QtCore.Signal()
@@ -1428,17 +1706,42 @@ class AnnotBar(QtWidgets.QFrame):
         lay.setSpacing(4)
         lay.setSizeConstraint(QtWidgets.QLayout.SetFixedSize)
 
+        # EXPORT FIRST, set apart. It is the one button here that acts on the
+        # whole shot rather than on the frame you are looking at, so it does
+        # not sit in among the tools - and then Undo and Clear, which act on
+        # this frame only, get a group of their own at the other end.
+        lay.addWidget(self._action_button(
+            "Export", "Writes every annotated frame as a JPEG into a folder\n"
+                      "named after the clip, with the CSV and the PDF beside\n"
+                      "them. Frames without a note are not written.",
+            self.exportWanted))
+        lay.addWidget(_BarDivider(self))
+
         self._tools = {}
         for key, glyph, tip in (
                 ("draw", "✎", "Pencil - drag on the image to draw.\n"
                                    "The frame is then marked blue in the "
                                    "timeline.\nThe MIDDLE button still pans."),
+                ("erase", "",
+                 "Rubber - drag over the pen ink to rub it out.\n"
+                 "Only what passes under it goes: cross a line and it is cut\n"
+                 "in two. The circle round the cursor is how big it is.\n"
+                 "Only ink made in the view you are in, and never text -\n"
+                 "a note is edited by clicking it."),
                 ("text", "T", "Text - click where the note belongs and type "
                               "it.\nClick a note you already wrote to change "
                               "it.\nThe frame is marked blue too.")):
             b = QtWidgets.QToolButton(self)
             b.setObjectName("cvToggle")
-            b.setText(glyph)
+            if key == "erase":
+                # A DRAWN RUBBER, not a character. There is no eraser in the
+                # fonts Nuke can be counted on to have, and the nearest glyph
+                # (a backspace key) reads as "delete the last thing" - which
+                # is what Undo next to it already does.
+                b.setIcon(rubber_icon())
+                b.setIconSize(QtCore.QSize(16, 16))
+            else:
+                b.setText(glyph)
             b.setCheckable(True)
             b.setFixedSize(24, 20)
             b.setFocusPolicy(QtCore.Qt.NoFocus)
@@ -1447,22 +1750,23 @@ class AnnotBar(QtWidgets.QFrame):
             lay.addWidget(b)
             self._tools[key] = b
 
+        lay.addWidget(_BarDivider(self))
         for text, tip, sig in (
-                ("Export", "Writes every annotated frame as a JPEG into the\n"
-                           "folder set on the node. Frames without a note are\n"
-                           "not written.", self.exportWanted),
                 ("Undo", "Takes back the last note on this frame.",
                  self.undoWanted),
                 ("Clear", "Removes every note on this frame.",
                  self.clearWanted)):
-            b = QtWidgets.QToolButton(self)
-            b.setObjectName("cvToggle")
-            b.setText(text)
-            b.setFixedHeight(20)
-            b.setFocusPolicy(QtCore.Qt.NoFocus)
-            b.setToolTip(tip)
-            b.clicked.connect(lambda *_a, s=sig: s.emit())
-            lay.addWidget(b)
+            lay.addWidget(self._action_button(text, tip, sig))
+
+    def _action_button(self, text, tip, signal):
+        b = QtWidgets.QToolButton(self)
+        b.setObjectName("cvToggle")
+        b.setText(text)
+        b.setFixedHeight(20)
+        b.setFocusPolicy(QtCore.Qt.NoFocus)
+        b.setToolTip(tip)
+        b.clicked.connect(lambda *_a, s=signal: s.emit())
+        return b
 
     def tool(self):
         return self._tool
@@ -1822,10 +2126,77 @@ class SlotBar(QtWidgets.QFrame):
             lay.addWidget(b)
             self._toggles[key] = b
 
+        # the shot's data window is not its format - see set_bbox_warning
+        self.bbox_warn = QtWidgets.QLabel("BBox is different then Canvas", self)
+        self.bbox_warn.setObjectName("cvBboxWarn")
+        self.bbox_warn.setToolTip(
+            "The bounding box (data window) of this frame is not the same as\n"
+            "its format - bigger (picture outside the frame) or smaller.\n"
+            "Switched off on the node: Settings > Warn when bbox differs.")
+        self.bbox_warn.setVisible(False)
+        lay.addWidget(self.bbox_warn)
+        self._bbox_on = False
+
         self._source = 0
         self._anchor = (EDGE, EDGE)
         self.set_source(0)
         self._reposition()
+
+    # WHAT STAYS WHEN THE WINDOW GETS NARROW, in the order it is given up.
+    # The input marker is not in the list: in Sync it is the only thing saying
+    # which of the two windows you are looking at, and a picture you cannot
+    # identify is worse than one with no controls over it.
+    # The bbox warning is last, so it is the first word to go - the strip
+    # stays red without it.
+    KEEP_ORDER = ("layer", "cc", "qc", "hist", "vscope", "wave", "meta",
+                  "bbox")
+
+    def fit(self, available):
+        """Hide whatever will not fit across `available` pixels of window.
+
+        This strip is laid out at a FIXED size - it has to be, it floats over
+        the picture instead of being laid out by it - so a narrow window does
+        not squeeze it, it lets the buttons run off the edge and over each
+        other. Past that width they come off instead, from the end least
+        missed: every toggle here is also on a key (C Q H V W M), the layer
+        menu is not, so the toggles go first and the layer goes last.
+        """
+        lay = self.layout()
+        margins = lay.contentsMargins()
+        room = (int(available) - margins.left() - margins.right()
+                - self.button.width() - lay.spacing())
+        widths, items = [], []
+        for key in self.KEEP_ORDER:
+            if key == "bbox":
+                if not self._bbox_on:
+                    continue            # nothing to make room for
+                widget = self.bbox_warn
+            else:
+                widget = (self.layer if key == "layer"
+                          else self._toggles.get(key))
+            if widget is None:
+                continue
+            items.append(widget)
+            widths.append(max(widget.width(), widget.sizeHint().width())
+                          + lay.spacing())
+        keep, total = len(items), sum(widths)
+        while keep > 0 and total > room:
+            keep -= 1
+            total -= widths[keep]
+        changed = False
+        for i, widget in enumerate(items):
+            wanted = i < keep
+            if widget.isVisible() != wanted:
+                widget.setVisible(wanted)
+                changed = True
+        if changed:
+            # SetFixedSize means the strip is however wide its visible children
+            # are, so it has just changed shape and whatever sits under it in
+            # Wipe has to be told where the bottom went
+            lay.activate()
+            self.adjustSize()
+            self.moved.emit()
+        return keep
 
     # ---- anchoring -----------------------------------------------------
     # The position is decided by the panel (see _Stage): in Base and Sync
@@ -1876,6 +2247,24 @@ class SlotBar(QtWidgets.QFrame):
 
     def source(self):
         return self._source
+
+    def set_bbox_warning(self, on):
+        """The whole strip goes red and says "BBox is different then Canvas"."""
+        on = bool(on)
+        if on == self._bbox_on:
+            return
+        self._bbox_on = on
+        self.setProperty("cvBbox", on)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.bbox_warn.setVisible(on)
+        self.layout().activate()
+        self.adjustSize()
+        self.update()
+        self.moved.emit()
+
+    def bbox_warning(self):
+        return self._bbox_on
 
     def set_active(self, active):
         """Highlights the window the scopes and the pixel readout read from."""
@@ -2255,6 +2644,10 @@ class VectorscopeCanvas(_Canvas):
         self._plate = scopes.hue_plate()          # the backdrop is computed once
         self._rgb = None                          # KEEPS the buffer alive for the QImage
         self._image = None
+        # how the trace was encoded: (channel, gain, gamma, sat) when it was
+        # made from the plate, None when from the finished image (QC) - the
+        # ring under the cursor has to be put through the SAME one
+        self.encode = None
 
     def set_data(self, grid):
         if grid is None:
@@ -2333,7 +2726,15 @@ class VectorscopeCanvas(_Canvas):
         # scopes.vectorscope_point, i.e. the same maths the trace was built
         # with, so it lands exactly where that pixel's contribution is.
         if self._probe:
-            xy = scopes.vectorscope_point(self._probe.get("shown"))
+            if self.encode is None:
+                src = self._probe.get("shown")
+            else:
+                ch, gain, gamma, sat = self.encode
+                lin = self._probe.get("linear")
+                src = (None if lin is None else scopes.vector_rgb(
+                    np.asarray(lin, dtype=np.float32).reshape(1, 3), ch, gain,
+                    gamma, sat).reshape(3))
+            xy = scopes.vectorscope_point(src)
             if xy is not None:
                 q = at(xy)
                 p.setBrush(QtCore.Qt.NoBrush)
@@ -2680,8 +3081,8 @@ class ScopeStack(_Stack):
         The histogram and the waveform follow one switch: in ordinary display
         they measure scene-linear data (and everything above 1 is visible in
         them), in QC mode the finished image - a QC visualisation has no
-        scene-linear equivalent. The vectorscope always takes the finished
-        image.
+        scene-linear equivalent. The vectorscope follows the same switch, so
+        none of the three moves when only the monitor LUT is changed.
         """
         channel = scopes.channel_key(ctx.get("channels", 0))
         qc = bool(ctx.get("qc"))
@@ -2690,14 +3091,21 @@ class ScopeStack(_Stack):
         gamma, lz = ctx.get("gamma", 1.0), ctx.get("linearize")
 
         if self.vscope.is_open():
-            # ALWAYS off the finished image - in both modes. It measures colour,
-            # not level, and that only means anything in a bounded domain (see
-            # the header of scopes.py). CC and the display transform are
-            # already in that image, so it follows them for free.
-            # The channel selection ISOLATES here: with a single channel the
-            # trace is a line pointing at that primary and its length is how
-            # much of the channel is in the shot (see scopes.vectorscope).
-            self.vscope.canvas.set_data(scopes.vectorscope(display, channel))
+            # THE SAME SWITCH AS THE OTHER TWO. In ordinary display off the
+            # plate, through a fixed encoding (scopes.vector_rgb), so the
+            # monitor LUT does not move it any more than it moves the histogram
+            # or the waveform. In QC mode off the finished image, because a QC
+            # visualisation has no scene-linear equivalent.
+            # The channel selection ISOLATES either way: with a single channel
+            # the trace is a line pointing at that primary and its length is
+            # how much of the channel is in the shot (see scopes.vectorscope).
+            if qc:
+                self.vscope.canvas.encode = None
+                self.vscope.canvas.set_data(scopes.vectorscope(display, channel))
+            else:
+                self.vscope.canvas.encode = (channel, gain, gamma, sat)
+                self.vscope.canvas.set_data(scopes.vectorscope_linear(
+                    linear, channel, gain, sat, linearize=lz, gamma=gamma))
         if self.wave.is_open():
             if qc:
                 self.wave.canvas.set_data(scopes.waveform(display, channel),

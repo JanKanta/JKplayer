@@ -20,6 +20,7 @@ Inputs named A and B give exactly what we need, and the innards stay hidden
 are recognised by their tag, so they keep working - just with a single input.
 """
 
+import os
 import uuid
 
 import nuke
@@ -318,34 +319,33 @@ def _add_knobs(node):
                  "the whole shot.")
     add(k)
 
-    k = nuke.String_Knob("cv_annot_name", "File name", "annotation_####.jpg")
-    k.setTooltip("Name of an exported file. #### becomes the frame number.\n"
-                 "Without any #, the number is added before the extension, so\n"
-                 "one file per frame either way.")
-    add(k)
-
     k = nuke.Enumeration_Knob("cv_annot_color", "Pen colour",
                               list(annotate.COLOR_NAMES))
     k.setTooltip("Colour of new strokes and notes. Existing ones keep theirs.")
-    add(k)
+    # NOT ON THE NODE'S FACE ANY MORE. The colour, the pen width and the text
+    # size are what the tool in the image is holding, and they are set there -
+    # the swatches, the Width, Shift-drag. Two places to set one thing, one of
+    # them a tab away from the picture, was only ever a way for the two to
+    # disagree. Kept as hidden knobs because they still REMEMBER the choice
+    # with the script, and old scripts still have values in them.
+    add_hidden(k)
 
-    k = nuke.Double_Knob("cv_annot_pen", "Pen width")
+    # A colour picked from the palette. Kept beside the menu above rather than
+    # replacing it: that one is an enumeration saved BY NAME in every script
+    # that has a JKplayer node, and turning it into something else would make
+    # all of those forget their pen colour. -1 = the menu decides.
+    k = nuke.Int_Knob("cv_annot_rgb", "Pen colour (palette)")
+    k.setValue(-1)
+    add_hidden(k)
+
+    k = nuke.Double_Knob("cv_annot_pen", "Pen width")          # hidden, see above
     k.setValue(annotate.LINE_W)
     k.setRange(0.5, 40.0)
     k.setTooltip("Stroke width, in IMAGE pixels - so a line keeps its weight\n"
                  "on the plate whatever you are zoomed to, and comes out of\n"
                  "the export the thickness it looked.\n"
                  "Existing strokes keep the width they were drawn with.")
-    add(k)
-
-    k = nuke.Boolean_Knob("cv_annot_scopes", "Export with scopes")
-    k.setValue(False)
-    k.setFlag(nuke.STARTLINE)
-    k.setTooltip("Draws the histogram, vectorscope and waveform OF THAT FRAME\n"
-                 "down the right-hand side of the exported picture.\n"
-                 "Inside the format - the JPEG keeps the plate's resolution,\n"
-                 "the scopes sit on top of it.")
-    add(k)
+    add_hidden(k)
 
     k = nuke.Boolean_Knob("cv_annot_csv", "Export list (CSV)")
     k.setValue(True)
@@ -358,6 +358,29 @@ def _add_knobs(node):
                  "Excel with the diacritics intact." % annotate.REPORT_NAME)
     add(k)
 
+    k = nuke.Boolean_Knob("cv_annot_pdf", "Export report (PDF)")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Writes '%s' next to the pictures: one page per finding, the\n"
+                 "frame above and what was written on it below.\n"
+                 "The folder and the table are two things to hand over and\n"
+                 "neither reads on its own - the table has no pictures, the\n"
+                 "pictures have no words. This is the same review in the form\n"
+                 "it gets looked at in." % annotate.REPORT_PDF)
+    add(k)
+
+    k = nuke.Double_Knob("cv_annot_pdf_text", "PDF text size")
+    k.setValue(annotate.PDF_BODY)
+    k.setRange(annotate.PDF_BODY_MIN, 60.0)
+    k.clearFlag(nuke.STARTLINE)
+    k.setTooltip("How big the notes are set under the picture in the PDF.\n"
+                 "A page with more notes than fit shrinks them to fit rather\n"
+                 "than cutting the last one off, so this is the size they are\n"
+                 "set at when there is room for it.\n"
+                 "Separate from the size notes are drawn on the picture: that\n"
+                 "one is in pixels of the plate, this is type on a page.")
+    add(k)
+
     k = nuke.Boolean_Knob("cv_annot_stamp", "Export with frame number")
     k.setValue(True)
     k.setFlag(nuke.STARTLINE)
@@ -366,12 +389,11 @@ def _add_knobs(node):
                  "JPEGs gives no way back to the frame a note is about.")
     add(k)
 
-    k = nuke.Double_Knob("cv_annot_text", "Text size")
+    k = nuke.Double_Knob("cv_annot_text", "Text size")         # hidden, as the pen
     k.setValue(annotate.TEXT_H)
     k.setRange(6.0, 200.0)
-    k.setTooltip("Height of a note, in IMAGE pixels (see Pen width).\n"
-                 "Existing notes keep the size they were written at.")
-    add(k)
+    k.setTooltip("Height of a note, in IMAGE pixels.")
+    add_hidden(k)
 
     k = nuke.Int_Knob("cv_annot_line", "Line length")
     k.setValue(annotate.LINE_MAX)
@@ -582,6 +604,43 @@ def _add_knobs(node):
                      "tab." % label)
         add(k)
 
+    # ---- stabilisation, at the bottom and behind a line ----
+    #
+    # A track pasted in, not computed here. Solving 2D motion is a whole tool
+    # and Nuke already has it; what a review player is missing is a way to LOOK
+    # at the result without building a stabilised branch in the comp just to
+    # check whether the grain sits still.
+    add(nuke.Text_Knob("cv_stab_div", ""))
+
+    k = nuke.Boolean_Knob("cv_stab_on", "Stabilise")
+    k.setValue(False)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Hold the picture still using the track below.\n"
+                 "DISPLAY ONLY, like Desqueeze: the pixels, the probe, the "
+                 "scopes and anything exported are unchanged - this\n"
+                 "moves the window over the plate, it does not resample it.")
+    add(k)
+
+    k = nuke.XY_Knob("cv_stab_xy", "Track")
+    k.setTooltip("Paste a Tracker's x and y here - copy the animation off the "
+                 "tracker's point and paste it onto this knob.\n"
+                 "Read per frame, so it follows the playhead. Both channels "
+                 "are taken as the POSITION of the feature being\n"
+                 "followed: the picture is moved by however far that has "
+                 "travelled since the reference frame below.\n"
+                 "With nothing animated on it, nothing moves.")
+    add(k)
+
+    k = nuke.Int_Knob("cv_stab_ref", "Reference frame")
+    k.setValue(0)
+    k.setRange(0, 1000000)
+    k.setTooltip("The frame the picture is held still AT - where the track is "
+                 "taken to be zero movement.\n"
+                 "0 means the first frame of the range.\n"
+                 "Move it and the whole shot re-centres on that frame; it "
+                 "changes where the picture sits, not how it moves.")
+    add(k)
+
     # ---- Scopes ----
     # The histogram, the vectorscope and the waveform are one family and are
     # read as one, so what belongs to all three lives together - rather than
@@ -721,10 +780,19 @@ def _add_knobs(node):
 
     configs = ocio.find_configs() if ocio.available() else []
     k = nuke.Enumeration_Knob("cv_ocio_config", "Config",
-                              [c[0] for c in configs] or ["(none found)"])
+                              ocio.config_menu(configs))
     if configs:
         k.setValue(ocio.default_config_index(configs))    # nuke-default
-    k.setTooltip("A config from the OCIO variable or from the Nuke installation.")
+    k.setTooltip("A config from the OCIO variable or from the Nuke installation,\n"
+                 "or 'custom' for one of your own - see Custom config below.")
+    add(k)
+
+    # YOUR OWN CONFIG. Only shown while 'custom' is the one picked - see
+    # apply_color_visibility - so it is not a field sitting there for nothing.
+    k = nuke.File_Knob("cv_ocio_custom", "Custom config")
+    k.setTooltip("The .ocio file to use when Config is set to 'custom'.\n"
+                 "A project whose Project Settings use a custom config hands\n"
+                 "its file over here by itself.")
     add(k)
 
     # The display and the view are kept as TEXT, not as an enumeration - their
@@ -766,6 +834,48 @@ def _add_knobs(node):
                           "Display is handled by the panel:  "
                           "JKplayer > Open JKplayer Panel")
     add(info)
+
+    # ---- settings ----
+    add(nuke.Tab_Knob("cv_settings_tab", "Settings"))
+    k = nuke.Boolean_Knob("cv_show_bbox", "Show outside format")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("An EXR whose data window is bigger than its format "
+                 "(overscan) carries picture outside the frame.\n"
+                 "On: that picture is shown.\n"
+                 "Off: the picture is cut to the format.\n"
+                 "The lines are separate switches below; nothing is drawn "
+                 "when the bounding box is the format.")
+    add(k)
+    k = nuke.Boolean_Knob("cv_line_format", "Format line")
+    k.setValue(False)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Outline the format (the display window) with a solid line.")
+    add(k)
+    k = nuke.Boolean_Knob("cv_line_bbox", "Bbox line")
+    k.setValue(False)
+    k.clearFlag(nuke.STARTLINE)
+    k.setTooltip("Outline the bounding box (the data window) with a dashed "
+                 "line, as the Nuke Viewer does.")
+    add(k)
+    k = nuke.Boolean_Knob("cv_bbox_warn", "Warn when bbox differs")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("When a frame's bounding box is not its format - bigger or "
+                 "smaller - the window's control strip\n"
+                 "(input, CC, QC, META...) turns red and says 'BBox is different "
+                 "then Canvas'.")
+    add(k)
+    add(nuke.Text_Knob("cv_settings_div", ""))
+    k = nuke.Boolean_Knob("cv_status_line", "Show status line")
+    k.setValue(False)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("The line at the very bottom of the panel: render and decode "
+                 "speed, resolution, cache fill,\n"
+                 "zoom, OCIO, the node name.\n"
+                 "Off, it still appears on its own when there is an error to "
+                 "report.")
+    add(k)
     apply_color_visibility(node)
     apply_view_visibility(node)
     return order
@@ -774,6 +884,7 @@ def _add_knobs(node):
 # knobs belonging to the individual colour management modes
 OCIO_KNOBS = ("cv_ocio_config", "cv_ocio_input", "cv_ocio_display",
               "cv_ocio_view")
+CUSTOM_KNOB = "cv_ocio_custom"
 NUKE_KNOBS = ("cv_nuke_display", "cv_nuke_input")
 
 
@@ -803,9 +914,11 @@ def apply_view_visibility(node):
     show("cv_wipe_opacity", mode == VIEW_WIPE)
     show("cv_overlay_mix", mode == VIEW_OVERLAY)
     show("cv_overlay_qc", mode == VIEW_OVERLAY)
-    for name in ("cv_annot_dir", "cv_annot_name", "cv_annot_color",
-                 "cv_annot_pen", "cv_annot_text", "cv_annot_line",
-                 "cv_annot_scopes", "cv_annot_stamp", "cv_annot_csv"):
+    # not the pen colour, the pen width or the text size: those stay hidden in
+    # every mode - they are set on the tool in the image, see _add_knobs
+    for name in ("cv_annot_dir", "cv_annot_line",
+                 "cv_annot_stamp", "cv_annot_csv",
+                 "cv_annot_pdf", "cv_annot_pdf_text"):
         show(name, mode == VIEW_ANNOTATE)
     show("cv_scope_opacity", not both)        # belongs to the scopes, Base only
     show("cv_matte_head", mode == VIEW_DIMATTE)
@@ -849,6 +962,12 @@ def apply_color_visibility(node):
     for name in NUKE_KNOBS:
         if name in node.knobs():
             node[name].setVisible(not ocio_mode)
+    if CUSTOM_KNOB in node.knobs():
+        try:
+            custom = node["cv_ocio_config"].value() == ocio.CUSTOM_LABEL
+        except Exception:
+            custom = False
+        node[CUSTOM_KNOB].setVisible(ocio_mode and custom)
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +984,27 @@ def _root_value(name):
     except Exception:
         return None
     return value
+
+
+def _root_path(name):
+    """A file path off the project root, with Nuke's expressions evaluated.
+
+    evaluate() and not value(): a project config is often written as
+    "[getenv SHOW]/config.ocio" or relative to the script, and the literal
+    text of that is not a file anyone can open.
+    """
+    try:
+        knob = nuke.root()[name]
+    except Exception:
+        return ""
+    for getter in ("evaluate", "value"):
+        try:
+            text = getattr(knob, getter)()
+        except Exception:
+            continue
+        if isinstance(text, str) and text.strip():
+            return os.path.expandvars(os.path.expanduser(text.strip()))
+    return ""
 
 
 def _pick_name(value, names):
@@ -917,11 +1057,23 @@ def project_colour():
 
     config = _root_value("OCIO_config")
     if isinstance(config, str) and config.strip():
-        # only one WE have - the enumeration would refuse anything else and
-        # the failure would surface as an error note on the panel
-        known = [c[0] for c in ocio.find_configs()] if ocio.available() else []
-        if config.strip() in known:
-            out["cv_ocio_config"] = config.strip()
+        config = config.strip()
+        if config == ocio.CUSTOM_LABEL:
+            # A CUSTOM CONFIG IN THE PROJECT comes over with its file. The
+            # file first - dicts keep their order, and the knobs are written
+            # in it - so the player is never on 'custom' with no file behind
+            # it, not even for the one tick in between.
+            path = _root_path("customOCIOConfigPath")
+            if path and os.path.isfile(path):
+                out["cv_ocio_custom"] = path
+                out["cv_ocio_config"] = ocio.CUSTOM_LABEL
+        else:
+            # only one WE have - the enumeration would refuse anything else
+            # and the failure would surface as an error note on the panel
+            known = ([c[0] for c in ocio.find_configs()]
+                     if ocio.available() else [])
+            if config in known:
+                out["cv_ocio_config"] = config
 
     display = _pick_name(_root_value("monitorLut"), nukelut.DISPLAY_NAMES)
     if display:
@@ -969,7 +1121,33 @@ def apply_project_defaults(node):
         except Exception:
             continue        # not our config, not our list - leave the default
         done[name] = value
+    # a project on a custom config has just switched the file field on
+    apply_color_visibility(node)
     return done
+
+
+def _refresh_config_menu(node):
+    """Gives an older node's Config menu the entries today's one has.
+
+    The menu is built when the knob is made, so a node saved before 'custom'
+    existed never offered it - and knobs that are already there are not made
+    again. The choice is kept by NAME across the rebuild, as it is saved.
+    """
+    try:
+        knob = node["cv_ocio_config"]
+    except Exception:
+        return
+    try:
+        want = ocio.config_menu()
+        have = list(knob.values())
+    except Exception:
+        return
+    if have == want:
+        return
+    chosen = knob.value()
+    knob.setValues(want)
+    if chosen in want:
+        knob.setValue(chosen)
 
 
 def create():
@@ -1206,6 +1384,7 @@ def ensure_knobs(node):
         _drop_old_label(node)
         before = set(node.knobs())
         _add_knobs(node)
+        _refresh_config_menu(node)
         added = set(node.knobs()) - before
         if added:
             nuke.tprint("JKplayer: added knobs on %s: %s"
@@ -1318,6 +1497,77 @@ def input_count(node):
         return 1
 
 
+def stabilise_at(node, frame, first=None):
+    """How far to move the picture to hold the track still at `frame`.
+
+    Returns (dx, dy) in image pixels, ready to be ADDED to the view's pan.
+    (0, 0) when it is switched off, when nothing has been pasted in, or when
+    anything at all goes wrong: a stabilisation that silently guesses is worse
+    than one that plainly does nothing.
+
+    TWO SIGNS, AND THEY ARE NOT THE SAME. Both were wrong the first time, so
+    they are written out here rather than left to be re-derived:
+
+      * A pixel at column `ix` is drawn at `width/2 + (ix - w/2 - pan) * zoom`.
+        Hold a feature still and that expression must not change, so
+        `pan = x(f) - x(ref)`: the pan FOLLOWS the feature, it does not oppose
+        it. Opposing it moves the picture twice as far as the feature did,
+        which reads as the shot running away rather than standing still.
+
+      * Nuke counts y UP from the bottom of the format. Our rows go DOWN from
+        the top - dpxread refuses a file that says otherwise - so the y of a
+        track has to be turned over on the way in. x needs no such thing.
+
+    The value is read PER FRAME off the knob rather than out of settings(),
+    because settings() is a snapshot of one moment and a track is a curve.
+    """
+    try:
+        if not node["cv_stab_on"].value():
+            return (0.0, 0.0)
+    except Exception:
+        return (0.0, 0.0)
+    try:
+        knob = node["cv_stab_xy"]
+        ref = int(node["cv_stab_ref"].value()) or int(
+            first if first is not None else frame)
+        now = knob.valueAt(float(frame))
+        base = knob.valueAt(float(ref))
+    except Exception:
+        return (0.0, 0.0)
+    try:
+        return (float(now[0]) - float(base[0]),           # follows the feature
+                -(float(now[1]) - float(base[1])))        # y is upside down
+    except (TypeError, IndexError, ValueError):
+        return (0.0, 0.0)
+
+
+def _annot_color(menu_index, palette):
+    """The pen colour: the palette's when one was picked, else the menu's."""
+    try:
+        palette = int(palette)
+    except (TypeError, ValueError):
+        palette = -1
+    if palette >= 0 and palette & annotate.CUSTOM_BIT:
+        return palette
+    return int(menu_index)
+
+
+def _knob_path(node, name):
+    """A File_Knob's path, evaluated like the root's (see _root_path)."""
+    try:
+        knob = node[name]
+    except Exception:
+        return ""
+    for getter in ("evaluate", "value"):
+        try:
+            text = getattr(knob, getter)()
+        except Exception:
+            continue
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
 def settings(node):
     """Reads the settings off the node into a dict (with sensible fallbacks)."""
     def val(name, default):
@@ -1347,6 +1597,11 @@ def settings(node):
         "workers": int(val("cv_workers", 8)),
         "qc_threads": int(val("cv_qc_threads", 4)),
         "qc_full_play": bool(val("cv_qc_full_play", True)),
+        "show_bbox": bool(val("cv_show_bbox", True)),
+        "line_format": bool(val("cv_line_format", False)),
+        "line_bbox": bool(val("cv_line_bbox", False)),
+        "bbox_warn": bool(val("cv_bbox_warn", True)),
+        "status_line": bool(val("cv_status_line", False)),
         "auto_cache": bool(val("cv_auto_cache", True)),
         "fps": fps,
         "loop": enum("cv_loop", 0),              # 0 loop, 1 ping-pong, 2 stop
@@ -1377,6 +1632,9 @@ def settings(node):
         "channels": enum("cv_channels", 0),      # 0 RGB,1 R,2 G,3 B,4 A,5 Luma
         "color_mgmt": enum("cv_color_mgmt", MGMT_NUKE),
         "ocio_config": enum("cv_ocio_config", ocio.default_config_index()),
+        # by NAME - see ocio.resolve_config - and the file behind 'custom'
+        "ocio_config_name": str(val("cv_ocio_config", "") or ""),
+        "ocio_custom": _knob_path(node, "cv_ocio_custom"),
         "ocio_input": str(val("cv_ocio_input", "")),
         "ocio_display": str(val("cv_ocio_display", "")),
         "ocio_view": str(val("cv_ocio_view", "")),
@@ -1389,13 +1647,14 @@ def settings(node):
         "diff_color": enum("cv_diff_color", 0),
         "diff_intensity": float(val("cv_diff_intensity", 1.0)),
         "annot_dir": str(val("cv_annot_dir", "")),
-        "annot_name": str(val("cv_annot_name", "annotation_####.jpg")),
-        "annot_color": enum("cv_annot_color", 0),
+        "annot_color": _annot_color(enum("cv_annot_color", 0),
+                                    val("cv_annot_rgb", -1)),
         "annot_pen": float(val("cv_annot_pen", annotate.LINE_W)),
         "annot_text": float(val("cv_annot_text", annotate.TEXT_H)),
         "annot_line": int(val("cv_annot_line", annotate.LINE_MAX)),
-        "annot_scopes": bool(val("cv_annot_scopes", False)),
         "annot_csv": bool(val("cv_annot_csv", True)),
+        "annot_pdf": bool(val("cv_annot_pdf", True)),
+        "annot_pdf_text": float(val("cv_annot_pdf_text", annotate.PDF_BODY)),
         "annot_stamp": bool(val("cv_annot_stamp", True)),
         "meta_keys": str(val("cv_meta_keys", "")),
         "matte_source": enum("cv_matte_source", MATTE_FROM_INPUT),
@@ -1453,7 +1712,7 @@ def _frame_range(src):
     if read is None:
         return None
     try:
-        return (int(read.firstFrame()), int(read.lastFrame()))
+        return sequence.file_range(read)
     except Exception:
         return None
 

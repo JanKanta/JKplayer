@@ -23,8 +23,50 @@ COLORS = ((255, 60, 60), (255, 210, 40), (60, 220, 90), (80, 170, 255),
           (255, 255, 255), (0, 0, 0))
 COLOR_NAMES = ("Red", "Yellow", "Green", "Blue", "White", "Black")
 
+# ANY COLOUR, NOT ONLY THOSE SIX. A colour is still one int wherever it is
+# kept - on a stroke, on a note, on the node - so nothing that stores it had to
+# change shape. 0-5 are the six above, as they always were, so every script and
+# every note made before the palette existed means exactly what it meant. A
+# colour picked from the palette carries CUSTOM_BIT with its RGB in the low 24
+# bits: an index can never have that bit set, so the two cannot be confused.
+CUSTOM_BIT = 1 << 24
+
+# The first row of swatches: the six, less white. White is not gone - it is
+# the top-left of the palette - but as a pen on a plate it is the one that
+# vanishes in every sky, and the row is for the colours reached for first.
+QUICK_COLORS = (0, 1, 2, 3, 5)
+
+
+def custom_color(r, g, b):
+    """The int that stands for an arbitrary RGB colour."""
+    return CUSTOM_BIT | (int(r) & 255) << 16 | (int(g) & 255) << 8 | \
+        (int(b) & 255)
+
+
+def color_rgb(color):
+    """(r, g, b) for anything a colour is stored as."""
+    try:
+        color = int(color)
+    except (TypeError, ValueError):
+        return COLORS[0]
+    if color & CUSTOM_BIT:
+        return ((color >> 16) & 255, (color >> 8) & 255, color & 255)
+    return COLORS[color % len(COLORS)]
+
+
+def is_custom(color):
+    try:
+        return bool(int(color) & CUSTOM_BIT)
+    except (TypeError, ValueError):
+        return False
+
 LINE_W = 3.0            # in IMAGE pixels, so the stroke keeps its weight
 TEXT_H = 34.0           # cap height of a note, also in image pixels
+
+def _burned(item):
+    """A text item's burn flag - True for one made before the flag existed."""
+    return bool(item[6]) if len(item) > 6 else True
+
 
 def look_key(look):
     """What makes two views the same for annotation purposes.
@@ -48,7 +90,11 @@ class Annotations(object):
         # to stay with the grain check even if the frame was already written on
         # in another one. The export then writes one picture per check.
         self._strokes = {}      # frame -> [(colour, width, [(x, y), ...], look)]
-        self._texts = {}        # frame -> [(x, y, colour, size, text, look)]
+        # frame -> [(x, y, colour, size, text, look, burn)]
+        # `burn` - whether the note is written INTO the exported picture. Off
+        # for a note that is meant to be read in the CSV or the PDF, where it
+        # would otherwise sit over the very thing it is describing.
+        self._texts = {}
         # The longest line, off the node. Kept HERE rather than passed down
         # through draw() and text_at() by every caller: it is one setting for
         # the whole set of notes, and the two must never be given different
@@ -88,7 +134,8 @@ class Annotations(object):
             (int(color), float(width), points, dict(look) if look else None))
         return True
 
-    def add_text(self, frame, x, y, text, color=0, size=TEXT_H, look=None):
+    def add_text(self, frame, x, y, text, color=0, size=TEXT_H, look=None,
+                 burn=True):
         # capped here and not only in the box: this is the one door every note
         # comes through, whatever writes it
         text = (text or "").strip()[:MAX_CHARS]
@@ -97,7 +144,7 @@ class Annotations(object):
         frame = int(frame)
         self._texts.setdefault(frame, []).append(
             (float(x), float(y), int(color), float(size), text,
-             dict(look) if look else None))
+             dict(look) if look else None, bool(burn)))
         return True
 
     def text_at(self, frame, x, y, look=None, image_width=0, image_height=0):
@@ -111,7 +158,7 @@ class Annotations(object):
             return None
         want = None if look is None else look_key(look)
         for i in range(len(items) - 1, -1, -1):
-            tx, ty, _color, size, text, ilook = items[i]
+            tx, ty, _color, size, text, ilook = items[i][:6]
             if want is not None and ilook is not None \
                     and look_key(ilook) != want:
                 continue
@@ -172,12 +219,13 @@ class Annotations(object):
             return items[index][2]
         return 0
 
-    def replace_text(self, frame, index, text, color=None):
+    def replace_text(self, frame, index, text, color=None, size=None,
+                     burn=None):
         """Rewrites a note in place. An empty text deletes it.
 
-        Position, size and the view it belongs to are kept, and so is the
-        colour unless a new one is given: this is a correction of a note, not
-        a new one.
+        Position and the view it belongs to are kept, and so is anything not
+        given - colour, size, whether it goes into the export: this is a
+        correction of a note, not a new one.
         """
         items = self._texts.get(int(frame))
         if not items or not (0 <= index < len(items)):
@@ -190,10 +238,29 @@ class Annotations(object):
             return True
         old = items[index]
         color = old[2] if color is None else int(color)
-        if old[4] == text and old[2] == color:
+        size = old[3] if size is None else float(size)
+        burn = _burned(old) if burn is None else bool(burn)
+        if (old[4], old[2], old[3], _burned(old)) == (text, color, size, burn):
             return False
-        items[index] = (old[0], old[1], color, old[3], text, old[5])
+        items[index] = (old[0], old[1], color, size, text, old[5], burn)
         return True
+
+    def text_burned(self, frame, index):
+        """Does this note go into the exported picture?"""
+        items = self._texts.get(int(frame)) or ()
+        if 0 <= index < len(items):
+            return _burned(items[index])
+        return True
+
+    def note_items(self, frame, look=None):
+        """[(text, colour index)] - notes() with the colour each was written in.
+
+        For the PDF, where every note is set in its own colour so the page
+        matches the picture: "the red one" means the same thing on both.
+        """
+        want = None if look is None else look_key(look)
+        return [(t[4], t[2]) for t in self._texts.get(int(frame), ())
+                if want is None or t[5] is None or look_key(t[5]) == want]
 
     def notes(self, frame, look=None):
         """The written notes on a frame, in the order they were put there.
@@ -232,6 +299,50 @@ class Annotations(object):
                     or look_key(items[i][look_at]) == want:
                 return i
         return None
+
+    def erase_at(self, frame, x, y, radius, look=None):
+        """Rubs out the ink within `radius` of (x, y) - and only that ink.
+
+        Like a real rubber: a line crossed in the middle ends up as two lines
+        with a gap, and a mark rubbed at one end just gets shorter. What is
+        left of a stroke stays the same stroke in every other respect - its
+        colour, its width, the view it was made in.
+
+        Restricted to the view the rubber is being used in, the same way undo
+        is: ink made in the grain check is not on screen over a plain plate and
+        must not be removable without being visible.
+
+        Text is left alone. It is not ink, it has its own handle - click it to
+        edit it - and a rubber that ate a note as it passed over would be the
+        easiest way in this tool to lose work without noticing.
+
+        Returns how many strokes were touched.
+        """
+        frame = int(frame)
+        items = self._strokes.get(frame)
+        if not items:
+            return 0
+        want = look_key(look) if look is not None else None
+        radius = max(0.5, float(radius))
+        x, y = float(x), float(y)
+        out, touched = [], 0
+        for entry in items:
+            color, width, points, made_in = entry
+            visible = want is None or made_in is None \
+                or look_key(made_in) == want
+            if not visible or not _near_stroke(points, x, y, radius):
+                out.append(entry)
+                continue
+            touched += 1
+            for piece in _rub_out(points, x, y, radius):
+                out.append((color, width, piece, made_in))
+        if not touched:
+            return 0
+        if out:
+            self._strokes[frame] = out
+        else:
+            del self._strokes[frame]
+        return touched
 
     def undo(self, frame, look=None):
         """Takes back the last thing put on this frame IN THIS VIEW.
@@ -279,7 +390,7 @@ class Annotations(object):
 
     # ---- drawing -------------------------------------------------------
     def draw(self, painter, frame, ox=0.0, oy=0.0, zoom=1.0, look=None,
-             width=0, height=0, zoom_x=None):
+             width=0, height=0, zoom_x=None, export=False):
         """Draws the notes of one frame.
 
         `ox`/`oy`/`zoom` place the image on whatever is being painted - the
@@ -291,6 +402,10 @@ class Annotations(object):
         anamorphic plate is drawn wider than it is stored. Only POSITIONS
         follow it: a stretched note is not a wider note, it is a distorted one,
         so pen weight and text size keep to `zoom`.
+
+        `export` leaves out the notes marked not to be burned into the
+        picture. On screen they are always drawn - a note you cannot see is a
+        note you cannot click to edit.
 
         `look` is what is on screen now. Notes made in a DIFFERENT view are
         left out: a circle around a grain problem drawn over a plain plate
@@ -308,13 +423,15 @@ class Annotations(object):
                        if s[3] is None or look_key(s[3]) == want]
             texts = [t for t in (texts or ())
                      if t[5] is None or look_key(t[5]) == want]
+        if export:
+            texts = [t for t in (texts or ()) if _burned(t)]
         if not strokes and not texts:
             return
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
         for color, pen_w, points, _look in (strokes or ()):
-            pen = QtGui.QPen(QtGui.QColor(*COLORS[color % len(COLORS)]))
+            pen = QtGui.QPen(QtGui.QColor(*color_rgb(color)))
             # The line keeps its weight IN THE PLATE, so a note drawn while
             # zoomed in does not become a hairline when you zoom out.
             pen.setWidthF(max(1.0, pen_w * zoom))
@@ -330,7 +447,8 @@ class Annotations(object):
             font = painter.font()
             font.setBold(True)
             self.font_family = font.family()   # so hit testing measures alike
-            for x, y, color, size, text, _look in texts:
+            for item in texts:
+                x, y, color, size, text = item[:5]
                 # THE LAYOUT IS DONE IN IMAGE PIXELS and only then scaled.
                 # Doing it in screen pixels meant the font size was rounded to
                 # a whole number first, so the line breaks and the spacing
@@ -345,7 +463,7 @@ class Annotations(object):
                 # ones already placed
                 font.setPixelSize(max(1, int(round(size * zoom))))
                 painter.setFont(font)
-                rgb = COLORS[color % len(COLORS)]
+                rgb = color_rgb(color)
                 # A contrasting outline: white text on a white sky - or black
                 # text on a dark frame - is invisible otherwise, and a note
                 # that cannot be read is not a note.
@@ -570,6 +688,374 @@ def fits_per_line(size, x, image_width, line_max=LINE_MAX):
 
 REPORT_NAME = "annotations.csv"
 
+# The PDF page. 150 dpi is the resolution the page is MEASURED in, not the
+# resolution the pictures go in at - they are drawn from the JPEG at whatever
+# size they are and scaled to the box, so a 4K frame stays 4K in the file.
+PDF_DPI = 150
+PDF_TITLE = 48          # the composition's name, top of every page
+PDF_HEAD = 26           # "frame 1043 - Grain check"
+PDF_BODY = 26           # the notes
+PDF_BODY_MIN = 14       # how small the notes may get before they are clipped
+PDF_SMALL = 15          # the footer
+PDF_GAP = 18            # between the heading, the picture and the notes
+
+
+REPORT_PDF = "annotations.pdf"
+
+# What an exported picture is called. In the code rather than on the node: it
+# is not a choice anybody needs to make per shot - the clip already has its own
+# folder (see clip_folder), so the files inside only have to be told apart by
+# frame and by check, which this does. A setting for it was only one more place
+# for two exports of the same shot to come out named differently.
+EXPORT_NAME = "annotation_####.jpg"
+
+# What a frame token looks like in a sequence path: ####, %08d, or %d.
+_FRAME_TOKEN = re.compile(r"#+|%0?\d*d")
+
+
+def clip_folder(pattern):
+    """The folder name for one clip's notes: the sequence's own name.
+
+    A review folder collects the notes of many shots, and a flat pile of
+    annotation_0012.jpg from three different clips is unreadable and, worse,
+    silently overwrites - the names collide the moment two clips are reviewed
+    on the same frame numbers. So each clip gets its own subfolder, named after
+    the file it came from.
+
+    The frame token and the extension come off, because they say nothing about
+    WHICH clip this is: "A004C004_comp_v02.%08d.dpx" is the clip
+    "A004C004_comp_v02". A trailing separator left behind by the token goes
+    too, so the usual "name.####.exr" does not become "name.".
+    """
+    name = os.path.basename(pattern or "")
+    name = os.path.splitext(name)[0]
+    name = _FRAME_TOKEN.sub("", name)
+    name = name.strip(" ._-")
+    return _safe_name(name) or "annotations"
+
+
+def _safe_name(name):
+    """A name a filesystem will take, without inventing a different one."""
+    out = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c
+                  for c in name)
+    return out.rstrip(". ").strip()
+
+
+def _enum(owner, scope, name):
+    """`owner.name`, wherever the binding decided to keep it.
+
+    Qt6 scopes its enums - QPageSize.PageSizeId.A4 - while Qt5 has them flat on
+    the class, and PySide6 exposes both depending on how it was built. Nuke
+    ships one or the other and this file cannot be run outside it, so both are
+    asked for rather than one being picked and hoped for.
+    """
+    inner = getattr(owner, scope, None)
+    if inner is not None and hasattr(inner, name):
+        return getattr(inner, name)
+    return getattr(owner, name)
+
+
+def write_pdf(path, folder, rows, title="", subtitle="", text_size=None):
+    """The review as one document: every picture with what was written on it.
+
+    A folder of JPEGs plus a CSV is two things to hand over and neither reads
+    on its own - the table has no pictures and the pictures have no words. This
+    is the same review in the form it actually gets looked at in: one page per
+    finding, the frame above, the note below it.
+
+    Built on QPdfWriter, which is in Qt itself, so this adds no dependency. The
+    pictures are re-read from the files just written rather than kept from the
+    export loop: one 4K frame at a time instead of all of them at once, and the
+    page then shows exactly what was handed over.
+    """
+    writer = QtGui.QPdfWriter(path)
+    writer.setPageSize(QtGui.QPageSize(_enum(QtGui.QPageSize, "PageSizeId",
+                                             "A4")))
+    writer.setPageOrientation(_enum(QtGui.QPageLayout, "Orientation",
+                                    "Landscape"))
+    writer.setResolution(PDF_DPI)
+    writer.setTitle(title or "JKplayer annotations")
+
+    painter = QtGui.QPainter()
+    if not painter.begin(writer):
+        raise IOError("cannot write %s" % path)
+    try:
+        page = writer.pageLayout().paintRectPixels(PDF_DPI)
+        w, h = page.width(), page.height()
+        first = True
+        for frame, check, filename, marks, note in rows:
+            if not first:
+                writer.newPage()
+            first = False
+            _pdf_page(painter, w, h, folder, frame, check, filename, marks,
+                      note, title, subtitle, text_size)
+    finally:
+        painter.end()
+    return path
+
+
+def _pdf_page(painter, w, h, folder, frame, check, filename, marks, note,
+              title, subtitle, text_size=None):
+    """One finding: the composition, the frame, the picture, then the notes.
+
+    `note` is a list of (text, colour index), or a plain string from a caller
+    that has no colours to give.
+    """
+    dark = QtGui.QColor(25, 25, 25)
+    grey = QtGui.QColor(125, 125, 125)
+    y = 0.0
+
+    # ---- THE COMPOSITION, first and biggest. A PDF gets forwarded, printed and
+    # opened weeks later; what it is ABOUT has to be the first thing read, not
+    # something worked out from a file name in the footer.
+    head = _pdf_font(painter, PDF_TITLE, bold=True)
+    painter.setFont(head)
+    painter.setPen(dark)
+    title_h = QtGui.QFontMetricsF(head, painter.device()).height() * 1.15
+    shown = QtGui.QFontMetricsF(head, painter.device()).elidedText(
+        title or filename, QtCore.Qt.ElideMiddle, w * 0.82)
+    painter.drawText(QtCore.QRectF(0, y, w, title_h),
+                     QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, shown)
+    if subtitle:
+        painter.setFont(_pdf_font(painter, PDF_BODY))
+        painter.setPen(grey)
+        painter.drawText(QtCore.QRectF(0, y, w, title_h),
+                         QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                         subtitle)
+    y += title_h
+
+    # ---- which frame, and which check it was seen in
+    sub = _pdf_font(painter, PDF_HEAD, bold=False)
+    painter.setFont(sub)
+    painter.setPen(grey)
+    line = "frame %s" % frame
+    if check:
+        line += "   \u00b7   %s" % check
+    sub_h = QtGui.QFontMetricsF(sub, painter.device()).height() * 1.3
+    painter.drawText(QtCore.QRectF(0, y, w, sub_h),
+                     QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, line)
+    y += sub_h
+    painter.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210), 2.0))
+    painter.drawLine(QtCore.QPointF(0, y), QtCore.QPointF(w, y))
+    y += PDF_GAP
+
+    footer_h = PDF_SMALL * 1.6
+    items = _note_items(note)
+
+    # ---- THE NOTES GET THEIR ROOM BEFORE THE PICTURE. A long note must not be
+    # pushed off the page by a tall frame - the note is why the page exists.
+    # If they would take more than about half the page, the type comes down
+    # until they fit, rather than the last one being cut off mid-sentence.
+    room = (h - y - footer_h) * 0.55
+    # the size set on the node, and from there down to fit if it must
+    size = max(PDF_BODY_MIN, int(round(text_size))) if text_size else PDF_BODY
+    while True:
+        layout = _layout_notes(painter, items, w, size)
+        if layout[1] <= room or size <= PDF_BODY_MIN:
+            break
+        size -= 1
+    blocks, notes_h, body = layout
+
+    image_h = h - y - footer_h - notes_h - (PDF_GAP if blocks else 0)
+    image = QtGui.QImage(os.path.join(folder, filename))
+    if not image.isNull() and image_h > 1:
+        scaled = image.size()
+        scaled.scale(int(w), int(image_h), QtCore.Qt.KeepAspectRatio)
+        x = (w - scaled.width()) / 2.0
+        painter.drawImage(
+            QtCore.QRectF(x, y, scaled.width(), scaled.height()), image)
+        y += scaled.height()
+    else:
+        painter.setPen(grey)
+        painter.drawText(QtCore.QRectF(0, y, w, max(image_h, 1.0)),
+                         QtCore.Qt.AlignCenter, "(%s)" % filename)
+        y += max(image_h, 0.0)
+    if blocks:
+        y += PDF_GAP
+        _draw_notes(painter, blocks, y, body)
+
+    # the file and the count go at the very bottom, small: provenance
+    painter.setPen(grey)
+    painter.setFont(_pdf_font(painter, PDF_SMALL))
+    painter.drawText(QtCore.QRectF(0, h - footer_h, w, footer_h),
+                     QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom,
+                     "%s   \u00b7   %s mark%s" % (filename, marks,
+                                                 "" if marks == 1 else "s"))
+
+
+def _note_items(note):
+    """The notes of one page as [(text, colour index or None)]."""
+    if not note:
+        return []
+    if isinstance(note, str):
+        return [(note, None)]
+    return [(text, color) for text, color in note if (text or "").strip()]
+
+
+def _layout_notes(painter, items, w, size):
+    """Wraps every note to the page at `size`. -> (blocks, height, font).
+
+    ALWAYS NUMBERED, one note or ten. Every page then reads the same way, and
+    "note 1 on frame 1043" is something that can be said out loud about a page
+    with a single note as much as about one with five. The number sits in its
+    own column and the text hangs beside it, so a note that runs to three lines
+    still reads as one item and the numbers stay lined up down the page.
+    """
+    body = _pdf_font(painter, size, bold=True)
+    metrics = QtGui.QFontMetricsF(body, painter.device())
+    numbered = bool(items)
+    number_w = _advance(metrics, "%d.  " % len(items)) if numbered else 0.0
+    avail = max(10.0, w - number_w)
+    step = metrics.lineSpacing()
+    blocks, height = [], 0.0
+    for i, (text, color) in enumerate(items):
+        lines = wrap_lines(text, metrics, avail, 10 ** 6) or [""]
+        label = ("%d." % (i + 1)) if numbered else ""
+        blocks.append((label, number_w, lines, color))
+        height += len(lines) * step
+        if i < len(items) - 1:
+            height += step          # the empty line between two notes
+    return blocks, height, body
+
+
+def _draw_notes(painter, blocks, top, body):
+    """The notes, each in the colour it was written in."""
+    metrics = QtGui.QFontMetricsF(body, painter.device())
+    step = metrics.lineSpacing()
+    y = top
+    for label, number_w, lines, color in blocks:
+        fill = (QtGui.QColor(*color_rgb(color))
+                if color is not None else QtGui.QColor(25, 25, 25))
+        if label:
+            _pdf_text(painter, body, 0.0, y + metrics.ascent(), label, fill)
+        for line in lines:
+            if line:
+                _pdf_text(painter, body, number_w, y + metrics.ascent(), line,
+                          fill)
+            y += step
+        y += step                   # the empty line between two notes
+
+
+def _pdf_text(painter, font, x, baseline, text, fill):
+    """One line of a note, in exactly the colour it was written in.
+
+    No outline, no box. An edge round the letters reads as a frame drawn
+    round the note, and the note is meant to look like what was typed - the
+    colour picked in the box is the whole of its styling.
+    """
+    painter.save()
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+    painter.setFont(font)
+    painter.setPen(fill)
+    painter.drawText(QtCore.QPointF(x, baseline), text)
+    painter.restore()
+
+
+def _pdf_font(painter, size, bold=False):
+    font = painter.font()
+    font.setPixelSize(int(size))
+    font.setBold(bold)
+    return font
+
+
+def _rub_out(points, x, y, radius):
+    """What is left of one polyline after rubbing a circle out of it.
+
+    The stroke is first walked at a spacing finer than the rubber, because a
+    fast stroke has samples far apart: taking out only the SAMPLES inside the
+    circle would leave the line drawn straight across the gap between the two
+    either side of it, and the rubber would appear to do nothing.
+
+    Then every point inside the circle is dropped and the stroke falls apart
+    into the runs between them. A run of fewer than two points is not a line
+    any more and goes too.
+    """
+    step = max(0.25, radius * 0.25)
+    dense = _resample(points, step)
+    r2 = radius * radius
+    pieces, run = [], []
+    for px, py in dense:
+        if (px - x) ** 2 + (py - y) ** 2 <= r2:
+            if len(run) > 1:
+                pieces.append(run)
+            run = []
+        else:
+            run.append((px, py))
+    if len(run) > 1:
+        pieces.append(run)
+    return [_thin(piece, step) for piece in pieces]
+
+
+def _resample(points, step):
+    """The same polyline with no two neighbouring points further than `step`."""
+    if not points:
+        return []
+    out = [points[0]]
+    for bx, by in points[1:]:
+        ax, ay = out[-1]
+        dx, dy = bx - ax, by - ay
+        span = (dx * dx + dy * dy) ** 0.5
+        n = int(span // step)
+        for i in range(1, n + 1):
+            t = i * step / span
+            if t < 1.0:
+                out.append((ax + dx * t, ay + dy * t))
+        out.append((bx, by))
+    return out
+
+
+def _thin(points, step):
+    """Drops the in-between points resampling added along straight runs.
+
+    Otherwise every rub would leave the stroke with several times the points
+    it had, and a note rubbed at for a while would get heavier to draw and to
+    save each time - for no change to how it looks.
+    """
+    if len(points) <= 2:
+        return list(points)
+    out = [points[0]]
+    for i in range(1, len(points) - 1):
+        ax, ay = out[-1]
+        bx, by = points[i]
+        cx, cy = points[i + 1]
+        # keep a point only where the line actually turns
+        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        length = ((cx - ax) ** 2 + (cy - ay) ** 2) ** 0.5
+        if length <= 0.0 or abs(cross) / length > step * 0.05:
+            out.append((bx, by))
+    out.append(points[-1])
+    return out
+
+
+def _near_stroke(points, x, y, radius):
+    """Does the polyline `points` pass within `radius` of (x, y)?
+
+    Segment by segment, not point by point: a stroke drawn quickly has its
+    samples far apart, and testing only the samples would let the rubber fall
+    between two of them and miss a line it is sitting right on top of.
+    """
+    r2 = radius * radius
+    if not points:
+        return False
+    px, py = points[0]
+    if (px - x) ** 2 + (py - y) ** 2 <= r2:
+        return True
+    for bx, by in points[1:]:
+        dx, dy = bx - px, by - py
+        span = dx * dx + dy * dy
+        if span <= 0.0:
+            t = 0.0
+        else:
+            # where along the segment the closest point is, kept on the segment
+            t = ((x - px) * dx + (y - py) * dy) / span
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        cx, cy = px + dx * t, py + dy * t
+        if (cx - x) ** 2 + (cy - y) ** 2 <= r2:
+            return True
+        px, py = bx, by
+    return False
+
 
 def write_report(path, rows):
     """The list of exported frames, next to the pictures.
@@ -600,7 +1086,7 @@ def export_name(pattern, frame, label=None):
     forgot it still produces one file per frame instead of one file overwritten
     by every frame.
     """
-    name = pattern or "annotation_####.jpg"
+    name = pattern or EXPORT_NAME
     if not os.path.splitext(name)[1]:
         name += ".jpg"
     match = re.search(r"#+", name)

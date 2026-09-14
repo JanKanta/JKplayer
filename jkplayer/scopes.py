@@ -543,6 +543,68 @@ With a single channel the trace is a STRAIGHT LINE out of the centre, and
     return _vectorscope_grid(rgb, size)
 
 
+def vector_rgb(rgb, channel="rgb", gain=1.0, gamma=1.0, sat_matrix=None,
+               alpha=None):
+    """Scene-linear RGB -> float 0..255, the way the vectorscope reads colour.
+
+    A FIXED encoding - sRGB, clipped at 1.0 - and not whatever the monitor LUT
+    is set to. The histogram and the waveform already measure the plate rather
+    than the screen; with the vectorscope on the finished image, switching the
+    viewer from sRGB to rec709 moved its trace while the other two stayed put,
+    which reads as the colour of the shot having changed when only the monitor
+    did. Encoded rather than linear, because the 75 % and 100 % targets are
+    defined on an encoded signal: on linear values the graticule would stop
+    meaning anything.
+
+    CC is in it (saturation, gain, gamma) exactly as for the other scopes, so
+    the three still agree with each other and with the CC panel.
+
+    One function for the trace AND for the ring under the cursor, so the two
+    cannot drift apart.
+    """
+    rgb = np.asarray(rgb, dtype=np.float32)[..., :3]
+    if sat_matrix is not None:
+        shape = rgb.shape
+        rgb = np.clip(rgb.reshape(-1, 3) @ sat_matrix, 0.0, None).reshape(shape)
+    if channel in ("r", "g", "b"):
+        # an isolated channel has no hue: it is put into its own axis, so the
+        # trace is a line towards that primary - see vectorscope()
+        i = {"r": 0, "g": 1, "b": 2}[channel]
+        plane = rgb[..., i]
+        rgb = np.zeros_like(rgb)
+        rgb[..., i] = plane
+    elif channel == "a":
+        a = (np.asarray(alpha, dtype=np.float32) if alpha is not None
+             else np.zeros(rgb.shape[:-1], np.float32))
+        rgb = np.repeat(a[..., None], 3, axis=-1)
+    elif channel == "y":
+        rgb = np.repeat((rgb @ _LUMA)[..., None], 3, axis=-1)
+    v = np.clip(apply_cc(rgb, gain, gamma), 0.0, 1.0)
+    return (_srgb_encode(v) * 255.0).astype(np.float32)
+
+
+def vectorscope_linear(arr, channel="rgb", gain=1.0, sat_matrix=None,
+                       budget=120000, size=VS_SIZE, linearize=None, gamma=1.0):
+    """(size, size) float32 0..1 - the vectorscope, off the PLATE.
+
+    Scene-linear half in, as the histogram and the waveform take it, through
+    the input transform and CC, then the fixed encoding in vector_rgb - so the
+    monitor LUT does not move it. The grid and the scale are the display
+    vectorscope's own (_vectorscope_grid), so nothing about reading it changes.
+    """
+    if arr is None or arr.ndim != 3 or arr.shape[2] < 3:
+        return None
+    sub = subsample(arr, budget)
+    if sub.size == 0:
+        return None
+    alpha = sub[:, :, 3] if sub.shape[2] >= 4 else None
+    rgb = sub[:, :, :3]
+    if linearize is not None:
+        rgb = linearize(np.ascontiguousarray(rgb))
+    return _vectorscope_grid(
+        vector_rgb(rgb, channel, gain, gamma, sat_matrix, alpha), size)
+
+
 def vectorscope_point(rgb):
     """(x, y) in -1..1 for ONE display-space pixel, or None.
 

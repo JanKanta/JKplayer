@@ -21,6 +21,7 @@ class FrameCache(object):
         self._items = OrderedDict()          # key -> ndarray
         self._bytes = 0
         self._budget = max(64, int(budget_mb)) * 1024 * 1024
+        self._closed = False
         # statistics (read-only from the outside)
         self.hits = 0
         self.misses = 0
@@ -59,6 +60,8 @@ class FrameCache(object):
             return
         nbytes = int(arr.nbytes)
         with self._lock:
+            if self._closed:
+                return            # its player is gone - see close()
             if key in self._items:
                 self._items.move_to_end(key)
                 return
@@ -78,6 +81,23 @@ class FrameCache(object):
         with self._lock:
             self._items.clear()
             self._bytes = 0
+
+    def close(self):
+        """Empties the cache for good - its player has been closed.
+
+        Unlike clear() nothing can be put back afterwards. A decode that was
+        already running when the panel went would otherwise land its frame in
+        a cache nobody can reach, and those gigabytes would stay held until
+        Nuke itself was closed.
+        """
+        with self._lock:
+            self._closed = True
+            self._items.clear()
+            self._bytes = 0
+
+    @property
+    def closed(self):
+        return self._closed
 
     def set_budget_mb(self, mb):
         with self._lock:

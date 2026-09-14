@@ -41,7 +41,8 @@ class Timeline(QtWidgets.QWidget):
             "  drag / click    = scrub\n"
             "  wheel           = zoom in / out\n"
             "  Ctrl+wheel      = step one frame\n"
-            "  middle button   = pan a zoomed timeline\n"
+            "  middle drag     = pan a zoomed timeline\n"
+            "  middle click    = back to the whole range\n"
             "  double click    = zoom out to the whole range\n"
             "  triangles       = mark IN / OUT (drag them)")
 
@@ -67,6 +68,9 @@ class Timeline(QtWidgets.QWidget):
         # colours (dark Nuke look)
         self.c_bg = QtGui.QColor(38, 38, 38)
         self.c_bg_out = QtGui.QColor(26, 26, 26)      # outside IN/OUT
+        self.c_outside = QtGui.QColor(14, 14, 14)     # outside the shot itself
+        self.c_edge = QtGui.QColor(90, 90, 90)        # where the shot starts/ends
+        self.c_text_outside = QtGui.QColor(95, 95, 95)
         self.c_tick = QtGui.QColor(90, 90, 90)
         self.c_text = QtGui.QColor(170, 170, 170)
         # Cache lines. Saturated on purpose - they are thin, and a washed-out
@@ -104,11 +108,36 @@ class Timeline(QtWidgets.QWidget):
         self._vfirst, self._vlast = self._first, self._last
         self.update()
 
+    # ZOOMING OUT PAST THE RANGE, as Nuke's own timeline does. Stopping at the
+    # range meant the wheel did nothing at all on a timeline that starts out
+    # showing the whole range - which reads as zoom not working. Past the ends
+    # is empty time, drawn darker, so it is plain where the shot stops.
+    ZOOM_OUT_MAX = 8                # at most this many times the range across
+    ZOOM_OUT_MIN_FRAMES = 48        # ...and never less than this, for short shots
+
+    def _max_span(self):
+        span = self._last - self._first + 1
+        return max(span * self.ZOOM_OUT_MAX, span + self.ZOOM_OUT_MIN_FRAMES)
+
+    def _clamp_view(self, vf, span):
+        """Where a view of `span` frames may start.
+
+        Zoomed IN it stays inside the range, as it always did. Zoomed OUT past
+        the range, the whole range stays inside the view: panning it so far
+        that the shot leaves the strip would leave a timeline of nothing.
+        """
+        range_span = self._last - self._first + 1
+        if span <= range_span:
+            return max(self._first, min(self._last - span + 1, vf))
+        return max(self._last - span + 1, min(self._first, vf))
+
     def zoom_view(self, factor, at_frame=None):
         """Zooms the timeline in/out around the given frame (mouse wheel)."""
         span = self._vlast - self._vfirst + 1
         new_span = int(round(span * factor))
-        new_span = max(self.MIN_SPAN, min(self._last - self._first + 1, new_span))
+        if factor > 1.0 and new_span == span:
+            new_span = span + 1               # a short view must still grow
+        new_span = max(self.MIN_SPAN, min(self._max_span(), new_span))
         if new_span == span:
             return
         anchor = self._frame if at_frame is None else at_frame
@@ -116,14 +145,13 @@ class Timeline(QtWidgets.QWidget):
         # the cursor"
         frac = (anchor - self._vfirst) / float(max(1, span - 1)) if span > 1 else 0.5
         vf = int(round(anchor - frac * (new_span - 1)))
-        vf = max(self._first, min(self._last - new_span + 1, vf))
+        vf = self._clamp_view(vf, new_span)
         self._vfirst, self._vlast = vf, vf + new_span - 1
         self.update()
 
     def pan_view(self, delta_frames):
         span = self._vlast - self._vfirst + 1
-        vf = int(round(self._vfirst + delta_frames))
-        vf = max(self._first, min(self._last - span + 1, vf))
+        vf = self._clamp_view(int(round(self._vfirst + delta_frames)), span)
         if vf != self._vfirst:
             self._vfirst, self._vlast = vf, vf + span - 1
             self.update()
@@ -244,6 +272,20 @@ class Timeline(QtWidgets.QWidget):
         x_in = self._x(self._in)
         x_out = self._x(self._out) + cw
         p.fillRect(QtCore.QRectF(x_in, 0, x_out - x_in, track_h), self.c_bg)
+        # zoomed out past the shot: the time before and after it is empty,
+        # darker still, with a hairline where the shot begins and ends
+        x_first = self._x(self._first)
+        x_end = self._x(self._last) + cw
+        if x_first > 0:
+            p.fillRect(QtCore.QRectF(0, 0, x_first, track_h), self.c_outside)
+        if x_end < w:
+            p.fillRect(QtCore.QRectF(x_end, 0, w - x_end, track_h),
+                       self.c_outside)
+        if x_first > 0 or x_end < w:
+            p.setPen(QtGui.QPen(self.c_edge, 1))
+            for x in (x_first, x_end):
+                if 0 < x < w:
+                    p.drawLine(int(x), 0, int(x), track_h)
 
         # CACHE - two layers, so it reads well even in a narrow strip:
         #   1) a soft tint over the whole cached area
@@ -296,9 +338,11 @@ class Timeline(QtWidgets.QWidget):
         while f <= self._vlast:
             if f >= self._vfirst:
                 x = self._x(f)
+                inside = self._first <= f <= self._last
                 p.setPen(self.c_tick)
                 p.drawLine(int(x), 0, int(x), 4)
-                p.setPen(self.c_text)
+                # numbers outside the shot are for orientation only
+                p.setPen(self.c_text if inside else self.c_text_outside)
                 p.drawText(QtCore.QRectF(x + 2, 0, 60, LABEL_H),
                            QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, str(f))
             f += step
@@ -386,8 +430,11 @@ class Timeline(QtWidgets.QWidget):
             self._drag = hit or "frame"
             self._apply_drag(x)
         elif event.button() == QtCore.Qt.MiddleButton:
-            self._drag = "pan"                  # pan a zoomed timeline
+            # a DRAG pans a zoomed timeline, a CLICK fits it back to the shot -
+            # which of the two it was is only known on release, see there
+            self._drag = "pan"
             self._pan_x = x
+            self._pan_press_x = x
             self._pan_view = self._vfirst
             self.setCursor(QtCore.Qt.ClosedHandCursor)
 
@@ -404,9 +451,16 @@ class Timeline(QtWidgets.QWidget):
         near = self._hit_marker(x)
         self.setCursor(QtCore.Qt.SizeHorCursor if near else QtCore.Qt.ArrowCursor)
 
-    def mouseReleaseEvent(self, _event):
+    # how far the middle button may wander and still count as a click - a hand
+    # pressing a wheel down is never perfectly still
+    CLICK_SLOP = 4
+
+    def mouseReleaseEvent(self, event):
         if self._drag == "pan":
             self.unsetCursor()
+            moved = abs(event_pos(event).x() - self._pan_press_x)
+            if moved <= self.CLICK_SLOP:
+                self.view_all()                  # a click on the wheel: fit
         self._drag = None
 
     def mouseDoubleClickEvent(self, _event):

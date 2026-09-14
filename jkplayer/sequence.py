@@ -20,13 +20,17 @@ _RE_HASH = re.compile(r"#+")
 class ExrSequence(object):
     """Immutable description of a sequence. Equality compares pattern and range."""
 
-    def __init__(self, pattern, first, last, offset=0):
+    def __init__(self, pattern, first, last, offset=0, nudge=0):
         self.pattern = pattern.replace("\\", "/")
         # first/last are the range ON THE TIMELINE, i.e. already shifted; the
         # offset is kept so path_for can go back to the file. An offset of
         # +5 means the clip starts five frames later and frame 10 shows the
         # file of frame 5.
         self.offset = int(offset)
+        # the part of the offset that is only a NUDGE (the node's Offset knob):
+        # it moves the clip against the timeline, while Start at moves the
+        # timeline with it - see PlayerPanel._timeline_range
+        self.nudge = int(nudge)
         self.first = int(first) + self.offset
         self.last = int(last) + self.offset
         if self.last < self.first:
@@ -90,13 +94,15 @@ class ExrSequence(object):
                 and other.pattern == self.pattern
                 and other.first == self.first
                 and other.last == self.last
-                and other.offset == self.offset)
+                and other.offset == self.offset
+                and other.nudge == self.nudge)
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
     def __hash__(self):
-        return hash((self.pattern, self.first, self.last, self.offset))
+        return hash((self.pattern, self.first, self.last, self.offset,
+                     self.nudge))
 
     def __repr__(self):
         return "ExrSequence(%r, %d-%d, offset=%d)" % (
@@ -152,6 +158,31 @@ def resolve_source(node):
     return None
 
 
+def file_range(read):
+    """(first, last) as the FILES on disk are numbered - not as the Read plays.
+
+    NOT read.firstFrame()/lastFrame(). Those answer what the Read sends into
+    the script, after its Frame tab has had its say: 'start at 1001' on a plate
+    numbered 1764455 makes them say 1001, while the files are still called
+    ...1764455.dpx - and asking the disk for frame 1001 finds nothing. Moving a
+    clip in time is done on this node (Start at, Offset), so all that is wanted
+    from the Read is where its files are and how they are numbered.
+
+    The Read's own Original Range is exactly that. Nuke fills it in from the
+    files when the path is set, and none of Frame mode, Frame Range or
+    Before/After change it. Only if a Read has no such knobs (or they are
+    empty) does it fall back to what the Read reports.
+    """
+    try:
+        first = int(read["origfirst"].value())
+        last = int(read["origlast"].value())
+        if last >= first:
+            return first, last
+    except Exception:
+        pass
+    return int(read.firstFrame()), int(read.lastFrame())
+
+
 def from_read_node(node, start_at=0, nudge=0):
     """ExrSequence for what is wired into an input, or None.
 
@@ -175,8 +206,9 @@ def from_read_node(node, start_at=0, nudge=0):
         pattern = read["file"].value()
         if not is_exr(pattern):
             return None
-        first, last = int(read.firstFrame()), int(read.lastFrame())
+        first, last = file_range(read)
         place = (int(start_at) - first) if start_at else 0
-        return ExrSequence(pattern, first, last, place + int(nudge))
+        return ExrSequence(pattern, first, last, place + int(nudge),
+                           nudge=int(nudge))
     except Exception:
         return None

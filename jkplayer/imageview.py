@@ -19,6 +19,7 @@ the cache and decodes nothing, it only recomputes the display from data that is
 already loaded.
 """
 
+import math
 import os
 import threading
 import time
@@ -309,7 +310,13 @@ class ImageView(QtWidgets.QWidget):
     viewportChanged = QtCore.Signal()        # zoom/pan - the other window follows
     picked = QtCore.Signal()                 # a click = this window is active
     annotated = QtCore.Signal()              # a note was added or taken back
+    # Shift-drag sized a tool: ("draw" | "text", image pixels). `sizeDragging`
+    # while the mouse is still moving, `sizeDragged` once, on release.
+    sizeDragged = QtCore.Signal(str, float)
+    sizeDragging = QtCore.Signal(str, float)
     textWanted = QtCore.Signal(float, float)  # image point a note was asked for
+    # the canvas check's seam crossing was dragged: (shift_x %, shift_y %)
+    canvasShifted = QtCore.Signal(float, float)
 
     def __init__(self, parent=None):
         super(ImageView, self).__init__(parent)
@@ -360,13 +367,30 @@ class ImageView(QtWidgets.QWidget):
         # for the shot, not one per window); the tool is None unless a pencil
         # or the text button is armed.
         self.annotations = None
-        self.annot_tool = None       # None | "draw" | "text"
+        self.annot_tool = None       # None | "draw" | "erase" | "text"
+        self.show_annotations = False  # drawn only in Annotation mode
         self.annot_color = 0
         self.annot_pen = annotate.LINE_W
         self.annot_text = annotate.TEXT_H
         self.annot_frame = 0
         self._stroke = None          # the stroke being drawn, in image pixels
+        self._erasing = False        # the rubber is down (see _erase_at)
+        # Shift-drag with the pen: (press x on screen, press point, width it
+        # started at). None when not resizing.
+        # Shift-drag sizing: (press x on screen, press point, size it started
+        # at, tool). None when not sizing.
+        self._size_drag = None
+        # the panel sets the real ones, from the tool panel's own sliders
+        self.annot_ranges = {"draw": (0.5, 40.0), "text": (6.0, 200.0)}
+        self._rubber_at = None       # where to draw the rubber's circle
+        self._erased = False         # it took something out during this drag
         self._note_drag = None       # the note being dragged, while it is held
+        self._canvas_drag = False    # the canvas check's centre is held
+        self._windows = None         # (data window, display window) - set_windows
+        self.show_bbox = True        # False: the picture is cut to the format
+        self.line_format = False     # outline the format, solid
+        self.line_bbox = False       # outline the bounding box, dashed
+        self._canvas_hover = False   # the pointer is over it
         # What the last redraw cost, for the status line. Covers the WHOLE
         # display path - crop, colour transform and the QC check when one is on
         # - so it is the rate the picture itself can be produced at, in every
@@ -392,6 +416,12 @@ class ImageView(QtWidgets.QWidget):
         # notes all stay in stored pixels, which is the only frame of reference
         # that survives switching the squeeze off again.
         self._par = 1.0
+        # STABILISATION, in image pixels, added to the pan for drawing only.
+        # Going through the pan is what makes it correct everywhere at once:
+        # the paint transform, the crop that gets rendered and the pixel under
+        # the cursor all read the pan already, so none of them can be left
+        # behind describing an unstabilised picture.
+        self._stab = [0.0, 0.0]
         self._pan = [0.0, 0.0]
         self._drag = None
         self._syncing = False        # currently taking the view from the other window
@@ -634,8 +664,10 @@ class ImageView(QtWidgets.QWidget):
         vw, vh = max(1, self.width()), max(1, self.height())
         # the centre of the window corresponds to image point (w/2 + pan) -
         # see paintEvent
-        cx = w / 2.0 + self._pan[0]
-        cy = h / 2.0 + self._pan[1]
+        px, py = self._pan_xy()
+        fcx, fcy = self._format_centre()
+        cx = fcx + px
+        cy = fcy + py
         if margin is None:
             if self.playing:
                 margin = 0.0
@@ -891,7 +923,13 @@ class ImageView(QtWidgets.QWidget):
             g = (a * 255.0 + 0.5).astype(np.uint8)
             return np.repeat(g[:, :, None], 3, axis=2)
         else:
-            src = self._isolate_channel(arr)[:, :, :3]
+            # _isolate_channel gives ONE channel, (h,w,1) - it was made single
+            # for the QC checks' sake. OCIO is told it is getting RGB, so the
+            # channel has to be written into all three here; handing it the
+            # one channel made OCIO refuse the buffer as a third too short.
+            one = self._isolate_channel(arr)
+            src = (np.repeat(one, 3, axis=2) if one.shape[2] == 1
+                   else one[:, :, :3])
         try:
             rgb = self.ocio.apply(src, self.gain)
         except Exception as exc:
@@ -962,27 +1000,6 @@ class ImageView(QtWidgets.QWidget):
                 "gain": self.gain,
                 "gamma": self.gamma,
                 "sat_matrix": self._sat_matrix,
-                "linearize": self.linearize_fn()}
-
-    def scope_source_for(self, arr, rgb, look=None):
-        """A scope context for a frame that is NOT the one on screen.
-
-        Same shape as scope_source(), but over the WHOLE frame and the look the
-        export is rendering - so the scopes written into a JPEG describe that
-        picture, not whatever the viewport happened to be showing.
-        """
-        look = look or self.current_look()
-        # ALL FOUR channels, exactly as visible_linear() hands them over - the
-        # scopes reach for the alpha themselves (see scopes._planes_float), so
-        # an RGB-only slice quietly gives them nothing to measure.
-        return {"linear": arr,
-                "display": rgb,
-                "qc": look.get("effect", fx.NONE) != fx.NONE,
-                "channels": int(look.get("channels", CH_RGB)),
-                "gain": float(look.get("gain", 1.0)),
-                "gamma": float(look.get("gamma", 1.0)),
-                "sat_matrix": build_saturation_matrix(
-                    float(look.get("saturation", 1.0))),
                 "linearize": self.linearize_fn()}
 
     def _apply_saturation(self, rgb):
@@ -1201,7 +1218,14 @@ class ImageView(QtWidgets.QWidget):
                 return self._as_rgb888(self._apply_cc(rgb))
 
         if self.ocio_active():
-            rgb = self._render_ocio(arr)
+            # the channels of the LOOK being exported, not of whatever the
+            # window happens to be showing now - _render_ocio reads them off
+            # the view, so they are lent to it for the one call
+            was, self.channels = self.channels, channels
+            try:
+                rgb = self._render_ocio(arr)
+            finally:
+                self.channels = was
         else:
             bits = arr.view(np.uint16)
             if channels == CH_RGB:
@@ -1278,8 +1302,73 @@ class ImageView(QtWidgets.QWidget):
             return (0, 0)
         return (self._frame.shape[1], self._frame.shape[0])
 
-    def _fit_zoom(self):
+    # ------------------------------------------------------------ format
+    def set_windows(self, data_window, display_window):
+        """The EXR's data window (what the pixels cover) and display window
+        (the FORMAT), both (x0, y0, x1, y1) inclusive, y down as in the file.
+
+        None for either = no format known: the frame is its own format, as
+        before. Kept raw and checked against the frame at use, so a stale pair
+        can never misplace a frame of a different size.
+        """
+        windows = None
+        if data_window and display_window:
+            windows = (tuple(int(v) for v in data_window),
+                       tuple(int(v) for v in display_window))
+        if windows == self._windows:
+            return
+        self._windows = windows
+        self.update()
+
+    def set_show_bbox(self, on, line_format=None, line_bbox=None):
+        """Picture outside the format shown or cut, and the two outlines."""
+        state = (bool(on),
+                 self.line_format if line_format is None else bool(line_format),
+                 self.line_bbox if line_bbox is None else bool(line_bbox))
+        if state != (self.show_bbox, self.line_format, self.line_bbox):
+            self.show_bbox, self.line_format, self.line_bbox = state
+            self.update()
+
+    def format_box(self):
+        """(x, y, w, h) of the format in FRAME pixels, or None.
+
+        None when there is no format, or when it is the frame itself - then
+        there is nothing outside it to mark.
+        """
         w, h = self.image_size
+        if not self._windows or not w or not h:
+            return None
+        (x0, y0, x1, y1), (dx0, dy0, dx1, dy1) = self._windows
+        if (x1 - x0 + 1, y1 - y0 + 1) != (w, h):
+            return None                 # the pair belongs to another frame
+        fw, fh = dx1 - dx0 + 1, dy1 - dy0 + 1
+        if fw <= 0 or fh <= 0:
+            return None
+        box = (dx0 - x0, dy0 - y0, fw, fh)
+        if box == (0, 0, w, h):
+            return None
+        return box
+
+    def bbox_differs(self):
+        """Is the data window anything other than the format - bigger on any
+        side, smaller, or shifted? format_box is None exactly when they match."""
+        return self.format_box() is not None
+
+    def _format_centre(self):
+        """The frame point the view centres on: the middle of the FORMAT.
+
+        Not of the data window - an overscan or a per-frame bounding box would
+        otherwise move the shot about on screen as the bbox changed.
+        """
+        box = self.format_box()
+        if box is None:
+            w, h = self.image_size
+            return w / 2.0, h / 2.0
+        return box[0] + box[2] / 2.0, box[1] + box[3] / 2.0
+
+    def _fit_zoom(self):
+        box = self.format_box()
+        w, h = (box[2], box[3]) if box else self.image_size
         if not w or not h:
             return 1.0
         # against the DESQUEEZED width - fitting an anamorphic plate by its
@@ -1301,6 +1390,24 @@ class ImageView(QtWidgets.QWidget):
     @property
     def pixel_aspect(self):
         return self._par
+
+    def set_stabilise(self, dx, dy):
+        """Where this frame's picture sits, relative to the reference frame."""
+        dx, dy = float(dx or 0.0), float(dy or 0.0)
+        if abs(dx - self._stab[0]) < 1e-6 and abs(dy - self._stab[1]) < 1e-6:
+            return
+        self._stab = [dx, dy]
+        self._begin_fast()      # a new crop is needed, and it moves every frame
+        self.update()
+
+    def _pan_xy(self):
+        """The pan the PICTURE is drawn at: what was dragged, plus the track.
+
+        The user's own pan is kept separate (see viewport) so that panning
+        still means the same thing while stabilised, and so the two windows in
+        Sync share where you looked rather than where the track was.
+        """
+        return (self._pan[0] + self._stab[0], self._pan[1] + self._stab[1])
 
     def _zoom_x(self, z=None):
         """The horizontal scale: the zoom, widened by the squeeze."""
@@ -1378,17 +1485,81 @@ class ImageView(QtWidgets.QWidget):
             # annotating without putting the pencil down.
             at = self._widget_to_image(event_pos(event))
             if at is not None:
-                if self.annot_tool == "text":
+                shift = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+                if shift and self.annot_tool in ("draw", "text"):
+                    # SHIFT-DRAG SIZES THE TOOL, the way the brush is sized in
+                    # Nuke's own paint tools: nothing is drawn or written, the
+                    # drag sideways changes the size, and a preview shows it -
+                    # a circle for the pen, letters for the text.
+                    pos = event_pos(event)
+                    start = (self.annot_pen if self.annot_tool == "draw"
+                             else self.annot_text)
+                    self._size_drag = (pos.x(), (pos.x(), pos.y()),
+                                       float(start), self.annot_tool)
+                    self.setCursor(QtCore.Qt.SizeHorCursor)
+                    self.update()
+                elif self.annot_tool == "text":
                     self._press_note(float(at[0]), float(at[1]))
+                elif self.annot_tool == "erase":
+                    self._erasing = True
+                    self._erase_at(float(at[0]), float(at[1]))
                 else:
                     self._stroke = [(float(at[0]), float(at[1]))]
                 return
+        if (event.button() == QtCore.Qt.LeftButton
+                and self._canvas_hit(event_pos(event))):
+            # the centre of the canvas check is a handle: it moves the seams,
+            # anywhere else the left button still pans
+            self._canvas_drag = True
+            self.setCursor(QtCore.Qt.SizeAllCursor)
+            self.update()
+            return
         if event.button() == QtCore.Qt.LeftButton:
             self._drag = event_pos(event)
             self.setCursor(QtCore.Qt.ClosedHandCursor)
         elif event.button() == QtCore.Qt.MiddleButton and self.annot_tool:
             self._drag = event_pos(event)
             self.setCursor(QtCore.Qt.ClosedHandCursor)
+
+    # The rubber's radius in SCREEN pixels - the circle drawn round the cursor.
+    # Divided by the zoom before it reaches the notes, so it takes exactly the
+    # ink the circle is drawn over whatever you are zoomed to.
+    ERASE_RADIUS = 12.0
+
+    def _size_drag_to(self, screen_x):
+        """The tool size for a Shift-drag that has reached `screen_x`.
+
+        Sizes are kept in IMAGE pixels, like every mark, so the drag is divided
+        by the zoom: what you drag out on screen is what you get on screen.
+
+        The pen grows by TWICE the drag, because the preview is a circle and
+        its edge is what follows the cursor. Text grows by the drag itself -
+        the preview letters grow upwards from where the drag started.
+        """
+        x0, _at, start, tool = self._size_drag
+        z = max(0.02, self._effective_zoom())
+        lo, hi = self.annot_ranges.get(tool, (0.5, 200.0))
+        gain = 2.0 if tool == "draw" else 1.0
+        size = start + gain * (float(screen_x) - x0) / z
+        size = max(float(lo), min(float(hi), size))
+        attr = "annot_pen" if tool == "draw" else "annot_text"
+        if abs(size - getattr(self, attr)) > 1e-6:
+            setattr(self, attr, size)
+            self.sizeDragging.emit(tool, size)   # the panel's number follows
+            self.update()
+        return size
+
+    def _erase_at(self, x, y):
+        """Takes out the pen marks under the rubber, if there are any."""
+        if self.annotations is None:
+            return
+        z = max(0.02, self._effective_zoom())
+        gone = self.annotations.erase_at(self.annot_frame, x, y,
+                                         self.ERASE_RADIUS / z,
+                                         self.current_look())
+        if gone:
+            self._erased = True
+            self.update()
 
     def _press_note(self, x, y):
         """The text tool was pressed on the image.
@@ -1413,6 +1584,11 @@ class ImageView(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event):
         p = event_pos(event)
+        if self.annot_tool == "erase":
+            # the circle follows the cursor whether or not it is pressed, so
+            # you can see what it will take before it takes it
+            self._rubber_at = (p.x(), p.y())
+            self.update()
         if self._note_drag is not None:
             at = self._widget_to_image(p, clamp=True)
             if at is not None:
@@ -1424,13 +1600,32 @@ class ImageView(QtWidgets.QWidget):
                     self._note_drag["moved"] = True
                     self.update()
             return
+        if self._size_drag is not None:
+            self._size_drag_to(p.x())
+            return
+        if self._erasing:
+            at = self._widget_to_image(p)
+            if at is not None:
+                self._erase_at(float(at[0]), float(at[1]))
+            return
         if self._stroke is not None:
             at = self._widget_to_image(p)
             if at is not None:
                 self._stroke.append((float(at[0]), float(at[1])))
                 self.update()
             return
+        if self._canvas_drag:
+            self._canvas_drag_to(p)
+            return
         if self._drag is None:
+            hover = self._canvas_hit(p)
+            if hover != self._canvas_hover:
+                self._canvas_hover = hover
+                if hover:
+                    self.setCursor(QtCore.Qt.OpenHandCursor)
+                else:
+                    self.unsetCursor()
+                self.update()
             self._emit_probe(p)
             return
         z = self._effective_zoom()
@@ -1440,10 +1635,19 @@ class ImageView(QtWidgets.QWidget):
         self._moved()
 
     def leaveEvent(self, _event):
+        if self._rubber_at is not None:
+            self._rubber_at = None
+            self.update()
         if not self.probe_frozen:
             self.probeChanged.emit(None)
 
     def mouseReleaseEvent(self, _event):
+        if self._canvas_drag:
+            self._canvas_drag = False
+            self._canvas_hover = False
+            self.unsetCursor()
+            self.update()
+            return
         if self._note_drag is not None:
             drag, self._note_drag = self._note_drag, None
             self.unsetCursor()
@@ -1452,6 +1656,20 @@ class ImageView(QtWidgets.QWidget):
             else:
                 gx, gy = drag["grab"]       # it was only clicked: open it
                 self.textWanted.emit(gx, gy)
+            return
+        if self._size_drag is not None:
+            tool = self._size_drag[3]
+            self._size_drag = None
+            self.setCursor(QtCore.Qt.CrossCursor)
+            self.sizeDragged.emit(tool, float(
+                self.annot_pen if tool == "draw" else self.annot_text))
+            self.update()
+            return
+        if self._erasing:
+            self._erasing = False
+            if self._erased:
+                self._erased = False
+                self.annotated.emit()    # once per drag, not once per mark
             return
         if self._stroke is not None:
             stroke, self._stroke = self._stroke, None
@@ -1478,8 +1696,10 @@ class ImageView(QtWidgets.QWidget):
             return None
         z = self._effective_zoom()
         zx = self._zoom_x(z)
-        ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * zx
-        oy = self.height() / 2.0 - (self._pan[1] + h / 2.0) * z
+        px, py = self._pan_xy()
+        fcx, fcy = self._format_centre()
+        ox = self.width() / 2.0 - (px + fcx) * zx
+        oy = self.height() / 2.0 - (py + fcy) * z
         ix = int((pos.x() - ox) / zx)
         iy = int((pos.y() - oy) / z)
         if clamp:
@@ -1667,20 +1887,76 @@ class ImageView(QtWidgets.QWidget):
                               not magnified and rstep * z > 1.001)
         # the top left corner of the WHOLE image on screen
         zx = self._zoom_x(z)             # widened if the plate is anamorphic
-        ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * zx
-        oy = self.height() / 2.0 - (self._pan[1] + h / 2.0) * z
+        px, py = self._pan_xy()          # shifted if the track is holding it
+        fcx, fcy = self._format_centre()
+        ox = self.width() / 2.0 - (px + fcx) * zx
+        oy = self.height() / 2.0 - (py + fcy) * z
         target = QtCore.QRectF(ox + rx0 * zx, oy + ry0 * z,
                                cols * rstep * zx, rows * rstep * z)
+        fmt = self.format_box()
+        fmt_rect = None
+        if fmt is not None:
+            fmt_rect = QtCore.QRectF(ox + fmt[0] * zx, oy + fmt[1] * z,
+                                     fmt[2] * zx, fmt[3] * z)
+            # inside the format but outside the data window is BLACK, as in
+            # Nuke - not the grey of the window around the frame
+            painter.fillRect(fmt_rect, QtGui.QColor(0, 0, 0))
+            if not self.show_bbox:
+                painter.save()
+                painter.setClipRect(fmt_rect)
         painter.drawImage(target, self._qimage)
+        if fmt_rect is not None:
+            if not self.show_bbox:
+                painter.restore()
+            if self.line_format or self.line_bbox:
+                self._draw_format_lines(painter, fmt_rect, QtCore.QRectF(
+                    ox, oy, w * zx, h * z))
 
         # The notes go on LAST and use the same ox/oy/z the picture was drawn
         # with, so they sit on the pixels they were drawn on at any zoom.
-        if self.annotations is not None:
+        if self.annotations is not None and self.show_annotations:
             self.annotations.draw(painter, self.annot_frame, ox, oy, z,
                                   self.current_look(), w, h, zoom_x=zx)
+            if self._size_drag is not None:
+                _x0, (cx, cy), _start, tool = self._size_drag
+                ink = QtGui.QColor(*annotate.color_rgb(self.annot_color))
+                painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                if tool == "draw":
+                    # the pen's width, where the drag started, at the size it
+                    # will actually lay down on screen
+                    r = max(1.0, self.annot_pen * z / 2.0)
+                    painter.setBrush(ink)
+                    painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 1.5))
+                    painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+                    painter.setBrush(QtCore.Qt.NoBrush)
+                else:
+                    # letters at the height a note will be written at, bold as
+                    # notes are, with the same contrasting edge they get
+                    font = painter.font()
+                    font.setBold(True)
+                    font.setPixelSize(max(1, int(round(self.annot_text * z))))
+                    path = QtGui.QPainterPath()
+                    path.addText(QtCore.QPointF(cx, cy), font, "Aa")
+                    rgb = annotate.color_rgb(self.annot_color)
+                    edge = (QtGui.QColor(255, 255, 255, 200) if sum(rgb) < 200
+                            else QtGui.QColor(0, 0, 0, 190))
+                    painter.strokePath(path, QtGui.QPen(edge, 2.0))
+                    painter.fillPath(path, ink)
+            if self.annot_tool == "erase" and self._rubber_at is not None:
+                # the rubber's reach, in the same screen pixels _erase_at uses
+                painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                cx, cy = self._rubber_at
+                r = self.ERASE_RADIUS
+                for colour, width in ((QtGui.QColor(0, 0, 0, 160), 3.0),
+                                      (QtGui.QColor(255, 255, 255, 230), 1.2)):
+                    pen = QtGui.QPen(colour)
+                    pen.setWidthF(width)
+                    painter.setPen(pen)
+                    painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
             if self._stroke and len(self._stroke) > 1:
-                pen = QtGui.QPen(QtGui.QColor(*annotate.COLORS[
-                    self.annot_color % len(annotate.COLORS)]))
+                pen = QtGui.QPen(QtGui.QColor(
+                    *annotate.color_rgb(self.annot_color)))
                 pen.setWidthF(max(1.0, self.annot_pen * z))
                 pen.setCapStyle(QtCore.Qt.RoundCap)
                 pen.setJoinStyle(QtCore.Qt.RoundJoin)
@@ -1689,3 +1965,126 @@ class ImageView(QtWidgets.QWidget):
                 painter.drawPolyline(QtGui.QPolygonF(
                     [QtCore.QPointF(ox + x * zx, oy + y * z)
                      for x, y in self._stroke]))
+
+        if self._canvas_handle_live():
+            self._draw_canvas_handle(painter)
+
+    def _draw_format_lines(self, painter, fmt_rect, bbox_rect):
+        """The format as a thin solid line, the bounding box DASHED - the way
+        the Nuke Viewer marks what lies outside the frame."""
+        painter.save()
+        painter.setOpacity(1.0)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        # Each line is drawn twice: dark underneath, light on top. A single
+        # light line vanished over a bright overscan, a dark one over a black
+        # one; the pair reads on anything.
+        dark = QtGui.QColor(0, 0, 0, 200)
+        light = QtGui.QColor(230, 230, 230, 240)
+        # drawn just OUTSIDE the edges, so neither line covers picture
+        fmt_rect = fmt_rect.adjusted(-1.0, -1.0, 0.0, 0.0)
+        bbox_rect = bbox_rect.adjusted(-1.0, -1.0, 0.0, 0.0)
+        if self.line_format:
+            # the canvas line is a hint, not a frame: its white at 25 %
+            # (the dark edge under it scaled down with it)
+            soft_dark = QtGui.QColor(0, 0, 0, 64)
+            soft_light = QtGui.QColor(255, 255, 255, 64)
+            for colour in (soft_dark, soft_light):
+                pen = QtGui.QPen(colour)
+                pen.setWidthF(1.0)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.drawRect(fmt_rect if colour is soft_light
+                                 else fmt_rect.adjusted(-1.0, -1.0, 1.0, 1.0))
+        if not self.line_bbox:
+            painter.restore()
+            return
+        under = QtGui.QPen(dark)
+        under.setWidthF(1.0)
+        under.setCosmetic(True)
+        painter.setPen(under)
+        painter.drawRect(bbox_rect)
+        dashed = QtGui.QPen(light)
+        dashed.setWidthF(1.0)
+        dashed.setCosmetic(True)
+        dashed.setStyle(QtCore.Qt.CustomDashLine)
+        dashed.setDashPattern([5.0, 4.0])
+        painter.setPen(dashed)
+        painter.drawRect(bbox_rect)
+        painter.restore()
+
+    # ------------------------------------------------------- canvas handle
+    # How close (screen pixels) the pointer has to be to take hold of the
+    # point where the canvas check's seams cross.
+    CANVAS_GRAB = 16.0
+
+    def _canvas_handle_live(self):
+        """The canvas check is on and nothing else owns the left button."""
+        return (self.effect == fx.CANVAS and self._frame is not None
+                and not self.annot_tool and all(self.image_size))
+
+    def canvas_seam(self):
+        """(x, y) in image pixels where the ORIGINAL edges meet on screen.
+
+        Mirrors effects.canvas_source_index: a displayed pixel x shows source
+        (x + dx) % w, so source column 0 - the plate's left edge - lands on
+        (w - dx) % w. With the default half shift that is the middle.
+        """
+        w, h = self.image_size
+        dx = int(w * fx.param(self.effect_params, "shift_x", 50.0) / 100.0)
+        dy = int(h * fx.param(self.effect_params, "shift_y", 50.0) / 100.0)
+        return (w - dx) % w, (h - dy) % h
+
+    def _image_origin(self):
+        """(ox, oy, zx, z): the image's top left on screen and the scales."""
+        w, h = self.image_size
+        z = self._effective_zoom()
+        zx = self._zoom_x(z)
+        px, py = self._pan_xy()
+        fcx, fcy = self._format_centre()
+        return (self.width() / 2.0 - (px + fcx) * zx,
+                self.height() / 2.0 - (py + fcy) * z, zx, z)
+
+    def _canvas_seam_screen(self):
+        ox, oy, zx, z = self._image_origin()
+        sx, sy = self.canvas_seam()
+        return ox + sx * zx, oy + sy * z
+
+    def _canvas_hit(self, pos):
+        if not self._canvas_handle_live():
+            return False
+        cx, cy = self._canvas_seam_screen()
+        return math.hypot(pos.x() - cx, pos.y() - cy) <= self.CANVAS_GRAB
+
+    def _canvas_drag_to(self, pos):
+        """Puts the seam crossing under the pointer -> new shift_x / shift_y."""
+        w, h = self.image_size
+        ox, oy, zx, z = self._image_origin()
+        ix = max(0.0, min(float(w), (pos.x() - ox) / zx))
+        iy = max(0.0, min(float(h), (pos.y() - oy) / z))
+        params = dict(self.effect_params)
+        params["shift_x"] = round((w - ix) / float(w) * 100.0, 2) % 100.0
+        params["shift_y"] = round((h - iy) / float(h) * 100.0, 2) % 100.0
+        if params != self.effect_params:
+            self.set_effect_params(params)
+            self.canvasShifted.emit(params["shift_x"], params["shift_y"])
+
+    def _draw_canvas_handle(self, painter):
+        cx, cy = self._canvas_seam_screen()
+        if not (-40 < cx < self.width() + 40 and -40 < cy < self.height() + 40):
+            return
+        painter.setOpacity(1.0)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        hot = self._canvas_drag or self._canvas_hover
+        arm = 14.0 if hot else 11.0          # a plain cross, no ring
+        for colour, width in ((QtGui.QColor(0, 0, 0, 170), 3.2),
+                              (QtGui.QColor(255, 200, 60, 240) if hot
+                               else QtGui.QColor(255, 255, 255, 220), 1.4)):
+            pen = QtGui.QPen(colour)
+            pen.setWidthF(width)
+            painter.setPen(pen)
+            painter.drawLine(QtCore.QPointF(cx - arm, cy),
+                             QtCore.QPointF(cx + arm, cy))
+            painter.drawLine(QtCore.QPointF(cx, cy - arm),
+                             QtCore.QPointF(cx, cy + arm))
