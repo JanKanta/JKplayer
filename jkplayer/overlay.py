@@ -67,15 +67,32 @@ QComboBox {
 
 # CC: (key, label, min, max, default, decimals, curve)
 # A curve > 1 packs the short end of the range towards the left of the slider.
-# Gain and gamma can therefore go quite high (16 and 8) and still be adjustable
-# in hundredths around 1.00 - with a straight slider the whole useful 0.5-2
-# stretch would take a few pixels. With a curve of 3 the value 1.00 sits at
-# roughly two fifths of the length.
+#
+# THE RANGES AND SLIDERS OF NUKE'S GRADE, so a hand used to Nuke lands on the
+# same number at the same place: WhitePoint runs like Grade's gain (0-4),
+# BlackPoint like its lift (-1 to 1), Gamma like its gamma (0.2-5), all on
+# straight sliders as Nuke draws them.
 CC_PARAMS = [
-    ("gain", "Gain", 0.0, 16.0, 1.0, 2, 3.0),
-    ("gamma", "Gamma", 0.1, 8.0, 1.0, 2, 3.0),
+    # A Grade's two points, in scene-linear: whatever sits at the white point
+    # is shown as 1.0, at the black point as 0.
+    ("white", "WhitePoint", 0.0, 4.0, 1.0, 3, 1.0),
+    ("black", "BlackPoint", -1.0, 1.0, 0.0, 3, 1.0),
+    ("gamma", "Gamma", 0.2, 5.0, 1.0, 2, 1.0),
     ("sat", "Saturation", 0.0, 4.0, 1.0, 2, 1.0),
 ]
+
+
+def cc_gain(values):
+    """(gain, black) from the CC panel's white and black point.
+
+    (in - black) / (white - black), so gain = 1 / (white - black). The two
+    points are kept at least a hair apart, so crossing them over flattens the
+    picture rather than dividing by zero or turning it into a negative.
+    """
+    values = values or {}
+    black = float(values.get("black", 0.0))
+    white = float(values.get("white", 1.0))
+    return 1.0 / max(white - black, 1e-4), black
 
 
 # Slider steps. Longer ranges (gain up to 16) need a finer step, otherwise one
@@ -803,7 +820,7 @@ class _Panel(QtWidgets.QFrame):
 
 
 class CCPanel(_Panel):
-    """Gain / gamma / saturation.
+    """WhitePoint / BlackPoint / gamma / saturation.
 
     It does not collapse: on/off is handled by the CC toggle in the window bar.
     A collapsed panel would show only a strip with the title once switched on
@@ -867,7 +884,7 @@ SCOPE_KEYS = ("hist", "vscope", "wave")
 # Panel toggles in the image: (key, label on the button, tooltip).
 # The key is used for the node knobs too - cv_<key>_<window>.
 PANEL_BUTTONS = (
-    ("cc", "CC", "Colour: gain, gamma, saturation."),
+    ("cc", "CC", "Colour: white point, black point, gamma, saturation."),
     ("qc", "QC", "Check mode (grain, high-pass, saturation, value map...)."),
     ("hist", "H", "Histogram: axis 0 to 55, the line at 1.0 marks clipping."),
     ("vscope", "V", "Vectorscope: the colour of the plate, through the input "
@@ -2411,6 +2428,9 @@ class EffectPanel(_Panel):
         super(EffectPanel, self).__init__("QC", PANEL_W, FX_LABEL_W,
                                           parent=parent)
         self._effect = fx.NONE
+        # menus whose items are decided at runtime, e.g. the log view's curves
+        # follow the colour management (see set_choices)
+        self._choice_lists = {}
 
         self.combo = _Combo(self)
         self.combo.addItems([fx.LABELS[e] for e in fx.ORDER])
@@ -2452,7 +2472,8 @@ class EffectPanel(_Panel):
             key, label, lo, hi, default, decimals = spec[:6]
             value = self._values.get(key, default)
             if len(spec) > 6:                 # named values -> a menu
-                self._add_choice(key, label, spec[6], value)
+                self._add_choice(key, label,
+                                 self._choice_lists.get(key, spec[6]), value)
             else:
                 self._add_slider(key, label, lo, hi, value, decimals,
                                  default=default)
@@ -2460,6 +2481,32 @@ class EffectPanel(_Panel):
         self.updateGeometry()
         self.adjustSize()
         self.resized.emit()
+
+    def set_choices(self, key, choices, index=0):
+        """Replaces the items of a menu parameter. No signal is sent.
+
+        Remembered for when the mode is built again; when the menu is on
+        screen now its items are swapped in place.
+        """
+        choices = list(choices)
+        self._choice_lists[key] = choices
+        index = max(0, min(len(choices) - 1, int(index))) if choices else 0
+        combo = self._choices.get(key)
+        if combo is None:
+            return
+        have = [combo.itemText(i) for i in range(combo.count())]
+        combo.blockSignals(True)
+        if have != choices:
+            combo.clear()
+            combo.addItems(choices)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        self._values[key] = float(index)
+
+    def choices(self, key):
+        combo = self._choices.get(key)
+        return ([combo.itemText(i) for i in range(combo.count())]
+                if combo is not None else list(self._choice_lists.get(key, [])))
 
     def _emit(self):
         self.changed.emit(self.values())
@@ -2644,7 +2691,7 @@ class VectorscopeCanvas(_Canvas):
         self._plate = scopes.hue_plate()          # the backdrop is computed once
         self._rgb = None                          # KEEPS the buffer alive for the QImage
         self._image = None
-        # how the trace was encoded: (channel, gain, gamma, sat) when it was
+        # how the trace was encoded: (channel, gain, gamma, sat, black) when it was
         # made from the plate, None when from the finished image (QC) - the
         # ring under the cursor has to be put through the SAME one
         self.encode = None
@@ -2729,11 +2776,11 @@ class VectorscopeCanvas(_Canvas):
             if self.encode is None:
                 src = self._probe.get("shown")
             else:
-                ch, gain, gamma, sat = self.encode
+                ch, gain, gamma, sat, black = self.encode
                 lin = self._probe.get("linear")
                 src = (None if lin is None else scopes.vector_rgb(
                     np.asarray(lin, dtype=np.float32).reshape(1, 3), ch, gain,
-                    gamma, sat).reshape(3))
+                    gamma, sat, black=black).reshape(3))
             xy = scopes.vectorscope_point(src)
             if xy is not None:
                 q = at(xy)
@@ -3089,6 +3136,7 @@ class ScopeStack(_Stack):
         display, linear = ctx.get("display"), ctx.get("linear")
         gain, sat = ctx.get("gain", 1.0), ctx.get("sat_matrix")
         gamma, lz = ctx.get("gamma", 1.0), ctx.get("linearize")
+        black = ctx.get("black", 0.0)
 
         if self.vscope.is_open():
             # THE SAME SWITCH AS THE OTHER TWO. In ordinary display off the
@@ -3103,9 +3151,10 @@ class ScopeStack(_Stack):
                 self.vscope.canvas.encode = None
                 self.vscope.canvas.set_data(scopes.vectorscope(display, channel))
             else:
-                self.vscope.canvas.encode = (channel, gain, gamma, sat)
+                self.vscope.canvas.encode = (channel, gain, gamma, sat, black)
                 self.vscope.canvas.set_data(scopes.vectorscope_linear(
-                    linear, channel, gain, sat, linearize=lz, gamma=gamma))
+                    linear, channel, gain, sat, linearize=lz, gamma=gamma,
+                    black=black))
         if self.wave.is_open():
             if qc:
                 self.wave.canvas.set_data(scopes.waveform(display, channel),
@@ -3113,7 +3162,8 @@ class ScopeStack(_Stack):
             else:
                 self.wave.canvas.set_data(
                     scopes.waveform_linear(linear, channel, gain, sat,
-                                           linearize=lz, gamma=gamma),
+                                           linearize=lz, gamma=gamma,
+                                           black=black),
                     scopes.WF_AXIS_LINEAR)
         if not self.hist.is_open():
             return
@@ -3123,4 +3173,4 @@ class ScopeStack(_Stack):
             return
         self.hist.canvas.set_data(
             scopes.histogram(linear, channel, gain, sat, linearize=lz,
-                             gamma=gamma))
+                             gamma=gamma, black=black))

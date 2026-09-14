@@ -103,7 +103,7 @@ def _srgb_decode(e):
                     np.power((e + 0.055) / 1.055, 2.4))
 
 
-def apply_cc(v, gain=1.0, gamma=1.0):
+def apply_cc(v, gain=1.0, gamma=1.0, black=0.0):
     """Scene-linear values -> scene-linear values AFTER CC.
 
     Gain is a plain multiplier, that belongs in linear. Gamma, however, acts
@@ -124,7 +124,10 @@ def apply_cc(v, gain=1.0, gamma=1.0):
     direction and size of the shift are right, and the scope axis is
     deliberately fixed anyway, independent of the view.
     """
-    v = np.asarray(v, dtype=np.float32) * float(gain)
+    v = np.asarray(v, dtype=np.float32)
+    if black:
+        v = v - float(black)          # the black point, before the white one
+    v = v * float(gain)
     if abs(float(gamma) - 1.0) <= 1e-6:
         return v                          # no round trip, keep it bit for bit
     low = _srgb_decode(np.power(_srgb_encode(np.clip(v, 0.0, 1.0)),
@@ -135,7 +138,7 @@ def apply_cc(v, gain=1.0, gamma=1.0):
 _LUT_CACHE = {}
 
 
-def bin_lut(gain=1.0, gamma=1.0):
+def bin_lut(gain=1.0, gamma=1.0, black=0.0):
     """Table half float bits -> bin number, CC already included.
 
     Gain and gamma are baked straight into the table, so the binning itself
@@ -143,7 +146,8 @@ def bin_lut(gain=1.0, gamma=1.0):
     histogram now reacts to CC. We keep a few of the latest tables so dragging
     a slider does not keep building new ones.
     """
-    key = (round(float(gain), 4), round(float(gamma), 4))
+    key = (round(float(gain), 4), round(float(gamma), 4),
+           round(float(black), 5))
     lut = _LUT_CACHE.get(key)
     if lut is None:
         lut = _pos_to_bin(value_to_pos(
@@ -157,7 +161,7 @@ def bin_lut(gain=1.0, gamma=1.0):
 _POS_CACHE = {}
 
 
-def pos_lut(gain=1.0, gamma=1.0):
+def pos_lut(gain=1.0, gamma=1.0, black=0.0):
     """Table half float bits -> position on a 0..255 axis, CC included.
 
     The same as bin_lut, only at a finer scale - the waveform computes its
@@ -165,7 +169,8 @@ def pos_lut(gain=1.0, gamma=1.0):
     table, converting the whole crop through np.power costs several times the
     rest of the computation (measured 8.9 -> 2.3 ms on 2K).
     """
-    key = (round(float(gain), 4), round(float(gamma), 4))
+    key = (round(float(gain), 4), round(float(gamma), 4),
+           round(float(black), 5))
     lut = _POS_CACHE.get(key)
     if lut is None:
         lut = (value_to_pos(apply_cc(_HALF_SAFE, *key)) * 255.0).astype(np.float32)
@@ -221,7 +226,7 @@ def _planes_float(sub, channel, sat_matrix):
 
 
 def _encoded_rgb(arr, channel, gain=1.0, sat_matrix=None, linearize=None,
-                 budget=120000, gamma=1.0):
+                 budget=120000, gamma=1.0, black=0.0):
     """Scene-linear half -> ((h,w,3) float32 0..255, which channels to draw).
 
     The conversion is the same as the histogram axis (value_to_pos), so the
@@ -248,7 +253,7 @@ def _encoded_rgb(arr, channel, gain=1.0, sat_matrix=None, linearize=None,
         # crop.
         cont = np.ascontiguousarray(sub)
         bits = cont.view(np.uint16)
-        lut = pos_lut(gain, gamma)
+        lut = pos_lut(gain, gamma, black)
         if channel == "rgb":
             return np.ascontiguousarray(lut[bits[:, :, :3]]), (0, 1, 2)
         if channel == "a":
@@ -275,7 +280,7 @@ def _encoded_rgb(arr, channel, gain=1.0, sat_matrix=None, linearize=None,
         rgb = np.repeat(sub[:, :, 3].astype(np.float32)[:, :, None], 3, axis=2)
     elif channel == "y":
         rgb = np.repeat((rgb @ _LUMA)[:, :, None], 3, axis=2)
-    return value_to_pos(apply_cc(rgb, gain, gamma)) * 255.0, keep
+    return value_to_pos(apply_cc(rgb, gain, gamma, black)) * 255.0, keep
 
 
 def _pack(binned, over):
@@ -354,7 +359,7 @@ def histogram_display(rgb8, channel="rgb"):
 
 
 def histogram(arr, channel="rgb", gain=1.0, sat_matrix=None, budget=150000,
-              linearize=None, gamma=1.0):
+              linearize=None, gamma=1.0, black=0.0):
     """(curves, colours, clipped_fraction, axis) or None.
 
     `curves` is (n, HIST_BINS) float32 normalised to 1, `colours` a list of RGB
@@ -384,19 +389,22 @@ def histogram(arr, channel="rgb", gain=1.0, sat_matrix=None, budget=150000,
         # The result is bit-identical.
         cont = np.ascontiguousarray(sub)
         bits = cont.view(np.uint16)
-        lut = bin_lut(gain, gamma)
+        lut = bin_lut(gain, gamma, black)
         binned = [(key, lut[bits[:, :, i]]) for key, i in idxs]
         # Gamma does not move the clipping boundary - it acts above the display
-        # domain and is fixed at 1.0 (see apply_cc), so a gain threshold is enough.
-        limit = float(np.float16(1.0 / max(gain, 1e-6)))
+        # domain and is fixed at 1.0 (see apply_cc), so the white point alone
+        # decides it: black + 1 / gain is the value that lands on 1.0.
+        limit = float(np.float16(float(black) + 1.0 / max(gain, 1e-6)))
         over = [float((cont[:, :, i].astype(np.float32) > limit).mean())
                 for _key, i in idxs]
     else:
         planes = _planes_float(sub, channel, sat_matrix)
         g = float(gain)
         binned = [(key, _pos_to_bin(value_to_pos(
-            apply_cc(p, g, gamma))).astype(np.int32)) for key, p in planes]
-        over = [float((p * g > 1.0).mean()) for _, p in planes]
+            apply_cc(p, g, gamma, black))).astype(np.int32))
+            for key, p in planes]
+        over = [float(((p - float(black)) * g > 1.0).mean())
+                for _, p in planes]
 
     curves, colors, clipped = _pack(binned, over)
     return curves, colors, clipped, AXIS_LINEAR
@@ -544,7 +552,7 @@ With a single channel the trace is a STRAIGHT LINE out of the centre, and
 
 
 def vector_rgb(rgb, channel="rgb", gain=1.0, gamma=1.0, sat_matrix=None,
-               alpha=None):
+               alpha=None, black=0.0):
     """Scene-linear RGB -> float 0..255, the way the vectorscope reads colour.
 
     A FIXED encoding - sRGB, clipped at 1.0 - and not whatever the monitor LUT
@@ -579,12 +587,13 @@ def vector_rgb(rgb, channel="rgb", gain=1.0, gamma=1.0, sat_matrix=None,
         rgb = np.repeat(a[..., None], 3, axis=-1)
     elif channel == "y":
         rgb = np.repeat((rgb @ _LUMA)[..., None], 3, axis=-1)
-    v = np.clip(apply_cc(rgb, gain, gamma), 0.0, 1.0)
+    v = np.clip(apply_cc(rgb, gain, gamma, black), 0.0, 1.0)
     return (_srgb_encode(v) * 255.0).astype(np.float32)
 
 
 def vectorscope_linear(arr, channel="rgb", gain=1.0, sat_matrix=None,
-                       budget=120000, size=VS_SIZE, linearize=None, gamma=1.0):
+                       budget=120000, size=VS_SIZE, linearize=None, gamma=1.0,
+                       black=0.0):
     """(size, size) float32 0..1 - the vectorscope, off the PLATE.
 
     Scene-linear half in, as the histogram and the waveform take it, through
@@ -602,7 +611,7 @@ def vectorscope_linear(arr, channel="rgb", gain=1.0, sat_matrix=None,
     if linearize is not None:
         rgb = linearize(np.ascontiguousarray(rgb))
     return _vectorscope_grid(
-        vector_rgb(rgb, channel, gain, gamma, sat_matrix, alpha), size)
+        vector_rgb(rgb, channel, gain, gamma, sat_matrix, alpha, black), size)
 
 
 def vectorscope_point(rgb):
@@ -734,7 +743,7 @@ def waveform(rgb8, channel="rgb", budget=200000, width=WF_W, height=WF_H):
 
 def waveform_linear(arr, channel="rgb", gain=1.0, sat_matrix=None,
                     budget=200000, width=WF_W, height=WF_H, linearize=None,
-                    gamma=1.0):
+                    gamma=1.0, black=0.0):
     """Waveform from SCENE-LINEAR data, with room for values above 1.
 
     The vertical axis is the same as the histogram's (see _encoded_rgb): the
@@ -742,7 +751,7 @@ def waveform_linear(arr, channel="rgb", gain=1.0, sat_matrix=None,
     HIST_MAX. The line at 1.0 is drawn by WaveformCanvas from WF_AXIS_LINEAR.
     """
     rgb, keep = _encoded_rgb(arr, channel, gain, sat_matrix, linearize,
-                             budget, gamma)
+                             budget, gamma, black)
     if rgb is None:
         return None
     return _waveform_grid(rgb, keep, width, height, 255.0)

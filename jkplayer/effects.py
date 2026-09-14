@@ -52,11 +52,13 @@ TEMPORAL = "temporal"
 # window when QC is off.
 ORDER = [LOG, GRAIN, BANDPASS, TEMPORAL, SAT, VALUEMAP, CANVAS]
 
-# The log curves offered by the log view. Taken from the same table the input
-# transforms come from, so the shot is shown in exactly the curve it would be
-# read back with - and only the LOG ones: putting sRGB in this list would make
-# a "log view" that is not a log view.
-LOG_CURVES = ["Cineon", "AlexaV3LogC", "SLog3", "Log3G10"]
+# The log curves offered by the log view WHEN COLOUR IS ON NUKE'S TRANSFORMS.
+# Taken from the same table the input transforms come from, so the shot is
+# shown in exactly the curve it would be read back with - and only the LOG
+# ones: putting sRGB in this list would make a "log view" that is not a log
+# view. Under OCIO the list is the config's own log spaces instead - the panel
+# swaps it (see PlayerPanel._sync_log_curves) and the view is handed an encoder.
+LOG_CURVES = list(nukelut.LOG_NAMES)
 
 # What the Overlay strip offers. NONE first - that is the plain dissolve.
 OVERLAY_MODES = [NONE, DIFF, HPDIFF]
@@ -130,8 +132,6 @@ PARAMS = {
     LOG: [
         # a seventh element = a menu instead of a slider (see overlay.EffectPanel)
         ("curve", "Log curve", 0, len(LOG_CURVES) - 1, 0, 0, LOG_CURVES),
-        ("exposure", "Exposure (stops)", -6.0, 6.0, 0.0, 2),
-        ("black", "Black level", 0.0, 0.5, 0.0, 3),
     ],
     DIFF: [
         # Threshold is the only thing left in the image. The colour and the
@@ -199,11 +199,10 @@ DESCRIPTION = {
     LOG: ("The shot read back through a LOG curve, whatever the monitor is\n"
           "set to. The toe and the shoulder are stretched out, so what a\n"
           "display transform has already rolled away is visible again.\n"
-          "Curve    = which log encoding to read it in.\n"
-          "Exposure = stops, for pushing a dark or bright plate into the\n"
-          "           part of the curve you want to look at.\n"
-          "Black    = lifts the floor away, so the toe is not mistaken for\n"
-          "           detail.\n"
+          "Curve    = which camera log to read it in: Nuke's log curves,\n"
+          "           or under OCIO the log spaces of the config in use\n"
+          "           (ACES 1.3, 2.0... each have their own list).\n"
+          "Levels: CC - WhitePoint, BlackPoint and Gamma go over it.\n"
           "Look for: crushed blacks, clipped highlights, banding in a\n"
           "gradient, a grade already baked into a plate that should be raw."),
     DIFF: ("Difference between input A and B (not between frames - that is\n"
@@ -592,34 +591,44 @@ _LOG_TABLE_KEY = None
 _LOG_TABLE_LOCK = threading.Lock()
 
 
-def _log_table(curve, exposure, black):
+def log_curve_name(params, curves=None):
+    """The curve NAME the 'curve' index of the log view points at."""
+    curves = list(curves) if curves else LOG_CURVES
+    idx = int(round(param(params or {}, "curve", 0)))
+    return curves[max(0, min(len(curves) - 1, idx))]
+
+
+def _log_bytes(v):
+    """Encoded log values 0..1 -> uint8. Levels are CC's job (white point,
+    black point, gamma), which goes over the finished check like any other."""
+    v = np.clip(np.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    return (v * 255.0 + 0.5).astype(np.uint8)
+
+
+def _log_table(curve):
     """half BITS -> uint8, the whole log view in one lookup.
 
     The curve itself is a log10 per pixel, which on a 4K frame is the most
     expensive thing in the check by a wide margin. It does not have to be:
     the input is a half, so there are only 65536 answers, and the table is
     built once and reused until a slider moves.
+
+    `curve` is a Nuke curve name, or an index into LOG_CURVES.
     """
     global _LOG_TABLE, _LOG_TABLE_KEY
-    name = LOG_CURVES[max(0, min(len(LOG_CURVES) - 1, int(round(curve))))]
-    key = (name, float(exposure), float(black))
+    if isinstance(curve, str):
+        name = curve
+    else:
+        name = LOG_CURVES[max(0, min(len(LOG_CURVES) - 1, int(round(curve))))]
+    key = name
     with _LOG_TABLE_LOCK:
         if key != _LOG_TABLE_KEY:
-            # The table covers EVERY half there is, so the top of it overflows
-            # as soon as exposure is pushed up, and log10 is handed a zero at
-            # the bottom. Both are expected and both are dealt with by the
-            # clip below - they must not print a warning per slider move.
+            # log10 is handed a zero at the bottom of the table; expected, and
+            # cleaned up in _log_bytes - no warning for it
             with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-                v = np.clip(_HALF_VALUES, 0.0, None) * (2.0 ** float(exposure))
+                v = np.clip(_HALF_VALUES, 0.0, None)
                 v = np.asarray(nukelut.encode(name, v), dtype=np.float32)
-            # Black level lifts the floor away, so the bottom of the curve is
-            # not read as detail when it is only the toe of the encoding.
-            lo = float(black)
-            if lo > 0.0:
-                v = (v - lo) / max(1e-6, 1.0 - lo)
-            _LOG_TABLE = (np.clip(np.nan_to_num(v, nan=0.0, posinf=1.0,
-                                                neginf=0.0), 0.0, 1.0)
-                          * 255.0 + 0.5).astype(np.uint8)
+            _LOG_TABLE = _log_bytes(v)
             _LOG_TABLE_KEY = key
         return _LOG_TABLE
 
@@ -638,10 +647,48 @@ def _log(lin, _lut, params=None):
     the other.
     """
     params = params or {}
-    table = _log_table(param(params, "curve", 0),
-                       param(params, "exposure", 0.0),
-                       param(params, "black", 0.0))
+    table = _log_table(param(params, "curve", 0))
     return table[lin[:, :, :3].view(np.uint16)]
+
+
+def log_view(lin, params=None, curves=None, encoder=None, threads=1):
+    """The log view with the curve list of the current colour management.
+
+    `curves` are the names offered (Nuke's log curves, or the OCIO config's
+    log spaces) and params['curve'] indexes into them. `encoder` is None for
+    a Nuke curve - one table lookup, see _log_table - or, under OCIO, the
+    exact encoder from ocio.DisplayTransform.log_encoder, run per band.
+
+    `lin` must already be scene-linear: a log plate re-encoded in log would
+    be log of log.
+    """
+    params = params or {}
+    if lin is None or lin.size == 0:
+        return None
+    if encoder is None:
+        name = log_curve_name(params, curves)
+        if not nukelut.has(name):
+            name = LOG_CURVES[0]         # an OCIO name with no OCIO behind it
+        table = _log_table(name)
+        return table[lin[:, :, :3].view(np.uint16)]
+
+    def band(r0, r1):
+        part = lin[r0:r1]
+        chans = min(3, part.shape[2])
+        rgb = part[:, :, :chans].astype(np.float32)
+        if chans == 1:                   # an isolated channel: grey through it
+            rgb = np.repeat(rgb, 3, axis=2)
+        rgb = np.ascontiguousarray(
+            np.nan_to_num(rgb, nan=0.0, posinf=65504.0, neginf=-65504.0))
+        encoder(rgb)
+        out = _log_bytes(rgb)
+        return out[:, :, :1] if chans == 1 else out
+
+    height = lin.shape[0]
+    bands = _band_count(height, int(threads), 0)
+    if bands > 1:
+        return _banded(band, height, bands, 0)
+    return band(0, height)
 
 
 def _grain(lin, lut, params=None):

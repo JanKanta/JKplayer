@@ -43,6 +43,10 @@ def _expose_in_main():
 PANEL_ID = "com.honza.JKplayerPanel"
 PANEL_NAME = "JKplayer"
 
+# Create JKplayer Node: Ctrl+J in the Node Graph (Nuke's "^" is Ctrl).
+CREATE_SHORTCUT = "^j"
+DAG_CONTEXT = 2           # nuke's shortcutContext for the Node Graph
+
 
 def _new_pane_panel(name, uid):
     """A Nuke pane wrapping our widget.
@@ -624,8 +628,13 @@ def register():
 
     try:
         m = nuke.menu("Nuke").addMenu("JKplayer")
+        # Ctrl+J, in the Node Graph only. Plain J is Nuke's "Jump to
+        # Bookmarked Node", and a window-wide shortcut would take J/K/L off
+        # the Viewer. Bound on THIS entry alone: the same key on the Nodes
+        # toolbar entry too would make it ambiguous, and Qt then fires neither.
         m.addCommand("Create JKplayer Node",
-                     "import jkplayer.register as r; r.create_node()")
+                     "import jkplayer.register as r; r.create_node()",
+                     CREATE_SHORTCUT, shortcutContext=DAG_CONTEXT)
         # NOT force. It used to be, back when there was one panel for the whole
         # script and the entry had to be able to open a second after the first
         # was closed. Now the entry means "show me the panel for the node I

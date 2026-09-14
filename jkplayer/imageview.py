@@ -263,15 +263,17 @@ NEUTRAL_LUT = build_lut()
 NEUTRAL_LUT_F = build_lut_f()    # the same, unclipped, for the band checks
 
 
-def build_cc_lut(gain, gamma):
-    """256 -> 256 uint8: gain and gamma over finished bytes, or None.
+def build_cc_lut(gain, gamma, black=0.0):
+    """256 -> 256 uint8: white/black point and gamma over finished bytes, or None.
 
     This is the CC path for the QC effects - it tints the result of the check
     but does not touch the data the check was computed from.
     """
-    if abs(float(gain) - 1.0) < 1e-6 and abs(float(gamma) - 1.0) < 1e-6:
+    if (abs(float(gain) - 1.0) < 1e-6 and abs(float(gamma) - 1.0) < 1e-6
+            and abs(float(black)) < 1e-9):
         return None
-    v = np.linspace(0.0, 1.0, 256, dtype=np.float32) * float(gain)
+    v = (np.linspace(0.0, 1.0, 256, dtype=np.float32) - float(black)) \
+        * float(gain)
     v = np.clip(v, 0.0, None)
     if abs(float(gamma) - 1.0) > 1e-6:
         v = np.power(v, 1.0 / max(float(gamma), 1e-3))
@@ -341,7 +343,8 @@ class ImageView(QtWidgets.QWidget):
         self.margin = 0.35           # margin around the visible area (share of the window)
 
         self._lut = build_lut()
-        self.gain = 1.0
+        self.gain = 1.0              # 1 / (white point - black point)
+        self.black = 0.0             # CC's black point, scene-linear
         self.gamma = 1.0
         self.channels = CH_RGB
         self.saturation = 1.0        # not in the LUT - handled over RGB pixels
@@ -356,6 +359,7 @@ class ImageView(QtWidgets.QWidget):
         self._fx_lut_src = None      # the table _fx_lut was built from
         self.effect = fx.NONE
         self.effect_params = {}      # settings of the active effect (see overlay.py)
+        self.log_curves = None       # names for the log view - set_log_curves
         # Threads the blur-heavy QC checks are computed on (cv_qc_threads).
         # They are the only expensive thing left on the GUI thread, and they
         # are what limits the DISPLAY rate - see effects._apply_banded.
@@ -471,7 +475,10 @@ class ImageView(QtWidgets.QWidget):
     def matte_active(self):
         return any(self.matte_channels)
 
-    def set_color(self, gain=None, gamma=None, channels=None, saturation=None):
+    def set_color(self, gain=None, gamma=None, channels=None, saturation=None,
+                  black=None):
+        """`gain` and `black` are CC's white and black point as a Grade uses
+        them: (in - black) * gain, gain = 1 / (white - black)."""
         rebuild = False
         if saturation is not None and abs(saturation - self.saturation) > 1e-6:
             self.saturation = float(saturation)
@@ -481,6 +488,8 @@ class ImageView(QtWidgets.QWidget):
             self.gain = float(gain); rebuild = True
         if gamma is not None and abs(gamma - self.gamma) > 1e-9:
             self.gamma = float(gamma); rebuild = True
+        if black is not None and abs(black - self.black) > 1e-9:
+            self.black = float(black); rebuild = True
         if channels is not None and int(channels) != self.channels:
             self.channels = int(channels)
             self._dirty = True
@@ -491,9 +500,9 @@ class ImageView(QtWidgets.QWidget):
 
     def _rebuild_luts(self):
         self._lut = nukelut.display_lut(self.nuke_display, self.nuke_input,
-                                        self.gain, self.gamma)
+                                        self.gain, self.gamma, self.black)
         self._gamma_lut = build_gamma_lut(self.gamma)
-        self._cc_lut = build_cc_lut(self.gain, self.gamma)
+        self._cc_lut = build_cc_lut(self.gain, self.gamma, self.black)
 
     def set_ocio(self, transform):
         """Switches the OCIO path on/off (transform = ocio.DisplayTransform or None)."""
@@ -830,6 +839,8 @@ class ImageView(QtWidgets.QWidget):
             return None if out is None else self._isolate_result(out, arr)
 
         src = self._isolate_channel(arr)
+        if self.effect == fx.LOG:
+            return self._render_log(src)
         if self.effect == fx.TEMPORAL:
             out = fx.temporal(src, self._isolate_channel(prev_crop),
                               lut, self.effect_params, self.qc_threads)
@@ -848,6 +859,28 @@ class ImageView(QtWidgets.QWidget):
             out = out[:, :, 0]      # one channel stays GREY to the QImage
         return out
 
+    def set_log_curves(self, curves):
+        """The names the log view's 'curve' index points at (see
+        effects.log_view) - Nuke's log curves or the OCIO config's log spaces."""
+        curves = list(curves) if curves else None
+        if curves != self.log_curves:
+            self.log_curves = curves
+            if self.effect == fx.LOG:
+                self.invalidate()
+
+    def _render_log(self, src):
+        """The log view: Nuke's curve by table, or OCIO's log space exactly."""
+        curves = self.log_curves or fx.LOG_CURVES
+        encoder = None
+        if self.ocio_active():
+            name = fx.log_curve_name(self.effect_params, curves)
+            encoder = self.ocio.log_encoder(name)
+        out = fx.log_view(src, self.effect_params, curves, encoder,
+                          self.qc_threads)
+        if out is not None and out.ndim == 3 and out.shape[2] == 1:
+            out = out[:, :, 0]
+        return out
+
     def _effect_inputs(self, arr, other):
         """Data and table prepared for the QC computation.
 
@@ -860,7 +893,9 @@ class ImageView(QtWidgets.QWidget):
         lut, lut_f = NEUTRAL_LUT, NEUTRAL_LUT_F
         if not self.is_linear_input():
             table = self.linear_table()
-            if table is None or self.effect == fx.VALUEMAP \
+            # the log view encodes VALUES too - it has to start from linear,
+            # or a log plate would be shown as log of log
+            if table is None or self.effect in (fx.VALUEMAP, fx.LOG) \
                     or self.channels == CH_LUMA:
                 arr = self._linearize(arr, table)
                 other = self._linearize(other, table)
@@ -931,7 +966,7 @@ class ImageView(QtWidgets.QWidget):
             src = (np.repeat(one, 3, axis=2) if one.shape[2] == 1
                    else one[:, :, :3])
         try:
-            rgb = self.ocio.apply(src, self.gain)
+            rgb = self.ocio.apply(src, self.gain, self.black)
         except Exception as exc:
             self.last_error = "OCIO: %s" % exc
             return None
@@ -999,6 +1034,7 @@ class ImageView(QtWidgets.QWidget):
                 "channels": self.channels,
                 "gain": self.gain,
                 "gamma": self.gamma,
+                "black": self.black,
                 "sat_matrix": self._sat_matrix,
                 "linearize": self.linearize_fn()}
 
@@ -1155,6 +1191,7 @@ class ImageView(QtWidgets.QWidget):
                 "channels": self.channels,
                 "gain": self.gain,
                 "gamma": self.gamma,
+                "black": self.black,
                 "saturation": self.saturation}
 
     def render_full(self, arr, look=None):
@@ -1172,13 +1209,15 @@ class ImageView(QtWidgets.QWidget):
         channels = int(look.get("channels", CH_RGB))
         gain = float(look.get("gain", 1.0))
         gamma = float(look.get("gamma", 1.0))
+        black = float(look.get("black", 0.0))
 
         # Its own tables, built from the look - the window is not disturbed,
         # and an export started while someone is dragging a slider still comes
         # out as the note was made.
-        if abs(gain - self.gain) > 1e-9 or abs(gamma - self.gamma) > 1e-9:
+        if (abs(gain - self.gain) > 1e-9 or abs(gamma - self.gamma) > 1e-9
+                or abs(black - self.black) > 1e-9):
             lut = nukelut.display_lut(self.nuke_display, self.nuke_input,
-                                      gain, gamma)
+                                      gain, gamma, black)
         else:
             lut = self._lut
         sat = build_saturation_matrix(float(look.get("saturation", 1.0)))
@@ -1796,7 +1835,8 @@ class ImageView(QtWidgets.QWidget):
 
         if self.ocio_active():
             try:
-                shown = self.ocio.apply(px[:, :, :3], self.gain).reshape(3)
+                shown = self.ocio.apply(px[:, :, :3], self.gain,
+                                        self.black).reshape(3)
             except Exception:
                 shown = self._lut[px[:, :, :3].view(np.uint16)].reshape(3)
         else:

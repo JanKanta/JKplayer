@@ -1161,12 +1161,23 @@ def create():
     connected to A only so the group is not "empty" - nothing is ever rendered
     through it.
     """
+    # A Read that is selected goes straight into COMP. Looked up BEFORE the
+    # node is made - creating it changes the selection - and connected only
+    # after the Input nodes exist: a fresh Group has no inputs, so Nuke's own
+    # "attach to the selected node" has nowhere to plug it in.
+    source = _selected_source()
     node = nuke.createNode("Group", inpanel=False)
     try:
         node.setName(DEFAULT_NAME)
     except Exception:
         pass                                  # the name exists -> Nuke adds a number
     _build_inputs(node)
+    if source is not None:
+        try:
+            node.setInput(0, source)          # 0 = Comp
+        except Exception as exc:
+            nuke.tprint("JKplayer: could not connect %s to Comp (%s)"
+                        % (source.name(), exc))
     _add_knobs(node)
     # the project is the first guess for colour and rate - see project_defaults
     apply_project_defaults(node)
@@ -1177,6 +1188,31 @@ def create():
     # name or a note goes - and taking it for a setting that is switched from
     # the keyboard was borrowing something that was not ours.
     return node
+
+
+def _selected_source():
+    """The selected node to wire into Comp, or None.
+
+    A Read this player can decode, or a Dot in front of one - the same things
+    the Comp input accepts, so nothing is connected only to be disconnected
+    again a moment later. The node selected LAST wins when there are several.
+    """
+    picked = []
+    try:
+        picked.append(nuke.selectedNode())    # the one selected last
+    except Exception:
+        pass                                  # nothing selected raises
+    try:
+        picked.extend(nuke.selectedNodes())
+    except Exception:
+        pass
+    for candidate in picked:
+        try:
+            if sequence.from_read_node(candidate) is not None:
+                return candidate
+        except Exception:
+            continue
+    return None
 
 
 def _inner_inputs(node):

@@ -32,6 +32,17 @@ plate good to send".
   format and the bbox outlined on demand, and the window's control strip turns
   red with *BBox is different then Canvas*.
 * **Canvas check** has a cross where the edges meet — drag it to move the join.
+* **Log view with camera logs.** Nuke's 16 log curves on the built-in
+  transforms; under OCIO the log spaces of the config in use (ACES 1.3 and 2.0
+  each have their own list), converted exactly. A log plate is linearised first,
+  so it is never log of log.
+* **CC like a Grade** — WhitePoint, BlackPoint and Gamma with the ranges and
+  straight sliders of Nuke's Grade, followed by the scopes, the readout and
+  the export.
+* **Ctrl+J** in the Node Graph creates a JKplayer node, and a selected Read goes
+  straight into Comp.
+* **Comp/Plate swap on `;`** — the key left of 1 — taken from Nuke, which binds
+  it itself, whenever the panel has the keyboard.
 * **Custom OCIO config** on the node, copied over from Project Settings when the
   script uses one.
 * **Timeline zooms out** past the shot on the wheel; a middle click fits it back.
@@ -99,7 +110,7 @@ up, and each picks its own input and its own EXR layer — so you can put rgba
 against depth of the same plate.
 
 The inputs are **Comp** and **Plate** (tagged `C` and `P` on the buttons inside
-the image). `-` swaps the window between them, which is the quickest A/B there
+the image). `;` swaps the window between them, which is the quickest A/B there
 is: same frame, same zoom, same place on the eye.
 
 ### Input tab
@@ -205,6 +216,20 @@ wired up, and then the node does not even grow the third input.
 frames), Saturation check, Value map and Canvas check; plus Difference and
 High-pass difference in the Difference view. Each has its own sliders,
 remembered per mode. A middle click on a slider resets it.
+
+**Log view** shows the shot in a camera log, whatever the monitor is set to.
+The curves on offer follow the colour management: Nuke's log curves (Cineon,
+AlexaV3LogC, ARRILogC4, SLog3, Log3G10...) on the built-in transforms, and
+under OCIO the log spaces of the config in use — ACES 1.3 and 2.0 each bring
+their own list (ACEScct, ARRI LogC3/LogC4, S-Log3, V-Log...), converted exactly
+through OCIO, gamut included. A log plate is taken to linear first, so it is
+never shown as log of log.
+
+**CC** — **WhitePoint** and **BlackPoint** as in a Grade, (in − black) /
+(white − black) in scene-linear, plus **Gamma** and **Saturation**. The ranges
+and straight sliders are Nuke's Grade: white like its gain (0–4), black like its
+lift (−1 to 1), gamma 0.2–5; the number fields take anything in between exactly. The histogram, waveform and vectorscope, the
+clipping line, the pixel readout and the exported notes all follow it.
 
 **Canvas check** swaps the image so the original edges meet in the middle. A
 cross marks the point where they meet: **drag it** to move the join anywhere,
@@ -404,9 +429,11 @@ from.
 
 ## Use
 
-1. **JKplayer > Create JKplayer Node** and connect a Read to input **Comp**
-   (optionally a second one to **Plate**, and a matte to **DiMatte** if the
-   mattes come as their own files). An EXR or DPX sequence, or a movie.
+1. **JKplayer > Create JKplayer Node** — or **Ctrl+J** in the Node Graph — and
+   connect a Read to input **Comp** (optionally a second one to **Plate**, and a
+   matte to **DiMatte** if the mattes come as their own files). An EXR or DPX
+   sequence, or a movie. With a Read (or a Dot in front of one) **selected**,
+   the new node comes already wired to it on Comp.
 2. **Click the node** (or open its properties) and its panel opens, docked next
    to the Viewer. *JKplayer > Open JKplayer Panel* does the same for the
    selected node.
@@ -444,6 +471,15 @@ least useful end. **Play and the frame it is on never go.**
 
 ## Keys and mouse
 
+### Node Graph
+
+```
+Ctrl + J           create a JKplayer node (the selected Read goes into Comp)
+```
+
+Plain `J` is left alone: in the Node Graph it is Nuke's *Jump to Bookmarked
+Node*.
+
 ### Keyboard (in the panel)
 
 ```
@@ -451,7 +487,7 @@ J / K / L          play backwards / stop-play / play forwards
 Left / Right       step one frame
 R  G  B  A         show that channel (a second press returns to RGB)
 Y                  luminance (a second press returns to RGB)
-C                  CC panel (gain, gamma, saturation)
+C                  CC panel (WhitePoint, BlackPoint, gamma, saturation)
 Q                  QC panel
 H                  histogram
 V                  vectorscope
@@ -463,8 +499,9 @@ F                  fit into the window (fits the FORMAT)
 I / O              mark IN / OUT at the current frame
 P                  freeze the pixel readout
 X                  switch the active window (in Sync)
--                  swap the window between Comp and Plate
-                   (number row and number pad both)
+;                  swap the window between Comp and Plate - the key left
+                   of 1 (';' on a Czech layout, '`' on an English one);
+                   taken from Nuke while the panel has the keyboard
 ```
 
 ### Image
@@ -531,7 +568,10 @@ on clips that carry their own frame number, the colour transforms against OCIO,
 the scopes, the QC modes, every knob on the node, and the parts Qt only draws,
 rendered off-screen and checked pixel by pixel — the wipe mask, the annotation
 bar and palette, the PDF pages, the crop dialog, the timeline, the canvas cross,
-the bounding box lines and the red strip.
+the bounding box lines and the red strip. The log view against OCIO's own
+processors for every camera space, the CC grade through every path (built-in,
+OCIO, scopes, export), and the swap key against a window that binds the same
+keys the way Nuke does.
 
 ## What has actually been run
 

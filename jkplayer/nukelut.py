@@ -388,6 +388,14 @@ ALIASES = {"rec1886": "BT1886"}
 DISPLAY_NAMES = ["sRGB", "rec709", "BT1886", "Gamma2.2", "Gamma2.4", "linear"]
 INPUT_NAMES = [name for name, _fn in TRANSFORMS if name not in _LEGACY]
 
+# The camera and film LOG encodings in Nuke's list, in Nuke's order - what the
+# log view offers when colour is on the built-in transforms. Not the gammas,
+# not sRGB/rec709 and not the HDR display curves (HybridLogGamma, st2084):
+# those are not how a camera records, and a "log view" in one is not a log view.
+LOG_NAMES = ["Cineon", "Panalog", "REDLog", "ViperLog", "AlexaV3LogC",
+             "PLogLin", "SLog", "SLog1", "SLog2", "SLog3", "CLog", "Log3G10",
+             "Log3G12", "Protune", "Blackmagic Film Generation 5", "ARRILogC4"]
+
 DEFAULT_DISPLAY = "sRGB"
 DEFAULT_INPUT = "linear"
 
@@ -443,14 +451,16 @@ def decode(name, values):
 # Tables over the bits of a half float - what actually gets used at runtime
 # ---------------------------------------------------------------------------
 def display_lut(display=DEFAULT_DISPLAY, input_space=DEFAULT_INPUT,
-                gain=1.0, gamma=1.0):
+                gain=1.0, gamma=1.0, black=0.0):
     """65536 -> uint8. The whole file -> monitor path in one table.
 
-    Everything is baked in: the input transform, exposure, the display and the
-    gamma from CC. At runtime it is then a single lookup.
+    Everything is baked in: the input transform, the black and white point
+    (as `black` and `gain` = 1 / (white - black), a Grade's
+    (in - black) / (white - black)), the display and the gamma from CC. At
+    runtime it is then a single lookup.
     """
     v = decode(input_space, _HALF_SAFE.copy()).astype(np.float32)
-    v = np.clip(v * float(gain), 0.0, None)
+    v = np.clip((v - float(black)) * float(gain), 0.0, None)
     v = np.asarray(encode(display, v), dtype=np.float32)
     if abs(float(gamma) - 1.0) > 1e-6:
         v = np.power(np.clip(v, 0.0, None), 1.0 / max(float(gamma), 1e-3))

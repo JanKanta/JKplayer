@@ -577,20 +577,6 @@ class _Stage(QtWidgets.QWidget):
         self.wipeChanged.emit()
 
 
-def _keypad_minus():
-    """The minus ON THE NUMBER PAD as a key sequence, or the plain one.
-
-    Qt tells the two minus keys apart, so binding only "-" leaves the pad key
-    doing nothing - and the pad is where the finger goes, because that is the
-    one sitting over plus.
-    """
-    try:
-        return QtGui.QKeySequence(QtCore.Qt.KeypadModifier
-                                  | QtCore.Qt.Key_Minus)
-    except Exception:
-        return QtGui.QKeySequence("-")     # older bindings: no harm, no gain
-
-
 def _fmt_value(v):
     """A scene-linear value as an ORDINARY decimal - never an exponent.
 
@@ -1471,7 +1457,7 @@ class PlayerPanel(QtWidgets.QWidget):
             "       F fit into the window\n"
             "       1-7 QC modes, I/O mark in/out, P freeze the readout\n"
             "       M metadata (both EXR headers, bottom left)\n"
-            "       X switch window (in Sync), - swap Comp/Plate")
+            "       X switch window (in Sync), ; swap Comp/Plate")
         self._status.setContentsMargins(4, 0, 4, 2)
         # hidden until switched on in Settings - see _show_status
         self._status.setVisible(False)
@@ -1489,13 +1475,8 @@ class PlayerPanel(QtWidgets.QWidget):
             ("B", lambda: self._toggle_channel(3)),
             ("A", lambda: self._toggle_channel(4)),
             ("Y", lambda: self._toggle_channel(5)),      # luminance
-            # MINUS - the one over plus on the number pad. Qt treats the
-            # keypad key as a different sequence from the one in the number
-            # row ("Num+-" against "-"), so both are bound: it is the same
-            # character and nobody looks at which half of the keyboard it
-            # came from.
-            ("-", self._swap_source),                    # Comp <-> Plate
-            (_keypad_minus(), self._swap_source),
+            # ';' (Comp <-> Plate) is NOT a shortcut here - Nuke owns that key
+            # and would take it first. It is caught in eventFilter instead.
             ("I", self._set_mark_in),                    # mark IN here
             ("O", self._set_mark_out),                   # mark OUT here
             ("P", self._toggle_probe_freeze),            # freeze the pixel readout
@@ -1548,14 +1529,57 @@ class PlayerPanel(QtWidgets.QWidget):
 
     def eventFilter(self, obj, event):
         try:
-            if event.type() == QtCore.QEvent.Wheel and self.isVisible():
+            kind = event.type()
+            if kind == QtCore.QEvent.Wheel and self.isVisible():
                 tl = getattr(self, "timeline", None)
                 if tl is not None and tl.isVisible() and tl.underMouse():
                     tl.wheelEvent(event)
                     return True
+            if (kind in (QtCore.QEvent.ShortcutOverride, QtCore.QEvent.KeyPress)
+                    and self._is_swap_key(event) and self._keys_are_ours()):
+                # NUKE HAS THIS KEY. '`' is its window-wide Toggle Hide
+                # Floating Viewers and ';' the Viewer's Previous view, and on a
+                # Czech layout the ';' key IS the '`' key - so a plain panel
+                # shortcut never got it. Claiming the override first keeps it
+                # from Nuke; the swap then runs on the key press itself.
+                if kind == QtCore.QEvent.ShortcutOverride:
+                    event.accept()
+                elif not event.isAutoRepeat():
+                    self._swap_source()
+                return True
         except Exception:
             pass
         return super(PlayerPanel, self).eventFilter(obj, event)
+
+    # the key left of 1 on Windows (VK_OEM_3): '`' on an English layout, ';'
+    # on a Czech one - the same physical key whichever layout is active
+    _VK_OEM_3 = 0xC0
+
+    def _is_swap_key(self, event):
+        """';' or the key it lives on - the Comp <-> Plate swap."""
+        mods = event.modifiers() & (QtCore.Qt.ControlModifier
+                                    | QtCore.Qt.AltModifier
+                                    | QtCore.Qt.MetaModifier)
+        if mods:
+            return False
+        if event.key() in (QtCore.Qt.Key_Semicolon, QtCore.Qt.Key_QuoteLeft):
+            return True
+        try:
+            return int(event.nativeVirtualKey()) == self._VK_OEM_3
+        except Exception:
+            return False
+
+    def _keys_are_ours(self):
+        """The keyboard is in this panel, and not in a field being typed into."""
+        if not self.isVisible():
+            return False
+        focus = QtWidgets.QApplication.focusWidget()
+        if focus is None or not (focus is self or self.isAncestorOf(focus)):
+            return False
+        return not isinstance(focus, (QtWidgets.QLineEdit,
+                                      QtWidgets.QAbstractSpinBox,
+                                      QtWidgets.QTextEdit,
+                                      QtWidgets.QPlainTextEdit))
 
     # ------------------------------------------------- double view and inputs
     def _fit_all(self):
@@ -3570,6 +3594,46 @@ class PlayerPanel(QtWidgets.QWidget):
             self._apply_nuke_color(s)
         else:
             self._apply_ocio(s)
+        self._sync_log_curves()
+
+    # the curve the log view starts on, when the list has it
+    LOG_DEFAULTS = ("ACEScct", "Cineon")
+
+    def _sync_log_curves(self):
+        """The log view's curve menu follows the colour management.
+
+        Nuke's transforms: Nuke's log curves. OCIO: the log spaces of the
+        config in use - an ACES 1.3 config, a 2.0 one and nuke-default each
+        name them differently, so the list is rebuilt when the config changes.
+        The curve picked holds across a switch when the new list has it too.
+        """
+        t = self._ocio
+        key = ("ocio", t.config_path) if t is not None else ("nuke",)
+        if key == getattr(self, "_log_key", None):
+            return
+        names = []
+        if t is not None:
+            try:
+                names = t.log_spaces()
+            except Exception:
+                names = []
+        if not names:
+            names = list(fx.LOG_CURVES)
+        old = getattr(self, "_log_names", None) or list(fx.LOG_CURVES)
+        self._log_key, self._log_names = key, names
+        default = next((names.index(n) for n in self.LOG_DEFAULTS
+                        if n in names), 0)
+        for slot in self._slots:
+            params = slot.fx_params.setdefault(fx.LOG, fx.defaults(fx.LOG))
+            was = fx.log_curve_name(params, old) if "curve" in params else None
+            idx = names.index(was) if was in names else default
+            params["curve"] = float(idx)
+            slot.view.set_log_curves(names)
+            if slot.view.effect == fx.LOG:
+                slot.view.set_effect_params(params)
+            controls = getattr(slot, "controls", None)
+            if controls is not None:
+                controls.fx.set_choices("curve", names, idx)
 
     def _apply_nuke_color(self, s):
         """The built-in transforms - one table, no OCIO."""
@@ -3991,7 +4055,7 @@ class PlayerPanel(QtWidgets.QWidget):
             self._probe_lbl.setText("")
 
     def _on_cc(self, slot, values):
-        """The in-image CC panel: gain / gamma / saturation, for its window.
+        """The in-image CC panel: white point, black point, gamma, saturation.
 
         When CC is off (the CC toggle), neutral values are sent - the image
         goes through with no colour correction and saturation no longer costs
@@ -4000,7 +4064,8 @@ class PlayerPanel(QtWidgets.QWidget):
         """
         if not self._flag(self._settings, "cc", slot):
             values = {}
-        slot.view.set_color(gain=values.get("gain", 1.0),
+        gain, black = overlay_mod.cc_gain(values)
+        slot.view.set_color(gain=gain, black=black,
                             gamma=values.get("gamma", 1.0),
                             saturation=values.get("sat", 1.0))
         self._refresh_scopes(slot)      # the scopes describe what is visible
